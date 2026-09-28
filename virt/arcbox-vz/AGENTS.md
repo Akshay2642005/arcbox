@@ -92,6 +92,14 @@ the ABI.
   enable it on a user machine. The reason shows up in the crash report,
   not the unified log:
   `~/Library/Logs/DiagnosticReports/com.apple.Virtualization.VirtualMachine-*.ips`.
+- **A VZ console pipe with no reader wedges the whole VM.**
+  `VZFileHandleSerialPortAttachment` writes guest output into a 64 KiB host
+  pipe; when it fills, the guest's virtio-console write never completes,
+  every vCPU spins at 100% in `hv_vcpu_run`, and the VM's vsock stops
+  answering (exec/ssh/stop all time out). `MachineManager::start` therefore
+  spawns `machine/serial.rs::drain_serial` for every machine, not only the
+  System VM; never add a VZ console the daemon does not drain. Reproduce
+  with `head -c 200000 /dev/zero > /dev/hvc0` inside a machine.
 - `VZLinuxRosettaAvailability` raw values are notSupported=0, notInstalled=1,
   installed=2 (a hand-written mapping once had 1 and 2 swapped; the shim now
   returns raw values and Rust maps them — keep them aligned with the SDK).
