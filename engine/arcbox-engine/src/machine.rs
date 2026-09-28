@@ -36,6 +36,8 @@ pub enum MachineState {
     Stopped,
 }
 
+#[cfg(target_os = "macos")]
+mod serial;
 #[cfg(test)]
 mod tests;
 
@@ -609,7 +611,11 @@ impl MachineManager {
     /// # Errors
     ///
     /// Returns an error if the machine cannot be started.
-    pub async fn start(&self, name: &str) -> Result<()> {
+    ///
+    /// On macOS this also spawns the machine's serial drain, which keeps the
+    /// guest's console pipes empty for as long as it runs; see
+    /// [`serial::drain_serial`] for why a VM cannot go without one.
+    pub async fn start(self: &Arc<Self>, name: &str) -> Result<()> {
         let (vm_id, cid) = self.assign_cid_for_start(name)?;
 
         // Check if this is a distro-based machine VM.
@@ -641,6 +647,9 @@ impl MachineManager {
                 tracing::info!("Machine '{}' started with CID {}", name, cid);
             }
         }
+
+        #[cfg(target_os = "macos")]
+        tokio::spawn(serial::drain_serial(Arc::clone(self), name.to_owned()));
 
         // Update persisted state (single read-modify-write)
         if let Err(e) = self.persistence.update(name, |m| {

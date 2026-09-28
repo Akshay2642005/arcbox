@@ -652,11 +652,6 @@ impl LifecycleShared {
         // Back on async context — do async follow-up work.
         tracing::info!(boot_id = %boot_id, "Agent is ready");
         self.health_monitor.record_success();
-        #[cfg(target_os = "macos")]
-        {
-            let mm = Arc::clone(&self.machine_manager);
-            tokio::spawn(super::serial::serial_read_adaptive(mm));
-        }
 
         Ok(())
     }

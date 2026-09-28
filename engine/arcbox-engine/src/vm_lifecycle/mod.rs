@@ -34,8 +34,6 @@ mod boot;
 mod health;
 mod machine;
 mod recovery;
-#[cfg(target_os = "macos")]
-mod serial;
 #[cfg(test)]
 mod tests;
 mod types;
