@@ -153,6 +153,14 @@ non-obvious invariants and failure signatures.
   `kubernetes_control_lock`, which a start holds for up to 30 s. The daemon
   polls it every 2 s, so `MessageType::is_periodic_poll` requests and
   per-connection accepts log at debug.
+- **The agent rootfs links only the busybox applets its boot sequence runs.**
+  boot-assets `BUSYBOX_SYMLINKS` links 17 of the 305 applets busybox is built
+  with into `/bin`, and there is no `/usr`, so a bare `fstrim` exec failed
+  with ENOENT on every boot until `DiskTrim` issued FITRIM itself. Anything
+  the agent execs must be one of those 17 or run as `/bin/busybox <applet>`
+  (as `init.rs`, `btrfs.rs` and `runtime_cache.rs` do). `abctl debug` shells
+  get every applet from `/run/arcbox/debug-tools`, appended last on their
+  `PATH`; machine-root exec does not.
 
 ## Debugging (symptom → first commands → likely cause)
 
