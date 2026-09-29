@@ -511,15 +511,6 @@ impl LifecycleShared {
             let mut last_readiness_err: Option<String> = None;
 
             while std::time::Instant::now() < deadline {
-                // Console output (best-effort, non-blocking).
-                #[cfg(target_os = "macos")]
-                if let Ok(output) = mm.read_console_output(&machine_name) {
-                    let trimmed = output.trim_matches('\0');
-                    if !trimmed.is_empty() {
-                        tracing::info!("{}", trimmed.trim_end());
-                    }
-                }
-
                 // connect_agent discovers when the guest starts listening on
                 // the agent vsock port, then the readiness event stream waits
                 // for the guest to report a terminal state.

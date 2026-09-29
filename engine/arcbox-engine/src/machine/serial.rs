@@ -1,177 +1,407 @@
-//! Serial port read loop for a VM's console and agent-log output.
+//! Serial drain for a VM's console and agent-log pipes.
 //!
-//! Every macOS VM gets one of these for as long as it runs. The console
-//! pipes are the only sink for what the guest writes to `hvc0`/`hvc1`, and
-//! VZ's serial attachment blocks the guest's virtio-console queue once the
-//! 64 KiB host pipe is full: the guest's console write then never completes,
-//! the vCPUs spin on the stalled queue at 100% each, and the guest's vsock
-//! side stops answering too (measured 2026-09-28, a Debian machine whose
-//! `agetty` on `hvc0` filled the pipe within a day). Draining is therefore
-//! load-bearing for every VM, not a logging nicety for the System VM.
+//! Every VZ machine gets one for as long as it runs. The console pipes are
+//! the only sink for what the guest writes to `hvc0`/`hvc1`, and VZ's serial
+//! attachment blocks the guest's virtio-console queue once the host pipe is
+//! full: the guest's console write then never completes, the vCPUs spin on
+//! the stalled queue at 100% each, and the guest's vsock side stops answering
+//! too (measured 2026-09-28, a Debian machine whose `agetty` on `hvc0` filled
+//! the pipe within a day). Draining is therefore load-bearing for every VM,
+//! not a logging nicety for the System VM.
+//!
+//! The drain is readiness-driven: each port is an [`AsyncFd`] task that
+//! reads whenever the pipe holds bytes and otherwise sleeps in the reactor,
+//! so an idle machine costs nothing and a flood drains at pipe speed instead
+//! of one pipe per poll interval (the pipe is not always 64 KiB — XNU hands
+//! out 512-byte buffers under host pipe-memory pressure). It ends on the
+//! cancellation the manager fires when the machine stops; the pipe itself
+//! never delivers EOF, because the host keeps the write end it handed to VZ.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::VecDeque;
+use std::io;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::sync::{Arc, Mutex, PoisonError};
 
-use super::MachineManager;
+use arcbox_vmm::SerialReaders;
+use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
+use tokio_util::sync::CancellationToken;
 
-/// Base polling interval (ms) when serial output is actively being produced.
-const SERIAL_ACTIVE_INTERVAL_MS: u64 = 100;
+use super::DEFAULT_MACHINE_NAME;
 
-/// Maximum number of doublings for idle backoff (100ms → 1600ms).
-const SERIAL_MAX_IDLE_SHIFT: u32 = 4;
+/// An unterminated line longer than this is dropped rather than buffered.
+const MAX_LINE_BUF: usize = 64 * 1024;
+/// Lines each port keeps for [`DrainHandle::tail`].
+const TAIL_LINES: usize = 40;
+/// Bytes per `read(2)`.
+const READ_CHUNK: usize = 16 * 1024;
 
-/// Drains `machine`'s hvc0 (console) and hvc1 (agent log) pipes until the
-/// machine stops, logging complete lines.
-///
-/// One loop with exponential backoff: 100ms while output arrives, doubling
-/// up to 1600ms when idle, so an idle VM costs about one wakeup a second.
-/// The loop ends when the console read is rejected, which the state-gated
-/// reader does as soon as the machine leaves `Running`.
-pub(super) async fn drain_serial(machine_manager: Arc<MachineManager>, machine: String) {
-    const MAX_LINE_BUF: usize = 64 * 1024;
+/// A running drain. Dropping it stops both port tasks.
+pub(super) struct DrainHandle {
+    cancel: CancellationToken,
+    console: Arc<TailRing>,
+    agent_log: Arc<TailRing>,
+}
 
-    let console_label = if machine == super::DEFAULT_MACHINE_NAME {
-        "Guest".to_owned()
-    } else {
-        format!("Guest[{machine}]")
-    };
-    let agent_label = if machine == super::DEFAULT_MACHINE_NAME {
-        "Agent".to_owned()
-    } else {
-        format!("Agent[{machine}]")
-    };
+impl DrainHandle {
+    /// The last lines seen on the console and agent-log ports, oldest first.
+    pub(super) fn tail(&self) -> (Vec<String>, Vec<String>) {
+        (self.console.lines(), self.agent_log.lines())
+    }
+}
+
+impl Drop for DrainHandle {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+/// Starts draining `readers` for `machine` on the current tokio runtime.
+pub(super) fn spawn(machine: &str, readers: SerialReaders) -> DrainHandle {
+    let cancel = CancellationToken::new();
+    let is_default = machine == DEFAULT_MACHINE_NAME;
     // Only the System VM's console is worth INFO: a user machine's getty
     // and journal chatter is diagnostic, not operational.
-    let console_info = machine == super::DEFAULT_MACHINE_NAME;
-
-    let mut console_buf = String::new();
-    let mut agent_buf = String::new();
-    let mut idle_streak: u32 = 0;
-
-    loop {
-        // Any byte read means the guest is writing and the pipe needs the
-        // fast poll, whatever the bytes are: NUL padding is not worth
-        // logging, but a guest that fills the pipe with it (`head -c N
-        // /dev/zero > /dev/hvc0`) still blocks until the pipe is drained.
-        let mut had_output = false;
-
-        if let Ok(output) = machine_manager.read_console_output(&machine) {
-            had_output |= !output.is_empty();
-            process_serial_output(
-                &mut console_buf,
-                &output,
-                &console_label,
-                console_info,
-                MAX_LINE_BUF,
-            );
+    let console = Port::new(
+        if is_default {
+            "Guest".to_owned()
         } else {
-            flush_line_buf(&mut console_buf, &console_label, console_info);
-            flush_line_buf(&mut agent_buf, &agent_label, false);
-            tracing::debug!(machine, "serial drain stopped: machine no longer running");
+            format!("Guest[{machine}]")
+        },
+        is_default,
+    );
+    let agent_log = Port::new(
+        if is_default {
+            "Agent".to_owned()
+        } else {
+            format!("Agent[{machine}]")
+        },
+        false,
+    );
+    let handle = DrainHandle {
+        cancel: cancel.clone(),
+        console: Arc::clone(&console.tail),
+        agent_log: Arc::clone(&agent_log.tail),
+    };
+    tokio::spawn(drain_port(readers.console, console, cancel.clone()));
+    tokio::spawn(drain_port(readers.agent_log, agent_log, cancel));
+    handle
+}
+
+/// One port's label, log level and retained tail.
+struct Port {
+    label: String,
+    info: bool,
+    tail: Arc<TailRing>,
+}
+
+impl Port {
+    fn new(label: String, info: bool) -> Self {
+        Self {
+            label,
+            info,
+            tail: Arc::new(TailRing::default()),
+        }
+    }
+
+    fn emit(&self, line: &str) {
+        if self.info {
+            tracing::info!("{}: {line}", self.label);
+        } else {
+            tracing::debug!("{}: {line}", self.label);
+        }
+        self.tail.push(line);
+    }
+}
+
+/// Reads `fd` until cancelled or closed, logging complete lines.
+async fn drain_port(fd: OwnedFd, port: Port, cancel: CancellationToken) {
+    let fd = match AsyncFd::with_interest(fd, Interest::READABLE) {
+        Ok(fd) => fd,
+        Err(e) => {
+            tracing::warn!("{}: cannot watch the console pipe: {e}", port.label);
+            return;
+        }
+    };
+    let mut splitter = LineSplitter::new(MAX_LINE_BUF);
+    let mut chunk = vec![0u8; READ_CHUNK];
+    loop {
+        let mut guard = tokio::select! {
+            () = cancel.cancelled() => break,
+            ready = fd.readable() => match ready {
+                Ok(guard) => guard,
+                Err(e) => {
+                    tracing::warn!("{}: console pipe readiness failed: {e}", port.label);
+                    break;
+                }
+            },
+        };
+        let closed = loop {
+            match guard.try_io(|inner| read_some(inner.as_raw_fd(), &mut chunk)) {
+                Ok(Ok(0)) => break true,
+                Ok(Ok(n)) => {
+                    let split = splitter.push(&chunk[..n]);
+                    for line in &split.lines {
+                        port.emit(line);
+                    }
+                    if split.overflowed {
+                        tracing::warn!("{}: line buffer overflow, flushing", port.label);
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("{}: console pipe read failed: {e}", port.label);
+                    break true;
+                }
+                Err(_would_block) => break false,
+            }
+        };
+        if closed {
             break;
         }
+    }
+    if let Some(line) = splitter.flush() {
+        port.emit(&line);
+    }
+    tracing::debug!("{}: serial drain stopped", port.label);
+}
 
-        if let Ok(output) = machine_manager.read_agent_log_output(&machine) {
-            had_output |= !output.is_empty();
-            process_serial_output(&mut agent_buf, &output, &agent_label, false, MAX_LINE_BUF);
+fn read_some(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: `fd` is the live non-blocking pipe fd the `AsyncFd` owns and
+    // `buf` is valid for `buf.len()` bytes for the duration of the call.
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+    usize::try_from(n).map_err(|_| io::Error::last_os_error())
+}
+
+/// The most recent [`TAIL_LINES`] lines of one port.
+#[derive(Default)]
+struct TailRing(Mutex<VecDeque<String>>);
+
+impl TailRing {
+    fn push(&self, line: &str) {
+        let mut lines = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if lines.len() == TAIL_LINES {
+            lines.pop_front();
         }
-        // Agent log failure is non-fatal — console may still work.
+        lines.push_back(line.to_owned());
+    }
 
-        if had_output {
-            idle_streak = 0;
-        } else {
-            idle_streak = idle_streak.saturating_add(1);
-        }
-
-        // Adaptive delay: 100ms when active, doubling up to 1600ms when idle.
-        let delay_ms = SERIAL_ACTIVE_INTERVAL_MS * (1u64 << idle_streak.min(SERIAL_MAX_IDLE_SHIFT));
-        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+    fn lines(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect()
     }
 }
 
-/// Process raw serial output into line-buffered log messages.
-fn process_serial_output(
-    line_buf: &mut String,
-    output: &str,
-    label: &str,
-    level_info: bool,
-    max_buf: usize,
-) {
-    let trimmed = output.trim_matches('\0');
-    if trimmed.is_empty() {
-        return;
-    }
+/// Splits a byte stream into console lines, keeping an unterminated tail
+/// between pushes so a character split across two reads stays whole.
+struct LineSplitter {
+    buf: Vec<u8>,
+    max: usize,
+}
 
-    line_buf.push_str(trimmed);
+struct Split {
+    lines: Vec<String>,
+    /// The unterminated tail exceeded the bound and was dropped.
+    overflowed: bool,
+}
 
-    while let Some(pos) = line_buf.find('\n') {
-        let line = line_buf[..pos].trim_end().to_owned();
-        line_buf.drain(..=pos);
-        if line.is_empty() {
-            continue;
-        }
-        if level_info {
-            tracing::info!("{label}: {line}");
-        } else {
-            tracing::debug!("{label}: {line}");
+impl LineSplitter {
+    fn new(max: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            max,
         }
     }
 
-    // Only an unterminated line can grow without bound; a burst of complete
-    // lines was already logged above.
-    if line_buf.len() > max_buf {
-        tracing::warn!("{label}: line buffer overflow, flushing");
-        line_buf.clear();
+    fn push(&mut self, bytes: &[u8]) -> Split {
+        // NUL padding is never text; dropping it here keeps a NUL flood
+        // from counting against the unterminated-line bound.
+        self.buf.extend(bytes.iter().copied().filter(|&b| b != 0));
+        let mut lines = Vec::new();
+        let mut start = 0;
+        while let Some(pos) = self.buf[start..].iter().position(|&b| b == b'\n') {
+            let end = start + pos;
+            if let Some(line) = line_text(&self.buf[start..end]) {
+                lines.push(line);
+            }
+            start = end + 1;
+        }
+        self.buf.drain(..start);
+        // Only an unterminated line can grow without bound; complete lines
+        // were just consumed.
+        let overflowed = self.buf.len() > self.max;
+        if overflowed {
+            self.buf.clear();
+        }
+        Split { lines, overflowed }
+    }
+
+    /// The unterminated tail, if it says anything.
+    fn flush(&mut self) -> Option<String> {
+        let line = line_text(&self.buf);
+        self.buf.clear();
+        line
     }
 }
 
-/// Flush any remaining partial line from a serial buffer.
-fn flush_line_buf(line_buf: &mut String, label: &str, level_info: bool) {
-    let trailing = line_buf.trim().to_owned();
-    if !trailing.is_empty() {
-        if level_info {
-            tracing::info!("{label}: {trailing}");
-        } else {
-            tracing::debug!("{label}: {trailing}");
-        }
-    }
-    line_buf.clear();
+/// One console line as logged: trailing whitespace and `\r` trimmed, lossily
+/// decoded; `None` when nothing printable is left.
+fn line_text(raw: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(raw);
+    let text = text.trim_end();
+    (!text.is_empty()).then(|| text.to_owned())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::process_serial_output;
+    use std::os::fd::FromRawFd;
+    use std::time::Duration;
+
+    use super::*;
+
+    /// A pipe with a non-blocking read end, as `setup_serial_console` makes it.
+    fn pipe() -> (OwnedFd, OwnedFd) {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `fds` is a valid two-element array; the fds are owned below.
+        unsafe {
+            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+            let flags = libc::fcntl(fds[0], libc::F_GETFL);
+            assert_ne!(
+                libc::fcntl(fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK),
+                -1
+            );
+            (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1]))
+        }
+    }
+
+    /// Writes `bytes` whole; the payload always fits a minimum-size pipe.
+    fn write(fd: &OwnedFd, bytes: &[u8]) {
+        assert!(
+            bytes.len() <= 512,
+            "keep test payloads inside a 512-byte pipe"
+        );
+        // SAFETY: `fd` is a live pipe write end and `bytes` is valid.
+        let n = unsafe { libc::write(fd.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
+        assert_eq!(usize::try_from(n), Ok(bytes.len()));
+    }
+
+    async fn wait_for_lines(tail: &TailRing, n: usize) -> Vec<String> {
+        for _ in 0..500 {
+            let lines = tail.lines();
+            if lines.len() >= n {
+                return lines;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("drain logged {:?}, wanted {n} lines", tail.lines());
+    }
+
+    fn port() -> (Port, Arc<TailRing>) {
+        let port = Port::new("T".to_owned(), false);
+        let tail = Arc::clone(&port.tail);
+        (port, tail)
+    }
+
+    #[tokio::test]
+    async fn lines_split_across_writes_arrive_whole_and_in_order() {
+        let (r, w) = pipe();
+        let (port, tail) = port();
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(drain_port(r, port, cancel.clone()));
+
+        write(&w, b"abc");
+        write(&w, b"def\n");
+        let zhong = "\u{4e2d}".as_bytes();
+        write(&w, &zhong[..2]);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        write(&w, &zhong[2..]);
+        write(&w, b"\r\n");
+
+        assert_eq!(wait_for_lines(&tail, 2).await, ["abcdef", "\u{4e2d}"]);
+        cancel.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_flushes_the_partial_line_and_ends_the_task() {
+        let (r, w) = pipe();
+        let (port, tail) = port();
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(drain_port(r, port, cancel.clone()));
+
+        write(&w, b"no newline yet");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("cancelled drain ends")
+            .unwrap();
+        assert_eq!(tail.lines(), ["no newline yet"]);
+    }
+
+    #[tokio::test]
+    async fn closing_the_last_writer_ends_the_task() {
+        let (r, w) = pipe();
+        let (port, tail) = port();
+        let task = tokio::spawn(drain_port(r, port, CancellationToken::new()));
+
+        write(&w, b"last words\n");
+        drop(w);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("drain ends on EOF")
+            .unwrap();
+        assert_eq!(tail.lines(), ["last words"]);
+    }
 
     #[test]
     fn a_burst_of_complete_lines_is_not_an_overflow() {
-        let mut buf = String::new();
-        let burst: String = std::iter::repeat_n("line\n", 100).collect();
-        process_serial_output(&mut buf, &burst, "T", false, 64);
-        assert!(buf.is_empty(), "every complete line was consumed");
+        let mut splitter = LineSplitter::new(64);
+        let burst: Vec<u8> = b"line\n".repeat(100);
+        let split = splitter.push(&burst);
+        assert_eq!(split.lines.len(), 100);
+        assert!(!split.overflowed);
+        assert!(
+            splitter.flush().is_none(),
+            "every complete line was consumed"
+        );
     }
 
     #[test]
-    fn an_unterminated_line_past_the_bound_is_dropped() {
-        let mut buf = String::new();
-        process_serial_output(&mut buf, &"x".repeat(65), "T", false, 64);
-        assert!(buf.is_empty());
+    fn an_unterminated_line_past_the_bound_is_dropped_and_reported() {
+        let mut splitter = LineSplitter::new(64);
+        let split = splitter.push(&[b'x'; 65]);
+        assert!(split.lines.is_empty());
+        assert!(split.overflowed);
+        assert!(splitter.flush().is_none());
     }
 
     #[test]
-    fn a_partial_line_waits_for_its_newline() {
-        let mut buf = String::new();
-        process_serial_output(&mut buf, "abc", "T", false, 64);
-        assert_eq!(buf, "abc");
-        process_serial_output(&mut buf, "def\n", "T", false, 64);
-        assert!(buf.is_empty());
+    fn nul_padding_is_neither_output_nor_buffered() {
+        let mut splitter = LineSplitter::new(64);
+        assert!(splitter.push(b"\0\0\n").lines.is_empty());
+        assert_eq!(splitter.push(b"\0abc\0\n").lines, ["abc"]);
+        let split = splitter.push(&[0u8; 200]);
+        assert!(split.lines.is_empty());
+        assert!(!split.overflowed, "a NUL flood is not an unterminated line");
+        assert!(splitter.flush().is_none());
     }
 
     #[test]
-    fn nul_padding_is_not_buffered() {
-        let mut buf = String::new();
-        process_serial_output(&mut buf, "\0\0", "T", false, 64);
-        assert!(buf.is_empty());
-        process_serial_output(&mut buf, "\0abc\0", "T", false, 64);
-        assert_eq!(buf, "abc");
+    fn the_tail_keeps_only_the_newest_lines() {
+        let tail = TailRing::default();
+        for i in 0..TAIL_LINES + 5 {
+            tail.push(&i.to_string());
+        }
+        let lines = tail.lines();
+        assert_eq!(lines.len(), TAIL_LINES);
+        assert_eq!(lines.first().map(String::as_str), Some("5"));
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some((TAIL_LINES + 4).to_string().as_str())
+        );
     }
 }

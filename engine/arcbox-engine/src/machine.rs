@@ -16,6 +16,8 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+#[cfg(target_os = "macos")]
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 /// Default machine name used for container operations.
@@ -319,6 +321,10 @@ pub struct MachineManager {
     /// so watchers (`MachineService.Events`) see them; the default System VM's
     /// events are published by its own lifecycle actor instead.
     event_bus: crate::event::EventBus,
+    /// The serial drain of every running machine, by name (see [`serial`]).
+    /// Dropping an entry stops its drain.
+    #[cfg(target_os = "macos")]
+    serial_drains: Mutex<HashMap<String, serial::DrainHandle>>,
 }
 
 impl MachineManager {
@@ -430,6 +436,8 @@ impl MachineManager {
             machines_dir,
             host_network,
             event_bus,
+            #[cfg(target_os = "macos")]
+            serial_drains: Mutex::new(HashMap::new()),
         }
     }
 
@@ -628,9 +636,9 @@ impl MachineManager {
     ///
     /// Returns an error if the machine cannot be started.
     ///
-    /// On macOS this also spawns the machine's serial drain, which keeps the
-    /// guest's console pipes empty for as long as it runs; see
-    /// [`serial::drain_serial`] for why a VM cannot go without one.
+    /// On macOS this also starts the machine's serial drain, which keeps the
+    /// guest's console pipes empty for as long as it runs; see [`serial`] for
+    /// why a VM cannot go without one.
     pub async fn start(self: &Arc<Self>, name: &str) -> Result<()> {
         let (vm_id, cid) = self.assign_cid_for_start(name)?;
 
@@ -665,7 +673,7 @@ impl MachineManager {
         }
 
         #[cfg(target_os = "macos")]
-        tokio::spawn(serial::drain_serial(Arc::clone(self), name.to_owned()));
+        self.start_serial_drain(name, &vm_id);
 
         // Update persisted state (single read-modify-write)
         if let Err(e) = self.persistence.update(name, |m| {
@@ -1013,53 +1021,81 @@ impl MachineManager {
         Ok(response.bytes_trimmed)
     }
 
-    /// Reads serial console output for a running machine (macOS only).
+    /// Starts the serial drain for a machine that just entered `Running`,
+    /// replacing (and thereby stopping) any earlier one under the same name.
     #[cfg(target_os = "macos")]
-    pub fn read_console_output(&self, name: &str) -> Result<String> {
-        let machines = self
-            .machines
-            .read()
-            .map_err(|_| EngineError::LockPoisoned)?;
-
-        let machine = machines
-            .get(name)
-            .ok_or_else(|| EngineError::not_found(name.to_string()))?;
-
-        if machine.state != MachineState::Running {
-            return Err(EngineError::invalid_state(format!(
-                "machine '{name}' is not running"
-            )));
-        }
-
-        self.vm_manager.read_console_output(&machine.vm_id)
+    fn start_serial_drain(&self, name: &str, vm_id: &VmId) {
+        let handle = match self.vm_manager.dup_serial_readers(vm_id) {
+            Ok(Some(readers)) => serial::spawn(name, readers),
+            Ok(None) => {
+                tracing::debug!(machine = name, "no host console pipes to drain");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    machine = name,
+                    "console pipes unavailable, not draining: {e}"
+                );
+                return;
+            }
+        };
+        self.serial_drains
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(name.to_owned(), handle);
     }
 
-    /// Logs the tail of a machine's console and agent-log pipes at WARN, for
+    #[cfg(target_os = "macos")]
+    fn stop_serial_drain(&self, name: &str) {
+        self.serial_drains
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(name);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn stop_serial_drain(&self, _name: &str) {}
+
+    /// Logs the tail of a machine's console and agent-log output at WARN, for
     /// diagnosing a boot that never reached agent readiness.
     ///
-    /// The serial drain starts only once `start` has marked the machine
-    /// `Running`, so early-boot output — including a kernel panic or a shim
-    /// `poweroff` — sits unread in the host-side console pipe buffer and is
-    /// recoverable here even after the guest has died.
+    /// The serial drain owns the pipes from the moment `start` marks the
+    /// machine `Running`, so the tail is what it kept; a machine without a
+    /// drain (no host pipes on its backend) falls back to whatever is still
+    /// unread in the pipes, which survives even an early guest death.
     #[cfg(target_os = "macos")]
     fn log_console_tail(&self, name: &str) {
-        // Read the vm_id directly: the machine may already be non-Running
-        // (an early guest death), which the state-gated readers reject.
-        let vm_id = match self.machines.read() {
-            Ok(machines) => machines.get(name).map(|m| m.vm_id.clone()),
-            Err(_) => None,
-        };
-        let Some(vm_id) = vm_id else { return };
-        for (label, output) in [
-            ("console", self.vm_manager.read_console_output(&vm_id)),
-            ("agent-log", self.vm_manager.read_agent_log_output(&vm_id)),
-        ] {
-            let Ok(text) = output else { continue };
-            let tail: Vec<&str> = text.lines().rev().take(40).collect();
-            if tail.is_empty() {
-                continue;
+        let kept = self
+            .serial_drains
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(name)
+            .map(serial::DrainHandle::tail);
+        let (console, agent_log) = match kept {
+            Some(tail) => tail,
+            None => {
+                // Read the vm_id directly: the machine may already be
+                // non-Running (an early guest death).
+                let vm_id = match self.machines.read() {
+                    Ok(machines) => machines.get(name).map(|m| m.vm_id.clone()),
+                    Err(_) => None,
+                };
+                let Some(vm_id) = vm_id else { return };
+                let last_lines = |output: Result<String>| -> Vec<String> {
+                    let Ok(text) = output else { return Vec::new() };
+                    let mut lines: Vec<String> =
+                        text.lines().rev().take(40).map(str::to_owned).collect();
+                    lines.reverse();
+                    lines
+                };
+                (
+                    last_lines(self.vm_manager.read_console_output(&vm_id)),
+                    last_lines(self.vm_manager.read_agent_log_output(&vm_id)),
+                )
             }
-            for line in tail.iter().rev() {
+        };
+        for (label, lines) in [("console", console), ("agent-log", agent_log)] {
+            for line in lines {
                 tracing::warn!(machine = %name, "machine {label}: {line}");
             }
         }
@@ -1067,27 +1103,6 @@ impl MachineManager {
 
     #[cfg(not(target_os = "macos"))]
     fn log_console_tail(&self, _name: &str) {}
-
-    /// Reads agent log output (hvc1) for a running machine (macOS only).
-    #[cfg(target_os = "macos")]
-    pub fn read_agent_log_output(&self, name: &str) -> Result<String> {
-        let machines = self
-            .machines
-            .read()
-            .map_err(|_| EngineError::LockPoisoned)?;
-
-        let machine = machines
-            .get(name)
-            .ok_or_else(|| EngineError::not_found(name.to_string()))?;
-
-        if machine.state != MachineState::Running {
-            return Err(EngineError::invalid_state(format!(
-                "machine '{name}' is not running"
-            )));
-        }
-
-        self.vm_manager.read_agent_log_output(&machine.vm_id)
-    }
 
     /// Captures a debug snapshot (virtio queues + vCPU exit counters)
     /// for a machine.
@@ -1150,6 +1165,7 @@ impl MachineManager {
 
         machine.state = MachineState::Stopped;
         machine.cid = None;
+        self.stop_serial_drain(name);
 
         // Update persisted state
         if let Err(e) = self.persistence.update_state(name, MachineState::Stopped) {
@@ -1296,6 +1312,7 @@ impl MachineManager {
                     .ok_or_else(|| EngineError::not_found(name.to_string()))?;
                 machine.state = MachineState::Stopped;
                 machine.cid = None;
+                self.stop_serial_drain(name);
 
                 if let Err(e) = self.persistence.update_state(name, MachineState::Stopped) {
                     tracing::warn!(
@@ -1387,6 +1404,7 @@ impl MachineManager {
             let vm_id = machine.vm_id.clone();
             drop(machines); // Release lock before stopping
             self.vm_manager.stop(&vm_id)?;
+            self.stop_serial_drain(name);
             machines = self
                 .machines
                 .write()
