@@ -142,6 +142,11 @@ run fails, and which paths must change together.
   kernel's `/private/var/folders/...` mountpoint, never matches, and the
   daemon never unmounts it (open). `KEEP_TEST_DIR=1` sidesteps the removal;
   the run's `metrics.json` lives in that data dir, so a killed run loses it.
+- A unit test that writes more than 512 bytes into a pipe before anything
+  reads it can hang forever on a loaded host: XNU shrinks new pipe buffers
+  under pipe-memory pressure (512 bytes measured 2026-09-29 with ~4300
+  open pipes). Write from another thread, or keep the unread payload under
+  512 bytes.
 
 ## Contracts to keep honest
 

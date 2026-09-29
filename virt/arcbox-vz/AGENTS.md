@@ -93,13 +93,26 @@ the ABI.
   not the unified log:
   `~/Library/Logs/DiagnosticReports/com.apple.Virtualization.VirtualMachine-*.ips`.
 - **A VZ console pipe with no reader wedges the whole VM.**
-  `VZFileHandleSerialPortAttachment` writes guest output into a 64 KiB host
-  pipe; when it fills, the guest's virtio-console write never completes,
-  every vCPU spins at 100% in `hv_vcpu_run`, and the VM's vsock stops
-  answering (exec/ssh/stop all time out). `MachineManager::start` therefore
-  spawns `machine/serial.rs::drain_serial` for every machine, not only the
-  System VM; never add a VZ console the daemon does not drain. Reproduce
-  with `head -c 200000 /dev/zero > /dev/hvc0` inside a machine.
+  `VZFileHandleSerialPortAttachment` writes guest output into a host pipe;
+  when it fills, the guest's virtio-console write never completes, every
+  vCPU spins at 100% in `hv_vcpu_run`, and the VM's vsock stops answering
+  (exec/ssh/stop all time out). `MachineManager::start` therefore starts
+  `machine/serial.rs` for every machine, not only the System VM — one
+  `AsyncFd` task per port on `DarwinVm::dup_serial_readers`, reading on
+  readiness, never on a timer — and stops it when the machine stops; never
+  add a VZ console the daemon does not drain. The pipe is not a fixed
+  64 KiB: XNU sizes pipe buffers to what it can spare, and under host
+  pipe-memory pressure (measured 2026-09-29 with ~4300 open pipes) a fresh
+  pipe holds 512 bytes, which is why the drain must not be a poll (one pipe
+  per poll interval was 650 KB/s at 64 KiB and ~5 KB/s at 512 B, with the
+  guest spinning for the whole write). The pipe never delivers EOF while
+  the VM is configured — the host keeps the write end it handed to VZ — so
+  the drain ends on the manager's cancellation, not on `read` returning 0.
+  Reproduce the wedge with 200 KB of text to `/dev/hvc0` (the
+  `machine_console` e2e); do not use a 2 MB flood on a machine you care
+  about: on kernel 6.18.38-arcbox it corrupted guest memory (oops / btrfs /
+  `Bad rss-counter`) in 5 of 12 systemd machines, and no-flood controls did
+  not.
 - **A distro's own `console_loglevel` decides how fast it fills that pipe.**
   Every machine boots `console=hvc0` (`engine/.../machine.rs`), so all
   kernel `printk` lands in the pipe above. A distro whose kernel default is
@@ -112,7 +125,7 @@ the ABI.
   (`QUIET_KERNEL_CONSOLE` in `engine/.../machine.rs`) so every distro
   matches Ubuntu regardless of its own default — `err` and above still
   reach the console. The drain above is the correctness backstop; this cap
-  keeps a machine from trickling the drain out of its idle backoff.
+  keeps a distro's `info` chatter out of the daemon log.
 - `VZLinuxRosettaAvailability` raw values are notSupported=0, notInstalled=1,
   installed=2 (a hand-written mapping once had 1 and 2 swapped; the shim now
   returns raw values and Rust maps them — keep them aligned with the SDK).
