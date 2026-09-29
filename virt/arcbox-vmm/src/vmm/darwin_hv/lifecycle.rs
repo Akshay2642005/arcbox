@@ -404,11 +404,7 @@ impl Vmm {
         let vcpu_ids_snapshot: Vec<u64> = self
             .hv_vcpu_ids
             .as_ref()
-            .map(|ids| {
-                ids.lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone()
-            })
+            .map(hv_vcpu_handles)
             .unwrap_or_default();
 
         // Warn if the snapshot is empty while threads are still alive: this
@@ -565,11 +561,7 @@ impl Vmm {
         let ids: Vec<u64> = self
             .hv_vcpu_ids
             .as_ref()
-            .map(|ids| {
-                ids.lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone()
-            })
+            .map(hv_vcpu_handles)
             .unwrap_or_default();
         if let Some(ref vm) = self.hv_vm {
             if let Err(e) = vm.exit_vcpus(&ids) {

@@ -89,7 +89,12 @@ impl Vmm {
                     data
                 );
                 if let Some(ref device_manager) = self.device_manager {
-                    if let Err(e) = device_manager.handle_mmio_write(*addr, *size as usize, *data) {
+                    if let Err(e) = device_manager.handle_mmio_write(
+                        Some(vcpu_id),
+                        *addr,
+                        *size as usize,
+                        *data,
+                    ) {
                         tracing::warn!("MMIO write failed at {:#x}: {}", addr, e);
                     }
                 }
@@ -135,7 +140,7 @@ impl Vmm {
                     }
                 }
             } else if let Some(value) = data {
-                if let Err(e) = device_manager.handle_mmio_write(addr, 4, value) {
+                if let Err(e) = device_manager.handle_mmio_write(None, addr, 4, value) {
                     tracing::warn!("Device {} write failed: {}", device_id, e);
                 }
             }

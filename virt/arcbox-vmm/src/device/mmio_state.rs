@@ -134,6 +134,14 @@ pub struct VirtioMmioState {
     pub kicks: [u64; MAX_VIRTQUEUES],
     /// Cumulative interrupts raised via [`Self::trigger_interrupt`].
     pub interrupts: u64,
+    /// The vCPU that most recently wrote `INTERRUPT_ACK`, i.e. the CPU the
+    /// guest routes this device's SPI to (`GICD_IROUTER` is inside the
+    /// framework's GIC, so this is the host's only view of it). Linux
+    /// routes every SPI to CPU 0 unless told otherwise, and re-routing
+    /// shows up here on the next acknowledgement. `None` until the guest
+    /// has serviced one interrupt. An io worker kicks this vCPU alone out
+    /// of `hv_vcpu_run` instead of broadcasting to all of them.
+    pub irq_ack_vcpu: Option<u32>,
 }
 
 impl VirtioMmioState {
@@ -159,6 +167,7 @@ impl VirtioMmioState {
             shm_regions: Vec::new(),
             kicks: [0; MAX_VIRTQUEUES],
             interrupts: 0,
+            irq_ack_vcpu: None,
         }
     }
 

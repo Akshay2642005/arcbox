@@ -860,6 +860,20 @@ impl DeviceManager {
         }
     }
 
+    /// The vCPU that last acknowledged an interrupt from the first device
+    /// of `device_type` — the CPU the guest routes its SPI to — or `None`
+    /// before the guest has serviced one. See `VirtioMmioState::irq_ack_vcpu`.
+    pub fn irq_ack_vcpu(&self, device_type: DeviceType) -> Option<u32> {
+        self.devices
+            .values()
+            .find(|dev| dev.info.device_type == device_type)?
+            .mmio_state
+            .as_ref()?
+            .read()
+            .ok()?
+            .irq_ack_vcpu
+    }
+
     /// Raises interrupt for a specific device ID. Used for the bridge NIC
     /// which shares `DeviceType::VirtioNet` with the primary NIC.
     pub fn raise_interrupt_for_device(&self, device_id: DeviceId, reason: u32) {

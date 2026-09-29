@@ -249,7 +249,7 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, boot: VcpuBoot, ctx: VcpuContext) {
         let mut ids = hv_vcpu_ids
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        ids.push(vcpu.raw_handle());
+        ids.push((vcpu_id, vcpu.raw_handle()));
     }
     {
         let mut handles = vcpu_thread_handles
@@ -474,6 +474,7 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, boot: VcpuBoot, ctx: VcpuContext) {
                                 mmio.access_size,
                             );
                             if let Err(e) = device_manager.handle_mmio_write(
+                                Some(vcpu_id),
                                 mmio.address,
                                 mmio.access_size as usize,
                                 value,

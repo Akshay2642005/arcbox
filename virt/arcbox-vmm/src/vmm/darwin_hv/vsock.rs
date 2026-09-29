@@ -133,7 +133,7 @@ impl Vmm {
             device_manager: Arc::clone(device_manager),
             doorbell_rd,
             running: self.running.clone(),
-            exit_vcpus: make_exit_vcpus_fn(
+            exit_vcpu: make_exit_vcpu_fn(
                 self.hv_vcpu_ids
                     .clone()
                     .expect("hv_vcpu_ids asserted Some above"),

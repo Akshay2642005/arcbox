@@ -19,8 +19,8 @@ pub trait ExitHandler: Send + Sync {
     /// Handles MMIO read from guest.
     fn handle_mmio_read(&self, addr: u64, size: usize) -> u64;
 
-    /// Handles MMIO write from guest.
-    fn handle_mmio_write(&self, addr: u64, size: usize, data: u64);
+    /// Handles MMIO write from guest, issued by vCPU `vcpu`.
+    fn handle_mmio_write(&self, vcpu: u32, addr: u64, size: usize, data: u64);
 
     /// Handles I/O port read from guest (x86 only).
     fn handle_io_read(&self, port: u16, size: usize) -> u64;
@@ -59,10 +59,10 @@ impl ExitHandler for DeviceManagerExitHandler {
         }
     }
 
-    fn handle_mmio_write(&self, addr: u64, size: usize, data: u64) {
+    fn handle_mmio_write(&self, vcpu: u32, addr: u64, size: usize, data: u64) {
         match self.device_manager.read() {
             Ok(dm) => {
-                if let Err(e) = dm.handle_mmio_write(addr, size, data) {
+                if let Err(e) = dm.handle_mmio_write(Some(vcpu), addr, size, data) {
                     tracing::warn!("MMIO write error at {:#x}: {}", addr, e);
                 }
             }
@@ -311,7 +311,7 @@ impl VcpuManager {
                             }
                             VcpuExit::MmioWrite { addr, size, data } => {
                                 if let Some(ref handler) = exit_handler {
-                                    handler.handle_mmio_write(addr, size.into(), data);
+                                    handler.handle_mmio_write(id, addr, size.into(), data);
                                 } else {
                                     tracing::trace!(
                                         "vCPU {} MMIO write: addr={:#x}, size={}, data={:#x}",
