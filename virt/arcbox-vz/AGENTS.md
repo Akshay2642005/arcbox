@@ -100,6 +100,19 @@ the ABI.
   spawns `machine/serial.rs::drain_serial` for every machine, not only the
   System VM; never add a VZ console the daemon does not drain. Reproduce
   with `head -c 200000 /dev/zero > /dev/hvc0` inside a machine.
+- **A distro's own `console_loglevel` decides how fast it fills that pipe.**
+  Every machine boots `console=hvc0` (`engine/.../machine.rs`), so all
+  kernel `printk` lands in the pipe above. A distro whose kernel default is
+  the noisier `7` — Debian — streams every `info`-level record there; the
+  loudest steady source is the audit subsystem, one `audit:` line per
+  systemd unit start/stop (~285 KiB/day on an idle machine, measured
+  2026-09-29), which crosses the 64 KiB pipe within a day. Ubuntu ships
+  `console_loglevel=4` in `sysctl.d` and is silent after boot; the other
+  mirrored distros sit between. The machine cmdline now pins `loglevel=4`
+  (`QUIET_KERNEL_CONSOLE` in `engine/.../machine.rs`) so every distro
+  matches Ubuntu regardless of its own default — `err` and above still
+  reach the console. The drain above is the correctness backstop; this cap
+  keeps a machine from trickling the drain out of its idle backoff.
 - `VZLinuxRosettaAvailability` raw values are notSupported=0, notInstalled=1,
   installed=2 (a hand-written mapping once had 1 and 2 swapped; the shim now
   returns raw values and Rust maps them — keep them aligned with the SDK).
