@@ -15,6 +15,12 @@ impl VirtioVsock {
     /// 2. Pop entries from the backend RX queue, build vsock packets
     ///    (REQUEST/RESPONSE/RW/SHUTDOWN/CREDIT_*), and write them into
     ///    available guest RX descriptors via `write_to_rx_descriptor`.
+    ///    A stream keeps its RW pending for as long as each read fills
+    ///    the packet, so one round drains everything the peer's credit
+    ///    and the posted RX descriptors allow, round-robin across
+    ///    connections. The caller pays one interrupt and one vCPU kick
+    ///    per round, not per packet: a 1 GiB `docker run -i` pipe used
+    ///    to cost ~290 k `hv_vcpus_exit` broadcasts on HV.
     /// 3. If `tx_qcfg` is supplied, drain the TX virtqueue via
     ///    `process_queue(1, ...)` so guest→host responses are picked up
     ///    on the same poll cycle.
@@ -321,6 +327,17 @@ impl VirtioVsock {
                                         // Ask for a refresh if we've crossed
                                         // the half-window mark.
                                         conn.maybe_request_credit();
+                                        // A full read may have left more
+                                        // behind: keep the RW pending so this
+                                        // round comes back to the stream
+                                        // (after any other queued connection)
+                                        // instead of ending on the packet. A
+                                        // short read drained the stream, and
+                                        // the readable fd re-arms the caller
+                                        // when more arrives.
+                                        if data.len() == max_read {
+                                            conn.rx_queue.enqueue(RxOps::RW);
+                                        }
 
                                         let hdr_bytes = hdr.to_bytes();
                                         let mut pkt =

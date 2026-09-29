@@ -16,9 +16,12 @@ fn rx_ops_priority_order() {
     ops.enqueue(RxOps::REQUEST);
     ops.enqueue(RxOps::RW);
     ops.enqueue(RxOps::CREDIT_UPDATE);
+    ops.enqueue(RxOps::CREDIT_REQUEST);
 
-    // Dequeue in priority order: Request → Rw → CreditUpdate → Reset
+    // Dequeue in priority order:
+    // Request → CreditRequest → Rw → CreditUpdate → Reset
     assert_eq!(ops.dequeue(), RxOps::REQUEST);
+    assert_eq!(ops.dequeue(), RxOps::CREDIT_REQUEST);
     assert_eq!(ops.dequeue(), RxOps::RW);
     assert_eq!(ops.dequeue(), RxOps::CREDIT_UPDATE);
     assert_eq!(ops.dequeue(), RxOps::RESET);
