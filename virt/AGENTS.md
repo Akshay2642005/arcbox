@@ -26,6 +26,14 @@ the failing backend drives before you edit anything.
   - net drain/poll: `virt/arcbox-virtio-net/src/device/hot_path.rs`.
   - blk: `virt/arcbox-vmm/src/blk_worker.rs` (independent parser — see
     `arcbox-vmm/AGENTS.md`).
+  - vsock RX injection: `poll_rx_injection` in
+    `virt/arcbox-virtio-vsock/src/device/rx_injection.rs`, driven by the
+    `vsock-io` thread (`virt/arcbox-vmm/src/vsock_rx_worker.rs`). One round
+    drains every queued stream as far as the peer's credit and the posted RX
+    descriptors allow — RW stays pending after a full read, round-robin
+    across connections — and the worker then raises INT_VRING once and kicks
+    once. `RxOps` ranks CreditRequest above Rw so the half-window refresh is
+    not starved behind the data. VZ never runs this: its vsock is Apple's.
 - **VZ + unit-test / local-sim path** — `queue.rs::VirtQueue` local rings,
   driven through `VirtioDevice::process_queue(memory: &mut [u8], ..)` in
   `virt/arcbox-virtio-core/src/lib.rs`, which returns a
@@ -160,6 +168,13 @@ readiness signal.
   until the post-readiness agent ping sets `clock_settime`
   (`AgentPingRequest.timestamp_secs`; ABX-416, PL031 RTC pending). Do not chase
   it in the DNS/net stack.
+- **HV host→guest vsock bulk is slow (multi-second per 100 MiB) while the
+  guest sits idle; VZ is fine.** Diff `kick_broadcasts` from
+  `GetVirtioDebug` across one transfer: ~1 broadcast per ≤3776-byte packet
+  means the injection round is back to one packet per connection (it cost
+  ~290 k `hv_vcpus_exit` and 19–20 s per GiB before 2026-09-29; ~200 and
+  5.5–6 s after). Details in `arcbox-vmm/AGENTS.md` "Async-Worker Completion
+  Contract".
 - **Queue stall that appears only under an EVENT_IDX guest.** Suspect a
   dropped `enable_notification` re-arm in a worker drain loop, or a
   weakened `should_notify` SeqCst fence. Diff against the "One SplitQueue"

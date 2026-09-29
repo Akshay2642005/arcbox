@@ -46,6 +46,17 @@ run fails, and which paths must change together.
   `target/aarch64-unknown-linux-musl/release`, and `~/.arcbox/bin`, copied
   into `<data_dir>/boot/<version>/arcbox-agent`. A stale agent boots but
   fails confusingly.
+- The same staging seeds guest runtime binaries: first from the installed
+  ArcBox (`~/.arcbox/runtime/<version>/`, or its unversioned `bin/`), then
+  `boot-assets/dev/runtime-bin/` on top — files into
+  `<data_dir>/runtime/<version>/bin/`, subdirectories (`kernel/vmlinux`) as
+  siblings of it. That generation directory is the one the daemon reads;
+  anything left in the unversioned `runtime/bin` shadows nothing. On a host
+  that cannot reach the CDN (403) with an installed ArcBox one generation
+  behind the `assets.lock` pin, the fallback copies the old `dockerd`, the
+  checksum fails, and the daemon dies on the download — stage
+  `boot-assets/dev/{kernel,rootfs.erofs,manifest.json}` and `runtime-bin/`
+  from a bundle of the pinned version first.
 - The `hv_e2e` probe (`--test hv_vmm`) instead shares the real `~/.arcbox`
   (or `ARCBOX_DATA_DIR`) and execs `<share>/bin/arcbox-agent` directly,
   hard-failing if absent. It needs a musl cross-compile placed there

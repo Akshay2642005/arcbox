@@ -14,14 +14,26 @@ all three, in this order:
 
 1. `VirtioMmioState::trigger_interrupt(1)` — set interrupt_status (INT_VRING).
 2. Fire the `DeviceIrqCallback` (`irq_callback(irq, true)`) — assert the SPI.
-3. Call the worker's `exit_vcpus()` closure — kick every vCPU out of WFI.
+3. Call the worker's exit closure — kick the vCPU that will service the
+   interrupt out of `hv_vcpu_run`. Closures from `make_exit_vcpus_fn` kick
+   every vCPU (blk, net-rx, console); the vsock-io worker's
+   `make_exit_vcpu_fn` kicks only `DeviceManager::irq_ack_vcpu(VirtioVsock)`
+   — the vCPU that last wrote `INTERRUPT_ACK`, i.e. the CPU the guest routes
+   the SPI to (Linux routes every virtio SPI to CPU 0 unless told otherwise;
+   `/proc/interrupts` in the guest shows it) — and falls back to every vCPU
+   until the guest has acknowledged one. `GICD_IROUTER` lives inside the
+   framework's GIC, so the ACK write is the host's only view of the routing.
+   Broadcasting to all 18 vCPUs per completion was ~43% of the vsock-io
+   thread under a bulk `docker run -i` pipe.
 
 Omitting step 3 produces intermittent guest hangs (guest sleeps until an
 unrelated exit) that are invisible in logs. Reference: `blk_worker.rs::trigger_irq`
 (blk_worker.rs:719-729, rationale 176-181); the GIC callback's complementary
-unpark-all loop is `setup.rs:145-154`. Worker `exit_vcpus` closures are built by
-`make_exit_vcpus_fn` (`vmm/darwin_hv/mod.rs:157-181`) and wired at
-`console.rs:31`, `vsock.rs:136`, `lifecycle.rs:143,212`.
+unpark-all loop is `setup.rs:145-154`. Worker exit closures are built by
+`make_exit_vcpus_fn` / `make_exit_vcpu_fn` (`vmm/darwin_hv/mod.rs`) and wired
+at `console.rs`, `vsock.rs`, `lifecycle.rs` (blk, net-rx). The vCPU registry
+they read (`HvVcpuIds`) pairs each `hv_vcpu_t` handle with its logical index,
+in arrival order — never index it by position.
 
 ## vCPU Exit Loop: PC-advance is asymmetric by exit class
 
@@ -100,10 +112,15 @@ selector > 8) and the near-`u64::MAX` ring-address snapshot test.
 
 - `VirtioMmioState::kicks`/`interrupts` (mmio_state.rs:134,136) and
   `vcpu_stats::VcpuStats` are cumulative across device resets.
-- `hv_kick_broadcasts`: incremented ONLY by `make_exit_vcpus_fn` (mod.rs:169) —
-  i.e. every io-worker all-vCPU wake. Teardown (`stop`/`pause`) calls
-  `vm.exit_vcpus` directly (lifecycle.rs:433,557) and is intentionally NOT
-  counted; do not expect this counter to move during shutdown.
+- `hv_kick_broadcasts`: incremented ONLY by `make_exit_vcpus_fn` and by
+  `make_exit_vcpu_fn`'s all-vCPU fallback — i.e. every io-worker all-vCPU
+  wake. A targeted kick is not a broadcast and shows up solely in the target
+  vCPU's `kicks_received`; since the vsock worker went targeted (2026-09-29)
+  the per-boot ~71 baseline no longer includes vsock's post-first-ACK kicks,
+  and a 1 GiB host→guest pipe moves it by ~200, not ~290 k. Teardown
+  (`stop`/`pause`) calls `vm.exit_vcpus` directly (lifecycle.rs) and is
+  intentionally NOT counted; do not expect this counter to move during
+  shutdown.
 - `hv_unpark_broadcasts`: incremented by the GIC IRQ callback's unpark-all loop
   (setup.rs:148).
 - R2/R3 acceptance is measured from these numbers. A refactor that bypasses the
@@ -128,6 +145,7 @@ archaeology produced multiple WRONG root causes for ABX-386; snapshot first.
 | >8-vCPU cold boot: guest wedges D-state / `folio_wait_bit_common` stall | live snapshot → find a blk queue whose `avail_idx` advances while `used_idx` stays stuck, or config dropped for high `queue_sel` | per-queue register array too small (`MAX_VIRTQUEUES` vs one-queue-per-vCPU), ABX-386 |
 | Guest TLS/cert validation fails right after boot | check whether agent-up ping has fired | no RTC; guest sits at kernel default epoch until the post-readiness ping sets the clock (ABX-416) |
 | Intermittent guest hang just after an I/O completes | audit the worker's completion path | missing `exit_vcpus()` — see Async-Worker Completion Contract |
+| Host→guest vsock bulk (`docker run -i` pipe, `docker load`) slow on HV with the guest idle; `GetVirtioDebug` shows `kick_broadcasts` moving by ~1 per packet | diff `kick_broadcasts` / vsock RX `used_idx` across one transfer | the injection round stopped draining a stream (`rx_injection.rs` re-enqueues RW after a full read) or the vsock worker lost its targeted kick (`irq_ack_vcpu` is `None`, or names a vCPU other than the one `/proc/interrupts` in the guest shows) |
 
 For config-dependent boot failures, bisect with the `hv_e2e` config-matrix knobs
 (`ARCBOX_HV_E2E_VCPUS/MEMORY_MB/BALLOON/BOOT_ONLY/...`, all share the
