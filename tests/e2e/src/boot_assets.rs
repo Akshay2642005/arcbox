@@ -416,18 +416,21 @@ pub fn stage_dev_boot_assets(root: &Path, data_dir: &Path, version: &str) -> Res
     // daemon's checksum check treats matching files as cached, so an
     // unreleased runtime bundle can be validated end-to-end before the CDN
     // carries it — pair with a matching dev manifest and a blanked
-    // assets.lock manifest pin.
+    // assets.lock manifest pin. The seed lands in this generation's
+    // directory, `runtime/<version>/`, which is the one the daemon reads;
+    // a copy in the unversioned `runtime/bin` shadows nothing.
     let seed_dir = dev_boot_dir.join("runtime-bin");
     if seed_dir.is_dir() {
-        let bin_dir = data_dir.join("runtime/bin");
+        let generation = data_dir.join("runtime").join(version);
+        let bin_dir = generation.join("bin");
         fs::create_dir_all(&bin_dir)?;
         for entry in fs::read_dir(&seed_dir)? {
             let entry = entry?;
             if entry.path().is_dir() {
                 // Subdirectories mirror `install_dir` binaries, which land as
                 // siblings of bin/ (e.g. runtime-bin/kernel/vmlinux →
-                // runtime/kernel/vmlinux).
-                let sibling = data_dir.join("runtime").join(entry.file_name());
+                // runtime/<version>/kernel/vmlinux).
+                let sibling = generation.join(entry.file_name());
                 fs::create_dir_all(&sibling)?;
                 for sub in fs::read_dir(entry.path())? {
                     let sub = sub?;
