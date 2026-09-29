@@ -126,6 +126,25 @@ the ABI.
   matches Ubuntu regardless of its own default — `err` and above still
   reach the console. The drain above is the correctness backstop; this cap
   keeps a distro's `info` chatter out of the daemon log.
+- **A machine that Oopses in `__seccomp_filter` under heavy churn is a known
+  guest-kernel bug, not a hypervisor or arcbox regression.** Under sustained
+  fork / cgroup / seccomp-scope / mount-namespace churn a machine's guest
+  kernel (6.18.38-arcbox) occasionally hits a use-after-free of a seccomp
+  cBPF filter: `__seccomp_filter` calls `bpf_func` = `0x0`, and the dying
+  task's `bpf_prog_free` then faults on a `bpf_prog` whose memory was
+  reallocated and overwritten with pointer-formatted ASCII (freed-then-reused
+  slab). It is stochastic and heap-timing-dependent — one machine crashed at
+  ~586 s uptime, another survived 1338 s under 2x the load (measured
+  2026-09-29). It is NOT the v0.0.24→v0.0.25 (0.8.6→0.8.7) kernel bump: that
+  diff is only the inert `arcbox_hvc_blk` DISCARD driver (machines use
+  virtio-blk), the config fragment is identical, and the 0.8.6 kernel is not
+  proven immune. Reproduce with concurrent in-guest churn
+  (`while :; do for i in $(seq 300); do /bin/true & done; wait; done` plus a
+  `systemd-run --scope -p SystemCallFilter=…` loop) driven for ~10 min;
+  the full trace is captured off `Guest[<name>]` console lines. The real fix
+  is kernel-side (KASAN-instrumented build + this reproducer on bare KVM to
+  pin the UAF, then a 6.18.z bump or backport); re-pinning to 0.8.6 is not
+  a proven mitigation.
 - `VZLinuxRosettaAvailability` raw values are notSupported=0, notInstalled=1,
   installed=2 (a hand-written mapping once had 1 and 2 swapped; the shim now
   returns raw values and Rust maps them — keep them aligned with the SDK).
