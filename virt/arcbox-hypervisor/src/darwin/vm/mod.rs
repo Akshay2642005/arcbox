@@ -2,6 +2,7 @@
 //!
 //! This module uses arcbox-vz for Virtualization.framework bindings.
 
+use std::os::fd::{BorrowedFd, OwnedFd};
 use std::os::unix::io::RawFd;
 use std::sync::{
     RwLock,
@@ -48,6 +49,15 @@ pub enum VmState {
     Stopped,
     /// VM encountered an error.
     Error,
+}
+
+/// Host read ends of a VM's console (`hvc0`) and agent-log (`hvc1`) pipes,
+/// duplicated by [`DarwinVm::dup_serial_readers`]. Both are non-blocking.
+pub struct SerialReaders {
+    /// Guest output on `hvc0`.
+    pub console: OwnedFd,
+    /// Guest output on `hvc1`, the agent's log channel.
+    pub agent_log: OwnedFd,
 }
 
 /// Virtual machine implementation for Darwin (macOS).
@@ -212,6 +222,19 @@ impl DarwinVm {
                 let write_fd = port.write_fd().ok_or_else(|| {
                     HypervisorError::DeviceError(format!("Failed to get {label} write fd"))
                 })?;
+                // The read end is non-blocking for life: the engine's drain
+                // waits on readiness and must never block in `read(2)`.
+                // SAFETY: `read_fd` is a live pipe fd this VM owns.
+                let flags = unsafe { libc::fcntl(read_fd, libc::F_GETFL) };
+                if flags == -1
+                    || unsafe { libc::fcntl(read_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) }
+                        == -1
+                {
+                    return Err(HypervisorError::DeviceError(format!(
+                        "Failed to make {label} read fd non-blocking: {}",
+                        std::io::Error::last_os_error()
+                    )));
+                }
                 Ok((port, read_fd, write_fd))
             };
 
@@ -403,6 +426,34 @@ impl DarwinVm {
             // guest mid-write — becomes U+FFFD instead of dropping its chunk.
             String::from_utf8_lossy(&bytes).into_owned()
         }
+    }
+
+    /// Duplicates the host read ends of the console (`hvc0`) and agent-log
+    /// (`hvc1`) pipes for a reader that owns them independently of this VM.
+    ///
+    /// The duplicates share the pipes' open file descriptions, so they are
+    /// non-blocking like the originals. They never see EOF while the VM is
+    /// configured: the host keeps the write end it handed to VZ, so a reader
+    /// needs its own stop signal.
+    pub fn dup_serial_readers(&self) -> Result<SerialReaders, HypervisorError> {
+        let dup = |fd: RawFd, label: &str| -> Result<OwnedFd, HypervisorError> {
+            // SAFETY: `fd` is a live pipe fd this VM owns; the borrow does
+            // not outlive the call.
+            let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+            borrowed.try_clone_to_owned().map_err(|e| {
+                HypervisorError::DeviceError(format!("Failed to dup {label} read fd: {e}"))
+            })
+        };
+        let (console, _) = self
+            .console_fds
+            .ok_or_else(|| HypervisorError::DeviceError("Console not configured".to_string()))?;
+        let (agent_log, _) = self.agent_log_fds.ok_or_else(|| {
+            HypervisorError::DeviceError("Agent log port not configured".to_string())
+        })?;
+        Ok(SerialReaders {
+            console: dup(console, "console")?,
+            agent_log: dup(agent_log, "agent-log")?,
+        })
     }
 
     /// Reads available console output (hvc0) from the guest.

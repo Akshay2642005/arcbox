@@ -871,7 +871,28 @@ impl VmManager {
         vmm.connect_vsock(port).map_err(EngineError::from)
     }
 
+    /// Duplicates a running VM's console pipe read ends for a serial drain;
+    /// `None` when the backend has no host-side pipes (HV).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the VM is unknown or the pipes cannot be duplicated.
+    #[cfg(target_os = "macos")]
+    pub fn dup_serial_readers(&self, id: &VmId) -> Result<Option<arcbox_vmm::SerialReaders>> {
+        let vms = self.vms.read().map_err(|_| EngineError::LockPoisoned)?;
+        let entry = vms
+            .get(id)
+            .ok_or_else(|| EngineError::not_found(id.to_string()))?;
+        let Some(vmm) = entry.vmm.as_ref() else {
+            return Ok(None);
+        };
+        vmm.dup_serial_readers().map_err(EngineError::from)
+    }
+
     /// Reads serial console output from a running VM (macOS only).
+    ///
+    /// While the machine's serial drain runs it owns the pipe; a concurrent
+    /// read here takes bytes away from it. Meant for a VM without a drain.
     #[cfg(target_os = "macos")]
     pub fn read_console_output(&self, id: &VmId) -> Result<String> {
         let vms = self.vms.read().map_err(|_| EngineError::LockPoisoned)?;

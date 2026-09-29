@@ -618,6 +618,16 @@ impl Vmm {
         }
     }
 
+    /// Duplicates the host read ends of the VZ console pipes for the
+    /// engine's serial drain. `None` on the HV backend, whose console is a
+    /// virtio device this VMM drains itself (`guest_console` target).
+    pub fn dup_serial_readers(&self) -> Result<Option<arcbox_hypervisor::darwin::SerialReaders>> {
+        self.darwin_vm
+            .as_ref()
+            .map(|vm| vm.dup_serial_readers().map_err(VmmError::Hypervisor))
+            .transpose()
+    }
+
     /// Reads console output (hvc0) from the VM.
     pub fn read_console_output(&self) -> Result<String> {
         if let Some(ref vm) = self.darwin_vm {
