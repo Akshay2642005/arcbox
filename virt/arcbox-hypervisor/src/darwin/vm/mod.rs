@@ -342,6 +342,13 @@ impl DarwinVm {
 
     /// Non-blocking read of all available data from a serial port file descriptor.
     fn read_serial_fd(read_fd: RawFd) -> String {
+        Self::read_serial_fd_chunked(read_fd, 4096)
+    }
+
+    /// [`Self::read_serial_fd`] reading `chunk` bytes per `read(2)`; the
+    /// tests shrink the chunk so a boundary falls inside what a small pipe
+    /// can hold.
+    fn read_serial_fd_chunked(read_fd: RawFd, chunk: usize) -> String {
         // SAFETY: All fd operations use valid pipe fds from setup_serial_console().
         // Flags are saved and restored to avoid side effects.
         unsafe {
@@ -358,8 +365,8 @@ impl DarwinVm {
                 return String::new();
             }
 
-            let mut buffer = vec![0u8; 4096];
-            let mut output = String::new();
+            let mut buffer = vec![0u8; chunk];
+            let mut bytes = Vec::new();
 
             loop {
                 let bytes_read = libc::read(
@@ -369,9 +376,7 @@ impl DarwinVm {
                 );
 
                 if bytes_read > 0 {
-                    if let Ok(s) = std::str::from_utf8(&buffer[..bytes_read as usize]) {
-                        output.push_str(s);
-                    }
+                    bytes.extend_from_slice(&buffer[..bytes_read as usize]);
                 } else if bytes_read == 0 {
                     break;
                 } else {
@@ -391,7 +396,12 @@ impl DarwinVm {
                     errno
                 );
             }
-            output
+
+            // Decode once over everything read: a multi-byte character that
+            // straddles two reads is whole here (checked per read, it cost
+            // both chunks), and one cut off by the end of the pipe — the
+            // guest mid-write — becomes U+FFFD instead of dropping its chunk.
+            String::from_utf8_lossy(&bytes).into_owned()
         }
     }
 
