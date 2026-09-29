@@ -216,13 +216,29 @@ const fn boot_console() -> &'static str {
 /// or its resolver's upstream from what the boot shim set up before init.
 const KEEP_KERNEL_NIC_NAMES: &str = "net.ifnames=0";
 
+/// Caps the kernel console at `err` and above, matching the
+/// `console_loglevel` Ubuntu's image already sets in `sysctl.d`.
+///
+/// `console=hvc0` (above) routes every kernel `printk` to the host pipe. A
+/// distro whose kernel default is the noisier `7` — Debian is the notable
+/// one — then streams `info`-level records there forever: an idle machine's
+/// systemd unit churn alone emits an `audit:` line on `hvc0` every unit
+/// start/stop (~285 KiB/day, measured 2026-09-29), while Ubuntu at `4` stays
+/// silent after boot. The host now drains that pipe per machine
+/// (`machine::serial`), so a full pipe no longer wedges the VM, but a
+/// machine that trickles for nothing still costs the drain its idle backoff.
+/// Pinning the level on the command line brings every distro down to
+/// Ubuntu's near-silent console regardless of its own default. `err` and
+/// above still reach the console, so a genuine boot failure is not hidden.
+const QUIET_KERNEL_CONSOLE: &str = "loglevel=4";
+
 /// Kernel command line for a shim-less distro machine: root on the read-only
 /// rootfs image at vda (custom-kernel testing).
 fn default_distro_cmdline(rootfs_format: &str) -> String {
     let console = boot_console();
     format!(
         "console={console} root=/dev/vda ro rootfstype={rootfs_format} earlycon \
-         {KEEP_KERNEL_NIC_NAMES}"
+         {KEEP_KERNEL_NIC_NAMES} {QUIET_KERNEL_CONSOLE}"
     )
 }
 
@@ -238,7 +254,7 @@ fn machine_shim_cmdline(rootfs_format: &str, mounts: &[MachineMount]) -> String 
     let console = boot_console();
     let mut cmdline = format!(
         "console={console} root=/dev/vda ro rootfstype=erofs earlycon \
-         {KEEP_KERNEL_NIC_NAMES} init={MACHINE_INIT_PATH} \
+         {KEEP_KERNEL_NIC_NAMES} {QUIET_KERNEL_CONSOLE} init={MACHINE_INIT_PATH} \
          {MACHINE_ROOTFS_KEY}/dev/vdb {MACHINE_ROOTFS_TYPE_KEY}{rootfs_format} \
          {MACHINE_DATA_KEY}/dev/vdc"
     );

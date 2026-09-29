@@ -307,6 +307,9 @@ async fn test_create_with_shim_assembles_boot_contract() {
         )),
         "{cmdline}"
     );
+    // The console is capped so a loud distro (Debian at console_loglevel 7)
+    // does not trickle kernel audit records onto hvc0 forever.
+    assert!(cmdline.contains("loglevel=4"), "{cmdline}");
 }
 
 #[tokio::test]
