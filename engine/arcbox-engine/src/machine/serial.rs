@@ -49,18 +49,21 @@ pub(super) async fn drain_serial(machine_manager: Arc<MachineManager>, machine: 
     let mut idle_streak: u32 = 0;
 
     loop {
+        // Any byte read means the guest is writing and the pipe needs the
+        // fast poll, whatever the bytes are: NUL padding is not worth
+        // logging, but a guest that fills the pipe with it (`head -c N
+        // /dev/zero > /dev/hvc0`) still blocks until the pipe is drained.
         let mut had_output = false;
 
         if let Ok(output) = machine_manager.read_console_output(&machine) {
-            if process_serial_output(
+            had_output |= !output.is_empty();
+            process_serial_output(
                 &mut console_buf,
                 &output,
                 &console_label,
                 console_info,
                 MAX_LINE_BUF,
-            ) {
-                had_output = true;
-            }
+            );
         } else {
             flush_line_buf(&mut console_buf, &console_label, console_info);
             flush_line_buf(&mut agent_buf, &agent_label, false);
@@ -69,9 +72,8 @@ pub(super) async fn drain_serial(machine_manager: Arc<MachineManager>, machine: 
         }
 
         if let Ok(output) = machine_manager.read_agent_log_output(&machine) {
-            if process_serial_output(&mut agent_buf, &output, &agent_label, false, MAX_LINE_BUF) {
-                had_output = true;
-            }
+            had_output |= !output.is_empty();
+            process_serial_output(&mut agent_buf, &output, &agent_label, false, MAX_LINE_BUF);
         }
         // Agent log failure is non-fatal — console may still work.
 
@@ -88,18 +90,16 @@ pub(super) async fn drain_serial(machine_manager: Arc<MachineManager>, machine: 
 }
 
 /// Process raw serial output into line-buffered log messages.
-///
-/// Returns `true` if any non-empty output was received.
 fn process_serial_output(
     line_buf: &mut String,
     output: &str,
     label: &str,
     level_info: bool,
     max_buf: usize,
-) -> bool {
+) {
     let trimmed = output.trim_matches('\0');
     if trimmed.is_empty() {
-        return false;
+        return;
     }
 
     line_buf.push_str(trimmed);
@@ -123,8 +123,6 @@ fn process_serial_output(
         tracing::warn!("{label}: line buffer overflow, flushing");
         line_buf.clear();
     }
-
-    true
 }
 
 /// Flush any remaining partial line from a serial buffer.
@@ -148,35 +146,32 @@ mod tests {
     fn a_burst_of_complete_lines_is_not_an_overflow() {
         let mut buf = String::new();
         let burst: String = std::iter::repeat_n("line\n", 100).collect();
-        assert!(process_serial_output(&mut buf, &burst, "T", false, 64));
+        process_serial_output(&mut buf, &burst, "T", false, 64);
         assert!(buf.is_empty(), "every complete line was consumed");
     }
 
     #[test]
     fn an_unterminated_line_past_the_bound_is_dropped() {
         let mut buf = String::new();
-        assert!(process_serial_output(
-            &mut buf,
-            &"x".repeat(65),
-            "T",
-            false,
-            64
-        ));
+        process_serial_output(&mut buf, &"x".repeat(65), "T", false, 64);
         assert!(buf.is_empty());
     }
 
     #[test]
     fn a_partial_line_waits_for_its_newline() {
         let mut buf = String::new();
-        assert!(process_serial_output(&mut buf, "abc", "T", false, 64));
+        process_serial_output(&mut buf, "abc", "T", false, 64);
         assert_eq!(buf, "abc");
-        assert!(process_serial_output(&mut buf, "def\n", "T", false, 64));
+        process_serial_output(&mut buf, "def\n", "T", false, 64);
         assert!(buf.is_empty());
     }
 
     #[test]
-    fn nul_padding_alone_is_not_output() {
+    fn nul_padding_is_not_buffered() {
         let mut buf = String::new();
-        assert!(!process_serial_output(&mut buf, "\0\0", "T", false, 64));
+        process_serial_output(&mut buf, "\0\0", "T", false, 64);
+        assert!(buf.is_empty());
+        process_serial_output(&mut buf, "\0abc\0", "T", false, 64);
+        assert_eq!(buf, "abc");
     }
 }

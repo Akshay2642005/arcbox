@@ -1037,10 +1037,10 @@ impl MachineManager {
     /// Logs the tail of a machine's console and agent-log pipes at WARN, for
     /// diagnosing a boot that never reached agent readiness.
     ///
-    /// Machine VMs (unlike the System VM) have no background serial drain, so
-    /// early-boot output — including a kernel panic or a shim `poweroff` —
-    /// sits unread in the host-side console pipe buffer and is recoverable
-    /// here even after the guest has died.
+    /// The serial drain starts only once `start` has marked the machine
+    /// `Running`, so early-boot output — including a kernel panic or a shim
+    /// `poweroff` — sits unread in the host-side console pipe buffer and is
+    /// recoverable here even after the guest has died.
     #[cfg(target_os = "macos")]
     fn log_console_tail(&self, name: &str) {
         // Read the vm_id directly: the machine may already be non-Running
