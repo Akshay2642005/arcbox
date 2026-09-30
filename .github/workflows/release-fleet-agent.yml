@@ -304,7 +304,7 @@ jobs:
       # Binaries first, latest.json last. A pre-release stages no latest.json,
       # so the pointer only moves for stable versions.
       - name: Publish to R2
-        uses: arcboxlabs/actions/r2-publish@v1
+        uses: arcboxlabs/actions/r2-publish@v2
         with:
           account-id: ${{ vars.R2_ACCOUNT_ID }}
           access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
