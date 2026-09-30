@@ -142,11 +142,12 @@ pub fn vsock_rx_worker_loop(ctx: VsockRxWorkerContext) {
             }
         }
 
-        let injected = ctx.device_manager.poll_vsock_rx();
-        if injected {
+        let round = ctx.device_manager.poll_vsock_rx();
+        if round.raise {
             ctx.device_manager
                 .raise_interrupt_for(DeviceType::VirtioVsock, INT_VRING);
-        } else if had_fd_data {
+        }
+        if !round.wrote && had_fd_data {
             // Data is buffered but the guest must free descriptors or grant
             // credit first; back off so level-triggered kevent doesn't spin.
             std::thread::sleep(NO_PROGRESS_BACKOFF);

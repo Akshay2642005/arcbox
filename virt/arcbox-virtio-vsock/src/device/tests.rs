@@ -907,7 +907,7 @@ fn one_round_drains_every_stream_round_robin() {
     write_all(host_a, b'a', 10_000);
     write_all(host_b, b'b', 8_000);
 
-    assert!(vsock.poll_rx_injection(&ring.config(), None));
+    assert!(vsock.poll_rx_injection(&ring.config(), None, false).raise);
 
     let pkts = ring.completed(&memory);
     let ports: Vec<u32> = pkts.iter().map(|(h, _)| h.dst_port).collect();
@@ -958,7 +958,7 @@ fn a_round_stops_at_the_last_posted_buffer_and_resumes() {
     let (id, host) = &hosts[0];
     write_all(host, b'x', 10_000);
 
-    assert!(vsock.poll_rx_injection(&ring.config(), None));
+    assert!(vsock.poll_rx_injection(&ring.config(), None, false).raise);
     assert_eq!(ring.used_idx(&memory), 2);
     {
         let m = mgr.lock().unwrap();
@@ -967,7 +967,7 @@ fn a_round_stops_at_the_last_posted_buffer_and_resumes() {
     }
 
     ring.post(&mut memory, 2);
-    assert!(vsock.poll_rx_injection(&ring.config(), None));
+    assert!(vsock.poll_rx_injection(&ring.config(), None, false).raise);
     assert_eq!(ring.used_idx(&memory), 3);
     let total: usize = ring.completed(&memory).iter().map(|(_, p)| p.len()).sum();
     assert_eq!(total, 10_000);
@@ -986,7 +986,7 @@ fn a_closing_window_sends_the_credit_request_ahead_of_pending_data() {
     let (id, host) = &hosts[0];
     write_all(host, b'x', 10_000);
 
-    assert!(vsock.poll_rx_injection(&ring.config(), None));
+    assert!(vsock.poll_rx_injection(&ring.config(), None, false).raise);
 
     let ops: Vec<(Option<VsockOp>, usize)> = ring
         .completed(&memory)
@@ -1022,7 +1022,7 @@ fn a_closing_window_sends_the_credit_request_ahead_of_pending_data() {
         );
         assert_eq!(m.backend_rxq.front(), Some(id));
     }
-    assert!(vsock.poll_rx_injection(&ring.config(), None));
+    assert!(vsock.poll_rx_injection(&ring.config(), None, false).raise);
     let total: usize = ring
         .completed(&memory)
         .iter()
@@ -1030,4 +1030,64 @@ fn a_closing_window_sends_the_credit_request_ahead_of_pending_data() {
         .map(|(_, p)| p.len())
         .sum();
     assert_eq!(total, 10_000);
+}
+
+/// With EVENT_IDX the round interrupts only when the guest asked for it:
+/// `used_event` inside the range it published means raise; a far-away
+/// `used_event` (the guest is still draining) means data landed silently,
+/// and a starved round that wrote nothing has nothing to report.
+#[test]
+fn an_event_idx_round_interrupts_only_when_the_guest_asked() {
+    let mut memory = vec![0u8; 0x30000];
+    let mut ring = RxRing::layout(&mut memory);
+    ring.post(&mut memory, 2);
+    let (mut vsock, mgr, hosts) = bind_injection_device(&mut memory, 1, 1 << 20);
+    let (id, host) = &hosts[0];
+    let used_event_off = ring.avail + 4 + 2 * RX_Q_SIZE;
+
+    // The guest enabled callbacks at used.idx 0: it wants the next entry.
+    memory[used_event_off..used_event_off + 2].copy_from_slice(&0u16.to_le_bytes());
+    write_all(host, b'x', 1_000);
+    assert_eq!(
+        vsock.poll_rx_injection(&ring.config(), None, true),
+        RxRound {
+            wrote: true,
+            raise: true
+        }
+    );
+    assert_eq!(ring.used_idx(&memory), 1);
+
+    // Now the guest is draining with callbacks disabled (used_event far off):
+    // the data still lands, without an interrupt.
+    memory[used_event_off..used_event_off + 2].copy_from_slice(&0x7fffu16.to_le_bytes());
+    write_all(host, b'y', 1_000);
+    assert_eq!(
+        vsock.poll_rx_injection(&ring.config(), None, true),
+        RxRound {
+            wrote: true,
+            raise: false
+        }
+    );
+    assert_eq!(ring.used_idx(&memory), 2);
+
+    // Out of descriptors with data pending: the stream stays queued
+    // (rxq_starved) but nothing new was published, so no interrupt either.
+    write_all(host, b'z', 1_000);
+    assert_eq!(
+        vsock.poll_rx_injection(&ring.config(), None, true),
+        RxRound {
+            wrote: false,
+            raise: false
+        }
+    );
+    assert_eq!(mgr.lock().unwrap().backend_rxq.front(), Some(id));
+
+    // Without EVENT_IDX the same starved round interrupts so the guest refills.
+    assert_eq!(
+        vsock.poll_rx_injection(&ring.config(), None, false),
+        RxRound {
+            wrote: false,
+            raise: true
+        }
+    );
 }

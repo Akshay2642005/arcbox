@@ -2,6 +2,18 @@ use arcbox_virtio_core::{QueueConfig, VirtioDevice};
 
 use super::*;
 
+/// What one injection round did.
+///
+/// `wrote` says the round moved something into the guest, so the caller
+/// keeps draining instead of backing off; `raise` says the guest has to be
+/// interrupted for it. With EVENT_IDX the two differ: a guest that is
+/// still draining the ring sees new used entries without an interrupt.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RxRound {
+    pub wrote: bool,
+    pub raise: bool,
+}
+
 impl VirtioVsock {
     // `poll_rx_injection` was previously `DeviceManager::poll_vsock_rx`.
     // It is the device side of the vsock RX loop the BSP vCPU drives
@@ -25,24 +37,29 @@ impl VirtioVsock {
     ///    `process_queue(1, ...)` so guest→host responses are picked up
     ///    on the same poll cycle.
     ///
-    /// Returns `true` when anything was injected (caller fires
-    /// INT_VRING). Returns `false` if the device isn't fully bound or
-    /// nothing was pending.
+    /// `event_idx` says the guest negotiated `VIRTIO_F_EVENT_IDX`: the
+    /// round then asks for an interrupt only if the guest's `used_event`
+    /// falls in the range of used entries it published, decided once for
+    /// the whole round like blk and net-rx do per batch. A starved round
+    /// that wrote nothing has nothing new to report. Without EVENT_IDX
+    /// every round that consumed a descriptor or ran out of them
+    /// interrupts, as before.
     #[allow(clippy::too_many_lines)]
     pub fn poll_rx_injection(
         &mut self,
         rx_qcfg: &QueueConfig,
         tx_qcfg: Option<&QueueConfig>,
-    ) -> bool {
+        event_idx: bool,
+    ) -> RxRound {
         use std::os::fd::AsRawFd;
 
         use crate::manager::{RxOps, TX_BUFFER_SIZE};
 
         let Some(ctx) = self.ctx.clone() else {
-            return false;
+            return RxRound::default();
         };
         let Some(conns) = self.conn_mgr.clone() else {
-            return false;
+            return RxRound::default();
         };
         let mem_arc = ctx.mem.clone();
         let gpa_base_usize = mem_arc.gpa_base();
@@ -107,16 +124,28 @@ impl VirtioVsock {
         // Phase 2: drain backend_rxq → fill RX descriptors
         // ------------------------------------------------------------------
         if !rx_qcfg.ready || rx_qcfg.size == 0 {
-            return injected;
+            return RxRound {
+                wrote: false,
+                raise: injected,
+            };
         }
         let Some(rx_desc) = (rx_qcfg.desc_addr as usize).checked_sub(gpa_base_usize) else {
-            return injected;
+            return RxRound {
+                wrote: false,
+                raise: injected,
+            };
         };
         let Some(rx_avail) = (rx_qcfg.avail_addr as usize).checked_sub(gpa_base_usize) else {
-            return injected;
+            return RxRound {
+                wrote: false,
+                raise: injected,
+            };
         };
         let Some(rx_used) = (rx_qcfg.used_addr as usize).checked_sub(gpa_base_usize) else {
-            return injected;
+            return RxRound {
+                wrote: false,
+                raise: injected,
+            };
         };
         let q_size = rx_qcfg.size as usize;
 
@@ -125,11 +154,17 @@ impl VirtioVsock {
         // re-derives its own slice) and used only by code that follows the
         // VirtIO descriptor-ownership discipline.
         let Some(guest_mem) = (unsafe { mem_arc.slice_mut(gpa_base_usize, mem_len) }) else {
-            return injected;
+            return RxRound {
+                wrote: false,
+                raise: injected,
+            };
         };
 
         if rx_avail + 4 > guest_mem.len() {
-            return injected;
+            return RxRound {
+                wrote: false,
+                raise: injected,
+            };
         }
 
         // Process backend_rxq: pop connections, fill RX descriptors. If we
@@ -138,6 +173,8 @@ impl VirtioVsock {
         // wakes the guest's rx_work, which refills descriptors, and the
         // next poll cycle drains the stalled entries.
         let mut rxq_starved = false;
+        let mut wrote_any = false;
+        let used_at_start = u16::from_le_bytes([guest_mem[rx_used + 2], guest_mem[rx_used + 3]]);
         loop {
             let avail_idx =
                 u16::from_le_bytes([guest_mem[rx_avail + 2], guest_mem[rx_avail + 3]]) as usize;
@@ -408,6 +445,7 @@ impl VirtioVsock {
                 // completion of an unusable chain — so the guest must be
                 // interrupted to reclaim the descriptor.
                 injected = true;
+                wrote_any = true;
 
                 // Fire injected_notify only when the packet actually landed:
                 // a REQUEST op unblocks a daemon-side connect waiting in
@@ -437,6 +475,20 @@ impl VirtioVsock {
         if rxq_starved {
             injected = true;
         }
+        if event_idx {
+            let used_now = u16::from_le_bytes([guest_mem[rx_used + 2], guest_mem[rx_used + 3]]);
+            injected = wrote_any
+                && Self::rx_notify_needed(
+                    guest_mem,
+                    rx_desc,
+                    rx_avail,
+                    rx_used,
+                    q_size,
+                    gpa_base_usize,
+                    used_at_start,
+                    used_now,
+                );
+        }
 
         // Drop the phase-2 slice borrow before phase 3 re-derives one
         // (and before we hand a fresh `&mut [u8]` to `process_queue`,
@@ -450,7 +502,10 @@ impl VirtioVsock {
             // SAFETY: same as above — short-lived slice, descriptor-scoped
             // access discipline holds.
             let Some(tx_mem) = (unsafe { mem_arc.slice_mut(gpa_base_usize, mem_len) }) else {
-                return injected;
+                return RxRound {
+                    wrote: wrote_any,
+                    raise: injected,
+                };
             };
             // Use `VirtioDevice::process_queue` directly on `&mut self`.
             // `tx_mem` borrows `mem_arc` (a clone), not `self`, so the
@@ -476,7 +531,42 @@ impl VirtioVsock {
             }
         }
 
-        injected
+        RxRound {
+            wrote: wrote_any,
+            raise: injected,
+        }
+    }
+
+    /// EVENT_IDX decision for a round that advanced `used.idx` from
+    /// `old_used` to `new_used` (`SplitQueue::notify_needed`).
+    #[allow(clippy::too_many_arguments)]
+    fn rx_notify_needed(
+        guest_mem: &mut [u8],
+        desc_addr: usize,
+        avail_addr: usize,
+        used_addr: usize,
+        q_size: usize,
+        gpa_base: usize,
+        old_used: u16,
+        new_used: u16,
+    ) -> bool {
+        let cfg = QueueConfig {
+            desc_addr: (desc_addr + gpa_base) as u64,
+            avail_addr: (avail_addr + gpa_base) as u64,
+            used_addr: (used_addr + gpa_base) as u64,
+            size: q_size as u16,
+            ready: true,
+            gpa_base: gpa_base as u64,
+        };
+        // SAFETY: as in `write_to_rx_descriptor`.
+        let mem = std::sync::Arc::new(unsafe {
+            arcbox_virtio_core::GuestMemWriter::new(
+                guest_mem.as_mut_ptr(),
+                guest_mem.len(),
+                gpa_base,
+            )
+        });
+        arcbox_virtio_core::SplitQueue::new(mem, 0, &cfg, true).notify_needed(old_used, new_used)
     }
 
     /// Writable bytes in the next available RX descriptor chain, without
