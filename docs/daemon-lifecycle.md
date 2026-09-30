@@ -134,6 +134,10 @@ write current PID
 signal received
   ├─ cancel CancellationToken         → all services begin draining
   ├─ drain(DNS, Docker, gRPC)         → 5 s timeout, then abort
+  │   Docker and the control plane close idle keep-alive connections at
+  │   once and finish in-flight requests with `Connection: close`; only
+  │   a request still running can use the budget. A client that parks
+  │   a pooled connection does not hold the daemon.
   ├─ runtime.shutdown()
   │   ├─ stop port forwarders
   │   ├─ vm_lifecycle.shutdown()       → graceful VM stop; bridge routes expire
