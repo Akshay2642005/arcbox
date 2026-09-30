@@ -49,7 +49,10 @@ The project is in **alpha**. Breaking changes (internal or user-facing) are acce
 - `guest/` — in-VM agent (cross-compiled for Linux)
 - `tests/` — test resources and fixture build scripts
 - `.agents/skills/` — shared coding-agent skills (symlinked from `.claude/skills/`)
-- `docs/` — supplementary documentation (boot assets, daemon lifecycle)
+- `docs/` — engineering docs: reference guides at the top level,
+  `docs/adr/` decisions, `docs/logs/` development and experiment logs,
+  `docs/architecture/` and `docs/plans/` for long-form designs and
+  execution plans; layout, templates and the index in `docs/README.md`
 
 ## Component Rules
 
@@ -108,6 +111,17 @@ When asked to plan, the plan must be fully resolved before implementation begins
 ## Testing
 
 - Tests are expected for code changes. Only test meaningful logic (branching, transformations, error handling). Don't test code that can only break if the language, runtime, or a dependency breaks.
+
+## Documentation
+
+- An experiment, benchmark, bisect or investigation that produced numbers
+  or a verdict ends in a `docs/logs/YYYY-MM-DD-<slug>.md` entry in the same
+  commit series, with its probes checked in under `tests/bench/` or an e2e
+  target so it can be rerun. Retiring a mechanism, choosing between
+  designs, or setting a rule a later change must not undo silently gets an
+  ADR in `docs/adr/`; the ADR cites the log entries, it does not repeat
+  them. `docs/README.md` holds the layout, the templates and the index —
+  add the new file to the index.
 
 ## Change Discipline
 
