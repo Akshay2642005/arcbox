@@ -89,8 +89,9 @@ pub struct EarlyContext {
     /// Slot filled once the selected non-default container CIDR is known.
     pub container_network_lease_slot: SharedContainerNetworkLease,
     pub dns_domain: String,
-    /// Requested DNS port; 0 lets the bound service choose an ephemeral port.
-    pub dns_port: u16,
+    /// Explicit DNS port; 0 lets the bound service choose one. `None` binds
+    /// the profile's port, falling back to an OS-allocated one when taken.
+    pub dns_port: Option<u16>,
     /// Explicit authorization for a non-canonical resolver domain mutation.
     pub install_dns_resolver: bool,
     /// Explicit Kubernetes proxy port; 0 lets the bound service choose one.
@@ -128,8 +129,9 @@ pub struct DaemonContext {
     /// Holds the same-user CIDR lease until shutdown cleanup completes.
     pub container_network_lease_slot: SharedContainerNetworkLease,
     pub dns_domain: String,
-    /// Requested DNS port; the actual bound port lives in [`ServiceHandles`].
-    pub dns_port: u16,
+    /// Explicit DNS port; `None` binds the profile's port best-effort. The
+    /// actual bound port lives in [`ServiceHandles`].
+    pub dns_port: Option<u16>,
     /// Explicit authorization for a non-canonical resolver domain mutation.
     pub install_dns_resolver: bool,
     /// Explicit Kubernetes proxy port; `None` uses best-effort port 16443.

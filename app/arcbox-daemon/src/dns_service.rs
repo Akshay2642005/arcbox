@@ -6,6 +6,8 @@
 
 use anyhow::{Context, Result};
 use arcbox_net::NetworkManager;
+use std::io;
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
@@ -17,15 +19,46 @@ pub struct DnsService {
 }
 
 impl DnsService {
-    /// Binds the UDP socket on `127.0.0.1:{port}`.
+    /// Binds the UDP socket on `127.0.0.1`.
     ///
-    /// Called eagerly at daemon startup so that a bind failure (port already in
-    /// use) propagates up and aborts the daemon before it enters the main loop.
-    pub async fn bind(network_manager: Arc<NetworkManager>, port: u16) -> Result<Self> {
-        let addr = format!("127.0.0.1:{port}");
-        let socket = UdpSocket::bind(&addr)
-            .await
-            .with_context(|| format!("DNS service failed to bind {addr}"))?;
+    /// An explicitly requested port (`--dns-port` or `ARCBOX_DNS_PORT`, `0`
+    /// for any) must bind or startup fails, as for the Kubernetes proxy and
+    /// the SSH server. The profile's `default` port is best-effort with one
+    /// difference: `NETWORK_READY` promises DNS, so a taken default falls
+    /// back to an OS-allocated port instead of leaving the daemon without
+    /// DNS. Self-setup publishes whichever port was bound through
+    /// `/etc/resolver/<domain>`, and `abctl dns status` probes the port that
+    /// file names.
+    ///
+    /// Called eagerly at daemon startup so that a bind failure propagates up
+    /// and aborts the daemon before it enters the main loop.
+    pub async fn bind_requested(
+        network_manager: Arc<NetworkManager>,
+        requested: Option<u16>,
+        default: u16,
+    ) -> Result<Self> {
+        let socket = match requested {
+            Some(port) => bind_loopback(port)
+                .await
+                .with_context(|| bind_error(port))?,
+            None => match bind_loopback(default).await {
+                Ok(socket) => socket,
+                Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+                    let socket = bind_loopback(0).await.with_context(|| bind_error(0))?;
+                    let fallback = socket
+                        .local_addr()
+                        .context("Failed to read DNS service address")?
+                        .port();
+                    tracing::warn!(
+                        port = default,
+                        fallback,
+                        "DNS port in use; listening on an OS-allocated port instead"
+                    );
+                    socket
+                }
+                Err(error) => Err(error).with_context(|| bind_error(default))?,
+            },
+        };
         let actual_addr = socket
             .local_addr()
             .context("Failed to read DNS service address")?;
@@ -112,6 +145,15 @@ impl DnsService {
     }
 }
 
+/// Binds a UDP socket on `127.0.0.1:{port}`; `0` asks the OS for any port.
+async fn bind_loopback(port: u16) -> io::Result<UdpSocket> {
+    UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).await
+}
+
+fn bind_error(port: u16) -> String {
+    format!("DNS service failed to bind 127.0.0.1:{port}")
+}
+
 /// Builds a SERVFAIL response from the original query bytes.
 fn build_servfail(query: &[u8]) -> Option<Vec<u8>> {
     if query.len() < 12 {
@@ -157,17 +199,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dns_bind_fail_fast() {
-        // Occupy a port, then verify DnsService::bind on the same port fails.
+    async fn explicit_port_in_use_fails_startup() {
         let blocker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let port = blocker.local_addr().unwrap().port();
 
         let nm = Arc::new(NetworkManager::new(arcbox_net::NetConfig::default()));
-        let result = DnsService::bind(nm, port).await;
+        let result = DnsService::bind_requested(nm, Some(port), port).await;
         assert!(
             result.is_err(),
-            "expected DnsService::bind to fail on occupied port"
+            "an explicitly requested port that is taken must fail, not fall back"
         );
+    }
+
+    #[tokio::test]
+    async fn default_port_in_use_falls_back_to_an_os_port() {
+        let blocker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let taken = blocker.local_addr().unwrap().port();
+
+        let nm = Arc::new(NetworkManager::new(arcbox_net::NetConfig::default()));
+        let service = DnsService::bind_requested(nm, None, taken)
+            .await
+            .expect("a taken default port must not fail startup");
+        let bound = service.host_port().unwrap();
+        assert_ne!(bound, taken);
+        assert_ne!(bound, 0);
     }
 
     #[tokio::test]
@@ -177,7 +232,9 @@ mod tests {
         nm.register_dns("my-nginx", ip);
 
         // Bind server on random port via DnsService::bind.
-        let service = DnsService::bind(Arc::clone(&nm), 0).await.unwrap();
+        let service = DnsService::bind_requested(Arc::clone(&nm), Some(0), 0)
+            .await
+            .unwrap();
         let server_addr = ("127.0.0.1", service.host_port().unwrap());
 
         let server_handle =
@@ -217,7 +274,9 @@ mod tests {
         let nm = Arc::new(NetworkManager::new(arcbox_net::NetConfig::default()));
         // Don't register anything — query should get NXDOMAIN.
 
-        let service = DnsService::bind(Arc::clone(&nm), 0).await.unwrap();
+        let service = DnsService::bind_requested(Arc::clone(&nm), Some(0), 0)
+            .await
+            .unwrap();
         let server_addr = ("127.0.0.1", service.host_port().unwrap());
 
         let server_handle =

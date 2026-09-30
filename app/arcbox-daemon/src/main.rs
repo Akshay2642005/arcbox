@@ -49,7 +49,9 @@ pub struct DaemonArgs {
     #[arg(long)]
     pub dns_domain: Option<arcbox_helper::validate::Domain>,
 
-    /// Host UDP port for DNS; 0 asks the OS to allocate one (default: 5553).
+    /// Host UDP port for DNS; 0 asks the OS to allocate one. Unset, the
+    /// profile's port (5553 production, 5554 development) is tried first and
+    /// an OS-allocated port is used when it is taken.
     #[arg(long)]
     pub dns_port: Option<u16>,
 

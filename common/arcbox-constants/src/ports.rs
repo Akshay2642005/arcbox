@@ -15,6 +15,17 @@ pub const KUBERNETES_API_HOST_PORT: u16 = 16443;
 /// 32222 OrbStack uses so both can run side by side.
 pub const SSH_HOST_PORT: u16 = 16022;
 
+/// Host loopback UDP port of the production daemon's DNS server, the port
+/// `/etc/resolver/arcbox.local` names.
+pub const DNS_HOST_PORT: u16 = 5553;
+
+/// Host loopback UDP port of the development daemon's DNS server.
+///
+/// Distinct so a development daemon runs beside the production one; the
+/// development profile never owns the canonical resolver file, so nothing
+/// else on the host has to know this number.
+pub const DEVELOPMENT_DNS_HOST_PORT: u16 = 5554;
+
 /// Guest localhost port for the Kubernetes API server.
 pub const KUBERNETES_API_GUEST_PORT: u16 = 6443;
 

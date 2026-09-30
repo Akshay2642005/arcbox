@@ -28,9 +28,6 @@ use crate::context::{DaemonContext, EarlyContext, StartupHandles, VmArgs};
 
 const DNS_PREFIX: &str = "arcbox";
 pub const DEFAULT_DNS_DOMAIN: &str = "arcbox.local";
-/// Canonical production DNS port. Isolated instances may request port 0 and
-/// publish the actual bound port through their unique resolver domain.
-pub const DEFAULT_DNS_PORT: u16 = 5553;
 
 /// Phase 1: directories, config, sockets. No runtime, no lock yet.
 ///
@@ -353,15 +350,17 @@ pub fn resolve_data_dir(profile: ArcboxProfile, data_dir: Option<&PathBuf>) -> P
     HostLayout::resolve_for_profile_from_env(profile, data_dir.map(PathBuf::as_path)).data_dir
 }
 
-fn dns_port(cli_port: Option<u16>) -> u16 {
-    if let Some(port) = cli_port {
-        return port;
-    }
-    let key = format!("{}_DNS_PORT", to_env_prefix(DNS_PREFIX));
-    std::env::var(key)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_DNS_PORT)
+/// The explicitly requested DNS port: `--dns-port`, then `ARCBOX_DNS_PORT`.
+///
+/// `None` leaves the choice to the DNS service, which binds the profile's
+/// port and falls back to an OS-allocated one when it is taken. Isolated
+/// instances request `0` and publish the bound port through their unique
+/// resolver domain.
+fn dns_port(cli_port: Option<u16>) -> Option<u16> {
+    cli_port.or_else(|| {
+        let key = format!("{}_DNS_PORT", to_env_prefix(DNS_PREFIX));
+        std::env::var(key).ok().and_then(|s| s.parse().ok())
+    })
 }
 
 fn dns_domain(cli_domain: Option<Domain>) -> Result<String> {

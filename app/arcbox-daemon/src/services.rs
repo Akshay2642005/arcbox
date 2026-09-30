@@ -81,10 +81,13 @@ pub async fn start_services(
         .await?;
     }
 
-    // DNS service.
-    let dns_service = DnsService::bind(Arc::clone(runtime.network_manager()), ctx.dns_port)
-        .await
-        .context("Failed to start DNS service")?;
+    let dns_service = DnsService::bind_requested(
+        Arc::clone(runtime.network_manager()),
+        ctx.dns_port,
+        ctx.profile.dns_host_port(),
+    )
+    .await
+    .context("Failed to start DNS service")?;
     let dns_port = dns_service.host_port()?;
 
     // VM-host-only mode: the Docker API, Docker CLI integration, and the

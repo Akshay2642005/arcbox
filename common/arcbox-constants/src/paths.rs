@@ -139,6 +139,18 @@ impl ArcboxProfile {
         }
     }
 
+    /// Returns the default host DNS port for this profile.
+    ///
+    /// The daemon binds it best-effort and falls back to an OS-allocated
+    /// port when it is taken; an explicit `--dns-port` must bind.
+    #[must_use]
+    pub const fn dns_host_port(self) -> u16 {
+        match self {
+            Self::Production => crate::ports::DNS_HOST_PORT,
+            Self::Development => crate::ports::DEVELOPMENT_DNS_HOST_PORT,
+        }
+    }
+
     /// Returns the profile selected by `ARCBOX_PROFILE`, defaulting to production.
     #[cfg(feature = "std")]
     #[must_use]
