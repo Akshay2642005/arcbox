@@ -82,20 +82,10 @@ impl DeviceManager {
 
     /// Handles MMIO write.
     ///
-    /// `vcpu` is the vCPU that issued the access, `None` for a host-originated
-    /// one. An `INTERRUPT_ACK` from a vCPU records it as the CPU the guest
-    /// routes the device's SPI to (`VirtioMmioState::irq_ack_vcpu`).
-    ///
     /// # Errors
     ///
     /// Returns an error if the write fails.
-    pub fn handle_mmio_write(
-        &self,
-        vcpu: Option<u32>,
-        addr: u64,
-        size: usize,
-        value: u64,
-    ) -> Result<()> {
+    pub fn handle_mmio_write(&self, addr: u64, size: usize, value: u64) -> Result<()> {
         let device_id = self
             .find_by_mmio(addr)
             .ok_or_else(|| VmmError::Device(format!("No device at MMIO address {addr:#x}")))?;
@@ -148,9 +138,6 @@ impl DeviceManager {
                     .write()
                     .map_err(|e| VmmError::Device(format!("Failed to lock device state: {e}")))?;
                 state.write(offset, value32);
-                if offset == virtio_mmio::regs::INTERRUPT_ACK && vcpu.is_some() {
-                    state.irq_ack_vcpu = vcpu;
-                }
             }
 
             // Handle special cases after write

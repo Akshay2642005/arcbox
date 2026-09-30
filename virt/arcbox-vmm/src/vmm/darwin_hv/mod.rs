@@ -50,29 +50,21 @@ use pl011::{PL011_BASE, PL011_DR, PL011_FR, PL011_SIZE};
 pub(super) use pl031::Pl031;
 pub use psci::CpuPower;
 
-/// Shared registry of vCPU thread handles for WFI unparking.
+/// Shared registry of vCPU thread handles.
 ///
-/// When a GIC interrupt is injected, the IRQ callback iterates this list
-/// and calls `unpark()` on every thread so that WFI-parked vCPUs wake up.
+/// `pause` parks every vCPU thread and `resume` iterates this list to
+/// unpark them. Device interrupts never park a vCPU thread: with the
+/// in-kernel GIC an idle vCPU sleeps inside `hv_vcpu_run` and `set_spi`
+/// wakes it there.
 pub(super) type VcpuThreadHandles = Arc<Mutex<Vec<std::thread::Thread>>>;
 
-/// Shared registry of `(logical vCPU index, opaque hv_vcpu_t handle)` pairs.
+/// Shared registry of Hypervisor.framework vCPU IDs (opaque `hv_vcpu_t`
+/// handles).
 ///
 /// Used by `stop_darwin_hv` / `pause_darwin_hv` to target `hv_vcpus_exit`
-/// correctly — on arm64, `hv_vcpus_exit(NULL, 0)` is a **no-op**; the
-/// framework expects a concrete list of handles (ABX-367) — and by io
-/// workers to kick the one vCPU the guest routes a device's SPI to. Each
-/// vCPU thread registers itself, so the order is arrival order, not index.
-pub(super) type HvVcpuIds = Arc<Mutex<Vec<(u32, u64)>>>;
-
-/// Snapshots the registered handles.
-fn hv_vcpu_handles(ids: &HvVcpuIds) -> Vec<u64> {
-    ids.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
-        .map(|&(_, handle)| handle)
-        .collect()
-}
+/// correctly. On arm64, `hv_vcpus_exit(NULL, 0)` is a **no-op** — the
+/// framework expects a concrete list of vCPU IDs. See ABX-367.
+pub(super) type HvVcpuIds = Arc<Mutex<Vec<u64>>>;
 
 /// Page size on ARM64.
 #[cfg(test)]
@@ -168,83 +160,6 @@ fn fdt_err(e: vm_fdt::Error) -> VmmError {
     VmmError::Memory(format!("FDT error: {e}"))
 }
 
-/// Force-exits the vCPUs behind `handles` out of `hv_vcpu_run`.
-fn hv_exit_vcpus(handles: &[u64]) {
-    if handles.is_empty() {
-        return;
-    }
-    // SAFETY: `handles` is a live slice for the duration of the FFI call;
-    // the pointer and length are consistent.
-    #[allow(clippy::cast_possible_truncation)]
-    let ret = unsafe { arcbox_hv::ffi::hv_vcpus_exit(handles.as_ptr(), handles.len() as u32) };
-    if let Err(e) = arcbox_hv::check(ret) {
-        tracing::warn!("exit_vcpus: hv_vcpus_exit failed: {e}");
-    }
-}
-
-/// Builds a thread-safe closure that force-exits every registered vCPU out
-/// of `hv_vcpu_run`, used by io-worker threads (net-rx, blk, console) to
-/// wake a guest that is idle in WFI for interrupt delivery.
-///
-/// On arm64 `hv_vcpus_exit` requires a concrete list of vCPU IDs; NULL/0 is
-/// a silent no-op. The registry is snapshotted on each invocation so
-/// late-arriving secondaries (PSCI CPU_ON) are picked up. Safe to call from
-/// any thread. See ABX-367.
-fn make_exit_vcpus_fn(
-    ids: HvVcpuIds,
-    broadcasts: Arc<std::sync::atomic::AtomicU64>,
-) -> Arc<dyn Fn() + Send + Sync> {
-    Arc::new(move || {
-        let handles = hv_vcpu_handles(&ids);
-        if handles.is_empty() {
-            return;
-        }
-        broadcasts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        hv_exit_vcpus(&handles);
-    })
-}
-
-/// The handles an io worker kicks for an interrupt the guest services on
-/// `target`: that vCPU alone when it is registered, every vCPU otherwise
-/// (no target known yet, or a stale one from before a CPU went away).
-fn kick_handles(ids: &[(u32, u64)], target: Option<u32>) -> Vec<u64> {
-    target
-        .and_then(|t| ids.iter().find(|&&(id, _)| id == t))
-        .map_or_else(
-            || ids.iter().map(|&(_, handle)| handle).collect(),
-            |&(_, handle)| vec![handle],
-        )
-}
-
-/// Like [`make_exit_vcpus_fn`], but kicks only the vCPU passed to the
-/// closure — the one the guest routes the device's SPI to, as observed
-/// from its `INTERRUPT_ACK` writes — and falls back to every vCPU when
-/// none is known. Only the fallback counts as a broadcast.
-///
-/// The vsock-io worker uses this: with every virtio SPI routed to the
-/// guest's CPU 0, broadcasting `hv_vcpus_exit` to all 18 vCPUs per round
-/// was ~43% of that thread's time.
-fn make_exit_vcpu_fn(
-    ids: HvVcpuIds,
-    broadcasts: Arc<std::sync::atomic::AtomicU64>,
-) -> Arc<dyn Fn(Option<u32>) + Send + Sync> {
-    Arc::new(move |target| {
-        let handles = {
-            let ids = ids
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            kick_handles(&ids, target)
-        };
-        if handles.is_empty() {
-            return;
-        }
-        if handles.len() > 1 {
-            broadcasts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        hv_exit_vcpus(&handles);
-    })
-}
-
 #[cfg(test)]
 fn choose_fdt_addr_hv(memory_size: u64, fdt_size: usize) -> Result<u64> {
     let fdt_size = fdt_size as u64;
@@ -289,19 +204,6 @@ mod tests {
     fn test_allocate_device_slot_overflow() {
         let result = allocate_device_slot(VIRTIO_MMIO_MAX_DEVICES, "overflow");
         assert!(result.is_err());
-    }
-
-    /// A worker kicks only the vCPU the guest services the interrupt on;
-    /// without one — or with one that never registered — every vCPU.
-    #[test]
-    fn kick_handles_targets_the_acknowledging_vcpu_or_everyone() {
-        // Arrival order, not index order: secondaries register as they come up.
-        let ids = [(0, 0x10), (2, 0x12), (1, 0x11)];
-        assert_eq!(kick_handles(&ids, Some(1)), vec![0x11]);
-        assert_eq!(kick_handles(&ids, Some(0)), vec![0x10]);
-        assert_eq!(kick_handles(&ids, None), vec![0x10, 0x12, 0x11]);
-        assert_eq!(kick_handles(&ids, Some(7)), vec![0x10, 0x12, 0x11]);
-        assert!(kick_handles(&[], Some(0)).is_empty());
     }
 
     #[test]

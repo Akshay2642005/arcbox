@@ -61,8 +61,8 @@ pub(super) struct VcpuContext {
     /// Per-vCPU power registry (states + CPU_ON wake channels).
     /// `None` when the VM has only one vCPU.
     pub cpu_power: Option<CpuPower>,
-    /// Registry of vCPU thread handles used by the IRQ callback to
-    /// unpark WFI-blocked threads.
+    /// Registry of vCPU thread handles; `resume` unparks the threads
+    /// `pause` parked.
     pub vcpu_thread_handles: VcpuThreadHandles,
     /// Registry of Hypervisor.framework vCPU IDs. Populated by this loop
     /// after `HvVcpu::new()`; read by `pause`/`stop` when calling
@@ -249,7 +249,7 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, boot: VcpuBoot, ctx: VcpuContext) {
         let mut ids = hv_vcpu_ids
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        ids.push((vcpu_id, vcpu.raw_handle()));
+        ids.push(vcpu.raw_handle());
     }
     {
         let mut handles = vcpu_thread_handles
@@ -474,7 +474,6 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, boot: VcpuBoot, ctx: VcpuContext) {
                                 mmio.access_size,
                             );
                             if let Err(e) = device_manager.handle_mmio_write(
-                                Some(vcpu_id),
                                 mmio.address,
                                 mmio.access_size as usize,
                                 value,
@@ -513,6 +512,11 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, boot: VcpuBoot, ctx: VcpuContext) {
                 } => {
                     crate::vcpu_stats::VcpuStats::bump(&stats.wfi);
                     // Guest executed WFI — it is idle and waiting for an interrupt.
+                    // Not reached with the in-kernel GIC: the framework handles WFI
+                    // inside `hv_vcpu_run` (`VcpuStateManager::wait_for_interrupt`)
+                    // and this counter stays 0 for a whole boot (2026-09-30). Kept
+                    // for a framework that does trap WFI; the 1 ms park below then
+                    // bounds interrupt latency, since nothing unparks on an SPI.
                     // Before parking, poll the bridge for incoming data. vsock and
                     // net injection are handled by their dedicated worker threads.
                     let wfi_has_bridge = device_manager.poll_bridge_rx();

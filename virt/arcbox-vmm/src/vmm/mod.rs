@@ -114,7 +114,7 @@ pub struct Vmm {
     /// vCPU thread join handles for the custom HV VMM path.
     #[cfg(target_os = "macos")]
     hv_vcpu_threads: Vec<std::thread::JoinHandle<()>>,
-    /// Shared vCPU thread handle registry for WFI unparking (custom HV).
+    /// Shared vCPU thread handle registry for pause/resume (custom HV).
     #[cfg(target_os = "macos")]
     hv_vcpu_thread_handles: Option<darwin_hv::VcpuThreadHandles>,
     /// Shared registry of Hypervisor.framework vCPU IDs (custom HV).
@@ -126,12 +126,6 @@ pub struct Vmm {
     /// kept after stop for post-mortem snapshots.
     #[cfg(target_os = "macos")]
     hv_vcpu_stats: Vec<std::sync::Arc<crate::vcpu_stats::VcpuStats>>,
-    /// Times any component broadcast `hv_vcpus_exit` to all vCPUs.
-    #[cfg(target_os = "macos")]
-    hv_kick_broadcasts: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Times the IRQ callback unparked all vCPU threads.
-    #[cfg(target_os = "macos")]
-    hv_unpark_broadcasts: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// PSCI per-vCPU power registry (custom HV): power states plus the
     /// CPU_ON wake channels for secondary vCPUs.
     #[cfg(target_os = "macos")]
@@ -323,10 +317,6 @@ impl Vmm {
             hv_vcpu_ids: None,
             #[cfg(target_os = "macos")]
             hv_vcpu_stats: Vec::new(),
-            #[cfg(target_os = "macos")]
-            hv_kick_broadcasts: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            #[cfg(target_os = "macos")]
-            hv_unpark_broadcasts: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(target_os = "macos")]
             hv_cpu_power: None,
             #[cfg(all(target_os = "macos", feature = "vmnet"))]
@@ -723,17 +713,7 @@ impl Vmm {
                 .collect(),
             #[cfg(not(target_os = "macos"))]
             vcpus: Vec::new(),
-            #[cfg(target_os = "macos")]
-            kick_broadcasts: self
-                .hv_kick_broadcasts
-                .load(std::sync::atomic::Ordering::Relaxed),
-            #[cfg(not(target_os = "macos"))]
             kick_broadcasts: 0,
-            #[cfg(target_os = "macos")]
-            unpark_broadcasts: self
-                .hv_unpark_broadcasts
-                .load(std::sync::atomic::Ordering::Relaxed),
-            #[cfg(not(target_os = "macos"))]
             unpark_broadcasts: 0,
         }
     }

@@ -501,9 +501,8 @@ impl DeviceManager {
     pub fn set_net_rx_hooks(
         &mut self,
         irq_callback: Arc<dyn Fn(crate::irq::Irq, bool) -> crate::error::Result<()> + Send + Sync>,
-        exit_vcpus: Arc<dyn Fn() + Send + Sync>,
     ) {
-        self.net_rx_worker.set_hooks(irq_callback, exit_vcpus);
+        self.net_rx_worker.set_hooks(irq_callback);
     }
 
     /// Stores the VM-wide `running` flag so the DRIVER_OK handler can
@@ -858,20 +857,6 @@ impl DeviceManager {
                 break;
             }
         }
-    }
-
-    /// The vCPU that last acknowledged an interrupt from the first device
-    /// of `device_type` — the CPU the guest routes its SPI to — or `None`
-    /// before the guest has serviced one. See `VirtioMmioState::irq_ack_vcpu`.
-    pub fn irq_ack_vcpu(&self, device_type: DeviceType) -> Option<u32> {
-        self.devices
-            .values()
-            .find(|dev| dev.info.device_type == device_type)?
-            .mmio_state
-            .as_ref()?
-            .read()
-            .ok()?
-            .irq_ack_vcpu
     }
 
     /// Raises interrupt for a specific device ID. Used for the bridge NIC

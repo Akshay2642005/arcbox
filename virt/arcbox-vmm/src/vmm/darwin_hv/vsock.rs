@@ -133,12 +133,6 @@ impl Vmm {
             device_manager: Arc::clone(device_manager),
             doorbell_rd,
             running: self.running.clone(),
-            exit_vcpu: make_exit_vcpu_fn(
-                self.hv_vcpu_ids
-                    .clone()
-                    .expect("hv_vcpu_ids asserted Some above"),
-                self.hv_kick_broadcasts.clone(),
-            ),
         };
         let handle = std::thread::Builder::new()
             .name("vsock-io".to_string())
