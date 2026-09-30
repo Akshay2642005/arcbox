@@ -13,8 +13,11 @@ prepare_host             Create directories, resolve config      ~instant
 acquire_daemon_lease     flock(daemon.lock), terminate stale     ~instant or ≤30 s
     │                    daemon
     │
-start_control_plane      Bind arcbox.sock, SystemService up      ~instant
-    │                    Desktop can connect from this point on.
+start_control_plane      Bind arcbox.sock, SystemService up;     ~instant
+    │                    bind the DNS socket. Desktop can
+    │                    connect from this point on, and a taken
+    │                    explicit --dns-port fails here, before
+    │                    any VM boots.
     │
 release_stale_resources  Wait for disk-image holders to release  0–10 s
     │                    Reported as CLEANING_UP via gRPC.
@@ -28,9 +31,10 @@ boot_runtime             Construct Runtime, boot the System VM   variable
     │                    published from inside Runtime::init so
     │                    the span covers the guest boot alone.
     │
-start_runtime_services   DNS, Docker API, critical recovery      ~instant
-    │                    Then optional production Docker context;
-    │                    reported as NETWORK_READY.
+start_runtime_services   Serve DNS, Docker API, critical         ~instant
+    │                    recovery. Then optional production
+    │                    Docker context; reported as
+    │                    NETWORK_READY.
     │
 mark_ready               SetupPhase::Ready
 ```

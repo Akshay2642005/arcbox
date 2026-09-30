@@ -13,8 +13,12 @@ use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 
 /// Async UDP DNS server backed by [`NetworkManager`]'s DNS forwarder.
+///
+/// Binding and serving are two steps: the socket is bound in
+/// `start_control_plane`, before the runtime exists, and served from
+/// `start_runtime_services` once the runtime's [`NetworkManager`] does.
+/// Queries that arrive in between wait in the socket's receive buffer.
 pub struct DnsService {
-    network_manager: Arc<NetworkManager>,
     socket: UdpSocket,
 }
 
@@ -30,13 +34,10 @@ impl DnsService {
     /// `/etc/resolver/<domain>`, and `abctl dns status` probes the port that
     /// file names.
     ///
-    /// Called eagerly at daemon startup so that a bind failure propagates up
-    /// and aborts the daemon before it enters the main loop.
-    pub async fn bind_requested(
-        network_manager: Arc<NetworkManager>,
-        requested: Option<u16>,
-        default: u16,
-    ) -> Result<Self> {
+    /// Called right after the daemon lease is held, so the previous daemon
+    /// has released its socket and a bind failure aborts startup before any
+    /// VM boots.
+    pub async fn bind_requested(requested: Option<u16>, default: u16) -> Result<Self> {
         let socket = match requested {
             Some(port) => bind_loopback(port)
                 .await
@@ -64,10 +65,7 @@ impl DnsService {
             .context("Failed to read DNS service address")?;
 
         tracing::info!(%actual_addr, "DNS service bound");
-        Ok(Self {
-            network_manager,
-            socket,
-        })
+        Ok(Self { socket })
     }
 
     /// Returns the actual UDP port selected by the bound socket.
@@ -83,12 +81,17 @@ impl DnsService {
             .port())
     }
 
-    /// Runs the DNS event loop. Only called after [`Self::bind`] succeeds.
+    /// Runs the DNS event loop on the socket [`Self::bind_requested`] bound,
+    /// resolving through `network_manager`.
     ///
     /// This method never returns under normal operation. Each incoming UDP
     /// packet is handled inline for local queries (fast path) or dispatched
     /// to a blocking task for upstream forwarding (slow path).
-    pub async fn run(self, shutdown: CancellationToken) -> Result<()> {
+    pub async fn run(
+        self,
+        network_manager: Arc<NetworkManager>,
+        shutdown: CancellationToken,
+    ) -> Result<()> {
         let mut buf = [0u8; 512];
         let socket = Arc::new(self.socket);
 
@@ -103,10 +106,7 @@ impl DnsService {
 
             // Fast path: local resolution or NXDOMAIN for the configured domain.
             // Operates on a borrowed slice to avoid allocation.
-            if let Some(response) = self
-                .network_manager
-                .try_resolve_dns_or_nxdomain(&buf[..len])
-            {
+            if let Some(response) = network_manager.try_resolve_dns_or_nxdomain(&buf[..len]) {
                 if let Err(e) = socket.send_to(&response, src).await {
                     tracing::debug!("Failed to send DNS response to {}: {}", src, e);
                 }
@@ -116,7 +116,7 @@ impl DnsService {
             // Slow path: forward to upstream DNS via blocking I/O.
             // Only clone into owned buffer when actually needed.
             let query = buf[..len].to_vec();
-            let nm = Arc::clone(&self.network_manager);
+            let nm = Arc::clone(&network_manager);
             let sock = Arc::clone(&socket);
             tokio::spawn(async move {
                 // Pre-build SERVFAIL before query is moved into spawn_blocking.
@@ -203,8 +203,7 @@ mod tests {
         let blocker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let port = blocker.local_addr().unwrap().port();
 
-        let nm = Arc::new(NetworkManager::new(arcbox_net::NetConfig::default()));
-        let result = DnsService::bind_requested(nm, Some(port), port).await;
+        let result = DnsService::bind_requested(Some(port), port).await;
         assert!(
             result.is_err(),
             "an explicitly requested port that is taken must fail, not fall back"
@@ -216,8 +215,7 @@ mod tests {
         let blocker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let taken = blocker.local_addr().unwrap().port();
 
-        let nm = Arc::new(NetworkManager::new(arcbox_net::NetConfig::default()));
-        let service = DnsService::bind_requested(nm, None, taken)
+        let service = DnsService::bind_requested(None, taken)
             .await
             .expect("a taken default port must not fail startup");
         let bound = service.host_port().unwrap();
@@ -231,14 +229,11 @@ mod tests {
         let ip = std::net::IpAddr::V4(Ipv4Addr::new(172, 17, 0, 2));
         nm.register_dns("my-nginx", ip);
 
-        // Bind server on random port via DnsService::bind.
-        let service = DnsService::bind_requested(Arc::clone(&nm), Some(0), 0)
-            .await
-            .unwrap();
+        let service = DnsService::bind_requested(Some(0), 0).await.unwrap();
         let server_addr = ("127.0.0.1", service.host_port().unwrap());
 
         let server_handle =
-            tokio::spawn(async move { service.run(CancellationToken::new()).await });
+            tokio::spawn(async move { service.run(nm, CancellationToken::new()).await });
 
         // Send query from client.
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -274,13 +269,11 @@ mod tests {
         let nm = Arc::new(NetworkManager::new(arcbox_net::NetConfig::default()));
         // Don't register anything — query should get NXDOMAIN.
 
-        let service = DnsService::bind_requested(Arc::clone(&nm), Some(0), 0)
-            .await
-            .unwrap();
+        let service = DnsService::bind_requested(Some(0), 0).await.unwrap();
         let server_addr = ("127.0.0.1", service.host_port().unwrap());
 
         let server_handle =
-            tokio::spawn(async move { service.run(CancellationToken::new()).await });
+            tokio::spawn(async move { service.run(nm, CancellationToken::new()).await });
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let query = build_dns_query("nonexistent.arcbox.local");

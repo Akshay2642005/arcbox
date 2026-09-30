@@ -5,6 +5,7 @@
 //! ```text
 //! Startup::prepare_host()          → EarlyContext   (no lock, no runtime)
 //! Startup::acquire_daemon_lease()  → DaemonContext  (lock held, no runtime yet)
+//! Startup::start_control_plane()   → ControlPlane   (gRPC serving, DNS socket bound)
 //! Startup::boot_runtime()          → Arc<Runtime>   (also fills SharedRuntime for gRPC)
 //! ```
 //!
@@ -19,6 +20,7 @@ use arcbox_constants::container_network::ContainerNetwork;
 use arcbox_constants::paths::{ArcboxProfile, HostLayout};
 use tokio_util::sync::CancellationToken;
 
+use crate::dns_service::DnsService;
 use crate::startup::{ContainerNetworkLease, DaemonLock};
 
 /// Daemon lock shared between the startup pipeline and `main`.
@@ -152,6 +154,17 @@ pub struct VmArgs {
     pub kernel: Option<PathBuf>,
     /// `--no-linux-vm`: forces `config.vm.autostart = false` in `init_runtime`.
     pub no_linux_vm: bool,
+}
+
+/// Host endpoints owned before the runtime boots.
+///
+/// The control-plane socket serves the setup stream from this point on. The
+/// DNS socket is only bound: a taken explicit port fails startup here, before
+/// any VM boots, and the socket is served once the runtime's `NetworkManager`
+/// exists. Consumed by `start_runtime_services`.
+pub struct ControlPlane {
+    pub grpc: tokio::task::JoinHandle<()>,
+    pub dns: DnsService,
 }
 
 /// Handles to spawned services for drain-on-shutdown.

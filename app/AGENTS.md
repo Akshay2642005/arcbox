@@ -74,23 +74,27 @@ Covers `arcbox-daemon` (startup/shutdown), `arcbox-core` (`vm_lifecycle`),
   `back_to_back_phases_are_all_delivered`,
   `the_snapshot_is_not_replayed_as_an_update`.
 - **A listener the phase promises is bound before `start_services` returns,
-  never inside its spawned task** (`DnsService::bind`, then
-  `DockerApiServer::bind` + `serve` — CORE-71). WHY: a task that binds and
-  only logs its error cannot fail startup, so the pipeline publishes
-  `NETWORK_READY` and `READY` for a daemon whose primary API no client can
-  reach. `NETWORK_READY` therefore covers whichever services this daemon
-  runs — `--no-linux-vm` reaches it with DNS alone — and the Kubernetes
-  proxy is the deliberate exception: a taken 16443 is tolerated, so it is
-  started here but not promised. Adding a listener means deciding which of
-  those two it is. DNS is promised yet never fails on a taken default: it
-  binds the profile's port (`ArcboxProfile::dns_host_port`, 5553 production
-  / 5554 development) and falls back to an OS-allocated one, which self-setup
-  publishes through `/etc/resolver/<domain>` and `abctl dns status` reads
-  back from that file; only an explicit `--dns-port` / `ARCBOX_DNS_PORT` must
-  bind. WHY: both profiles' daemons run on one machine, and a development
-  build that shared 5553 with production crash-looped under launchd for
-  three days, a full VM boot per 5 s cycle because the bind sits after
-  `boot_runtime`.
+  never inside its spawned task** (`DnsService::bind_requested` in
+  `start_control_plane`, then `DockerApiServer::bind` + `serve` — CORE-71).
+  WHY: a task that binds and only logs its error cannot fail startup, so the
+  pipeline publishes `NETWORK_READY` and `READY` for a daemon whose primary
+  API no client can reach. `NETWORK_READY` therefore covers whichever
+  services this daemon runs — `--no-linux-vm` reaches it with DNS alone —
+  and the Kubernetes proxy is the deliberate exception: a taken 16443 is
+  tolerated, so it is started here but not promised. Adding a listener means
+  deciding which of those two it is. DNS is promised yet never fails on a
+  taken default: it binds the profile's port (`ArcboxProfile::dns_host_port`,
+  5553 production / 5554 development) and falls back to an OS-allocated one,
+  which self-setup publishes through `/etc/resolver/<domain>` and `abctl dns
+  status` reads back from that file; only an explicit `--dns-port` /
+  `ARCBOX_DNS_PORT` must bind. The DNS socket is bound in
+  `start_control_plane`, right after the lease is held, and served from
+  `start_services` once the runtime's `NetworkManager` exists (`ControlPlane`
+  in `context.rs` carries it across). WHY: both profiles' daemons run on one
+  machine, and a development build that shared 5553 with production
+  crash-looped under launchd for three days, a full VM boot per 5 s cycle,
+  because the bind then sat after `boot_runtime`; a bind failure now costs
+  no boot.
 - **`SetupStatus.vm_running` is owned by `services::vm_running_loop`**, which
   mirrors `VmLifecycleState::is_ready` (readiness level 2 below) off
   `Runtime::subscribe_system_vm_state`. WHY: it used to be set once by
