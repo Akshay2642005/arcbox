@@ -105,9 +105,12 @@ the ABI.
   pipe-memory pressure (measured 2026-09-29 with ~4300 open pipes) a fresh
   pipe holds 512 bytes, which is why the drain must not be a poll (one pipe
   per poll interval was 650 KB/s at 64 KiB and ~5 KB/s at 512 B, with the
-  guest spinning for the whole write). The pipe never delivers EOF while
-  the VM is configured — the host keeps the write end it handed to VZ — so
-  the drain ends on the manager's cancellation, not on `read` returning 0.
+  guest spinning for the whole write). The VZ-facing pipe ends are closed
+  in this process as soon as the VM runs (`DarwinVm::release_guest_serial_ends`;
+  the helper holds its own copies), so the drain sees EOF when the helper
+  exits and the manager's cancellation covers everything before that; a
+  VZ VM cannot be restarted in place after that, and `VmManager` never
+  does.
   Reproduce the wedge with 200 KB of text to `/dev/hvc0` (the
   `machine_console` e2e); do not use a 2 MB flood on a machine you care
   about: on kernel 6.18.38-arcbox it corrupted guest memory (oops / btrfs /

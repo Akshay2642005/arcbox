@@ -85,6 +85,11 @@ pub struct DarwinVm {
     console_fds: Option<(RawFd, RawFd)>,
     /// Agent log serial port file descriptors (hvc1): dedicated agent tracing channel.
     agent_log_fds: Option<(RawFd, RawFd)>,
+    /// The VZ-facing ends of both ports' pipes, held only until the VM has
+    /// started: the helper process has its own copies by then, so these are
+    /// closed in `start` (see [`Self::release_guest_serial_ends`]) or, for
+    /// a VM that never started, in `Drop`.
+    guest_serial_fds: Vec<RawFd>,
     /// Device configuration metadata for snapshots.
     ///
     /// Since Virtualization.framework doesn't expose device state, we store
@@ -196,6 +201,7 @@ impl DarwinVm {
             vz_vm: None,
             console_fds: None,
             agent_log_fds: None,
+            guest_serial_fds: Vec::new(),
             device_configs: Vec::new(),
             vsock_irq_fd: RwLock::new(None),
             balloon_configured: false,
@@ -212,35 +218,41 @@ impl DarwinVm {
     /// Returns "pipe" on success. Use `read_console_output()` and
     /// `read_agent_log_output()` to read from each port.
     pub fn setup_serial_console(&mut self) -> Result<String, HypervisorError> {
-        let make_port =
-            |label: &str| -> Result<(SerialPortConfiguration, RawFd, RawFd), HypervisorError> {
-                let port = SerialPortConfiguration::virtio_console()
-                    .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
-                let read_fd = port.read_fd().ok_or_else(|| {
-                    HypervisorError::DeviceError(format!("Failed to get {label} read fd"))
-                })?;
-                let write_fd = port.write_fd().ok_or_else(|| {
-                    HypervisorError::DeviceError(format!("Failed to get {label} write fd"))
-                })?;
-                // The read end is non-blocking for life: the engine's drain
-                // waits on readiness and must never block in `read(2)`.
-                // SAFETY: `read_fd` is a live pipe fd this VM owns.
-                let flags = unsafe { libc::fcntl(read_fd, libc::F_GETFL) };
-                if flags == -1
-                    || unsafe { libc::fcntl(read_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) }
-                        == -1
-                {
-                    return Err(HypervisorError::DeviceError(format!(
-                        "Failed to make {label} read fd non-blocking: {}",
-                        std::io::Error::last_os_error()
-                    )));
-                }
-                Ok((port, read_fd, write_fd))
-            };
+        let make_port = |label: &str| -> Result<
+            (SerialPortConfiguration, RawFd, RawFd, (RawFd, RawFd)),
+            HypervisorError,
+        > {
+            let port = SerialPortConfiguration::virtio_console()
+                .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
+            let read_fd = port.read_fd().ok_or_else(|| {
+                HypervisorError::DeviceError(format!("Failed to get {label} read fd"))
+            })?;
+            let write_fd = port.write_fd().ok_or_else(|| {
+                HypervisorError::DeviceError(format!("Failed to get {label} write fd"))
+            })?;
+            let guest_fds = port.guest_fds().ok_or_else(|| {
+                HypervisorError::DeviceError(format!("Failed to get {label} guest fds"))
+            })?;
+            // The read end is non-blocking for life: the engine's drain
+            // waits on readiness and must never block in `read(2)`.
+            // SAFETY: `read_fd` is a live pipe fd this VM owns.
+            let flags = unsafe { libc::fcntl(read_fd, libc::F_GETFL) };
+            if flags == -1
+                || unsafe { libc::fcntl(read_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+            {
+                return Err(HypervisorError::DeviceError(format!(
+                    "Failed to make {label} read fd non-blocking: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            Ok((port, read_fd, write_fd, guest_fds))
+        };
 
         // Port 0 (hvc0): kernel/init console
-        let (console_port, console_read, console_write) = make_port("console")?;
+        let (console_port, console_read, console_write, console_guest) = make_port("console")?;
         self.console_fds = Some((console_read, console_write));
+        self.guest_serial_fds
+            .extend([console_guest.0, console_guest.1]);
         tracing::info!(
             "Console port (hvc0): read_fd={}, write_fd={}",
             console_read,
@@ -248,8 +260,9 @@ impl DarwinVm {
         );
 
         // Port 1 (hvc1): agent log channel
-        let (agent_log_port, agent_read, agent_write) = make_port("agent-log")?;
+        let (agent_log_port, agent_read, agent_write, agent_guest) = make_port("agent-log")?;
         self.agent_log_fds = Some((agent_read, agent_write));
+        self.guest_serial_fds.extend([agent_guest.0, agent_guest.1]);
         tracing::info!(
             "Agent log port (hvc1): read_fd={}, write_fd={}",
             agent_read,
@@ -428,13 +441,28 @@ impl DarwinVm {
         }
     }
 
+    /// Closes this process's copies of the VZ-facing pipe ends.
+    ///
+    /// Called once the VM runs: VZ has passed the file handles to its helper
+    /// process, which owns copies from then on, so ours only leak two fds per
+    /// port and keep the guest-output pipe from ever reaching EOF. After this
+    /// the VM cannot be started again in place — VZ would hand the closed
+    /// handles to a new helper — which `start` refuses; a new VM gets new
+    /// pipes.
+    fn release_guest_serial_ends(&mut self) {
+        for fd in self.guest_serial_fds.drain(..) {
+            // SAFETY: `fd` is a pipe end this VM created and still owns.
+            unsafe { libc::close(fd) };
+        }
+    }
+
     /// Duplicates the host read ends of the console (`hvc0`) and agent-log
     /// (`hvc1`) pipes for a reader that owns them independently of this VM.
     ///
     /// The duplicates share the pipes' open file descriptions, so they are
-    /// non-blocking like the originals. They never see EOF while the VM is
-    /// configured: the host keeps the write end it handed to VZ, so a reader
-    /// needs its own stop signal.
+    /// non-blocking like the originals. They see EOF only once the VZ
+    /// helper, the last holder of the write end after `start`, has exited;
+    /// a reader that must stop earlier needs its own stop signal.
     pub fn dup_serial_readers(&self) -> Result<SerialReaders, HypervisorError> {
         let dup = |fd: RawFd, label: &str| -> Result<OwnedFd, HypervisorError> {
             // SAFETY: `fd` is a live pipe fd this VM owns; the borrow does

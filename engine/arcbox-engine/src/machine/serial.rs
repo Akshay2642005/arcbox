@@ -14,8 +14,9 @@
 //! so an idle machine costs nothing and a flood drains at pipe speed instead
 //! of one pipe per poll interval (the pipe is not always 64 KiB — XNU hands
 //! out 512-byte buffers under host pipe-memory pressure). It ends on the
-//! cancellation the manager fires when the machine stops; the pipe itself
-//! never delivers EOF, because the host keeps the write end it handed to VZ.
+//! cancellation the manager fires when the machine stops, or on EOF once
+//! the VZ helper — the last holder of the pipe's write end after the VM
+//! has started — exits.
 
 use std::collections::VecDeque;
 use std::io;
