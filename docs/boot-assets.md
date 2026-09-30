@@ -46,7 +46,7 @@ lists it as a non-required legacy artifact.
 2. Download pre-built kernels from `arcboxlabs/kernel`
 3. Sync upstream runtime binaries (Docker 29.7.2 static package)
 4. Package tarball + checksum + manifest
-5. Publish to GitHub Releases and the Backblaze B2-backed CDN
+5. Publish to GitHub Releases and the Cloudflare R2-backed CDN
 
 ## CDN Layout
 
