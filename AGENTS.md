@@ -29,7 +29,7 @@ The project is in **alpha**. Breaking changes (internal or user-facing) are acce
   "Releasing guest RAM" and `engine/arcbox-engine/src/vm_lifecycle/balloon/mod.rs`.
 ² Same-context comparison (container vs container, same-day pairing).
   Cache-hot native is not a valid denominator for FUSE metadata —
-  methodology and current numbers in `docs/fs-perf-limits.md`.
+  methodology and current numbers in `docs/benchmarks/virtiofs.md`.
 
 ## Platform Priority
 
@@ -49,10 +49,11 @@ The project is in **alpha**. Breaking changes (internal or user-facing) are acce
 - `guest/` — in-VM agent (cross-compiled for Linux)
 - `tests/` — test resources and fixture build scripts
 - `.agents/skills/` — shared coding-agent skills (symlinked from `.claude/skills/`)
-- `docs/` — engineering docs: reference guides at the top level,
-  `docs/adr/` decisions, `docs/logs/` development and experiment logs,
-  `docs/architecture/` and `docs/plans/` for long-form designs and
-  execution plans; layout, templates and the index in `docs/README.md`
+- `docs/` — engineering docs: reference guides at the top level, then
+  `architecture/` (designs), `adr/` (decisions), `plans/`, `experiments/`
+  (question → method → verdict), `benchmarks/` (stable method, dated
+  results), `logs/` (changes, investigations, incidents); layout,
+  templates and the index in `docs/README.md`
 
 ## Component Rules
 
@@ -114,14 +115,17 @@ When asked to plan, the plan must be fully resolved before implementation begins
 
 ## Documentation
 
-- An experiment, benchmark, bisect or investigation that produced numbers
-  or a verdict ends in a `docs/logs/YYYY-MM-DD-<slug>.md` entry in the same
-  commit series, with its probes checked in under `tests/bench/` or an e2e
-  target so it can be rerun. Retiring a mechanism, choosing between
-  designs, or setting a rule a later change must not undo silently gets an
-  ADR in `docs/adr/`; the ADR cites the log entries, it does not repeat
-  them. `docs/README.md` holds the layout, the templates and the index —
-  add the new file to the index.
+- Work that produced numbers or a verdict is recorded in the same commit
+  series, in the category `docs/README.md` defines: a question answered
+  with data is a `docs/experiments/YYYY-MM-DD-<slug>.md` entry; a
+  measurement that will be repeated is a dated row in
+  `docs/benchmarks/<subject>.md`; a change, root-cause hunt or incident is
+  a `docs/logs/YYYY-MM-DD-<slug>.md` entry. The probes behind the numbers
+  are checked in under `tests/bench/<name>/` or as an e2e target so the
+  entry can be rerun. Retiring a mechanism, choosing between designs, or
+  setting a rule a later change must not undo silently gets an ADR in
+  `docs/adr/`; the ADR cites the entries, it does not repeat their tables.
+  Every new file goes into the index in `docs/README.md`.
 
 ## Change Discipline
 

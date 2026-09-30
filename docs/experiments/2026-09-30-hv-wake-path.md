@@ -98,6 +98,6 @@ removed), 7acb93a0 (vsock EVENT_IDX with `RxRound`), 646bd279 (docs).
 ## Open
 
 - Re-measure the multi-flow Host→VM ceiling (`network_iperf`) now that the
-  net-rx worker no longer kicks; `docs/net-perf-limits.md` quotes numbers
+  net-rx worker no longer kicks; `docs/benchmarks/network.md` quotes numbers
   that included `hv_vcpus_exit`.
 - `rx-inject` idle loop → event-driven wait (the ABX-517 shape).

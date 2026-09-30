@@ -1,33 +1,20 @@
-# YYYY-MM-DD — <what was done or asked, as a sentence>
+# YYYY-MM-DD — <what happened, as a sentence>
 
-- Type: change | experiment | investigation | incident
+- Type: change | investigation | incident
 - Area: <crates / subsystem>
-- Commits / PRs: <hashes, or "none (not merged)">
-- Outcome: <ADR NNNN | fixed | rejected | open>
-- Probes / scripts: <path in tests/bench or e2e target>
-- Host / guest: <hardware, macOS, load; guest shape and kernel facts that
-  affect the numbers>
+- Commits / PRs: <hashes, or "none">
+- Related: <ADR, experiment, benchmark entries>
 
-## Question or problem
+Logs are the chronological record of work that is not an experiment
+(`docs/experiments/`) and not a repeatable measurement (`docs/benchmarks/`):
+a change and the reasoning around it, a root-cause hunt, an incident. Keep
+the numbers that motivated the work and the ones that proved it, with how
+they were taken.
 
-One paragraph. Numbers that motivated the work, with how they were taken.
+## Problem or trigger
 
-## Method
+## What was done
 
-What was run, against what, how many times. Enough for someone to rerun
-it; refer to checked-in scripts rather than pasting them.
+## Evidence
 
-## Results
-
-Tables. Same units and same conditions per row; note the load next to the
-numbers when it varied.
-
-## Findings
-
-Numbered. Each one a claim the results support, with the mechanism when it
-is known and "unknown" when it is not.
-
-## Decisions taken / open
-
-What changed because of this (link the ADR or commit), and what is still
-unanswered.
+## Follow-ups

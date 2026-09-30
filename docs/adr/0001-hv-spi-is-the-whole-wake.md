@@ -3,7 +3,7 @@
 - Status: accepted (2026-09-30)
 - Deciders: Xuan
 - Commits: c3004580 (remove the kicks), 7acb93a0 (vsock EVENT_IDX), 646bd279 (docs)
-- Evidence: `docs/logs/2026-09-30-hv-wake-path-experiments.md`,
+- Evidence: `docs/experiments/2026-09-30-hv-wake-path.md`,
   `docs/logs/2026-09-29-vsock-rx-round-and-targeted-kick.md`
 
 ## Context
@@ -83,7 +83,7 @@ On macOS 26.4 with an 18-vCPU System VM (details and tables in the
   the framework. HV idle CPU (~6.7% of a core) is ~5.6 points the
   `rx-inject` thread's `cthread_yield`/`semaphore_timedwait` loop; that is
   the next idle-CPU task.
-- `docs/net-perf-limits.md`'s `hv_vcpus_exit` rows are history and its
+- `docs/benchmarks/network.md`'s `hv_vcpus_exit` rows are history and its
   multi-flow ceiling needs re-measuring; the `pthread_cond_signal` it saw is
   the framework waking the target vCPU, i.e. the wake itself.
 - Anyone reintroducing a kick or an unpark on the interrupt path must first

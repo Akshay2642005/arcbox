@@ -280,7 +280,7 @@ Most of ArcBox's performance-critical code is custom rather than vendored:
 - A privileged helper with code-signature-based peer authentication for the few
   operations that need root, so the daemon itself does not run as root.
 
-Measured, and documented in [docs/net-perf-limits.md](docs/net-perf-limits.md):
+Measured, and documented in [docs/benchmarks/network.md](docs/benchmarks/network.md):
 single-stream host→VM throughput of 22.7 Gbps on the custom backend, about twice
 Apple's VirtIO-net in the same test (multi-flow saturation currently tops out at
 10–12 Gbps combined).

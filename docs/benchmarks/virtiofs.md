@@ -1,5 +1,7 @@
 # VirtioFS datapath — measured performance and known limits
 
+Benchmark record. Method and probes are described inline; results are dated and must be compared same-context (see `docs/README.md` "Benchmarks").
+
 As of boot assets **0.6.13** (kernel v0.0.22 with the `fuse-spin-wait` patch,
 2026-08-01). Backend: VZ (Apple's virtio-fs device — the custom VirtioFS
 serves only the HV backend and has **no** performance measurement yet).

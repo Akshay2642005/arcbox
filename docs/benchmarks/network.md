@@ -1,5 +1,7 @@
 # Network datapath — measured performance and known limits
 
+Benchmark record. Method and probes are described inline; results are dated and must be compared same-context (see `docs/README.md` "Benchmarks").
+
 As of `net-perf-mergeable-rx` tag (commit `eb45a46`, 2026-04-24). Host: Apple Silicon, macOS 26.0.1. Guest: Linux under HV backend. Bench: `iperf3` client on host against `networkstatic/iperf3` container in guest, port-forwarded.
 
 ## Headline numbers

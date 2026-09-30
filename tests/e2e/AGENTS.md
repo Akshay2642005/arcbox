@@ -86,7 +86,7 @@ run fails, and which paths must change together.
   liveness only — VZ throughput is too run-to-run variable for an automated
   Gbps target, so a real floor is opt-in (`ARCBOX_E2E_IPERF_MIN_GBPS`).
   Prove an RX/TX regression fixed (iperf zero -> baseline restored) with
-  that test or the manual reproducer in `docs/net-perf-limits.md`, checked
+  that test or the manual reproducer in `docs/benchmarks/network.md`, checked
   against the doc's baseline on both HV and VZ. Auto-forensics don't help a datapath failure
   (`virtio-debug.json` is HV-only queue/boot state) — preserve the
   scenario's own evidence (assigned `docker port`/inspect, host connect

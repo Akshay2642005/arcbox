@@ -3,7 +3,7 @@
 Small probes for the HV backend's host→guest wake path: how many vCPU
 kicks, unparks and interrupts a transfer costs, and what a vsock RPC or a
 guest-internal wakeup takes. They drove `docs/adr/0001-hv-spi-is-the-whole-wake.md`
-and `docs/logs/2026-09-30-hv-wake-path-experiments.md`; run them against an
+and `docs/experiments/2026-09-30-hv-wake-path.md`; run them against an
 isolated dev daemon, never the user's `~/.arcbox` one.
 
 All scripts take the daemon from the environment:

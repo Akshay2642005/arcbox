@@ -1,5 +1,10 @@
 # Host tunnel proof: `tun_proxy`
 
+- Type: experiment (gate proof)
+- Date: 2026-06-17
+- Area: `common/` net crates, `virt/arcbox-net/examples/tun_proxy.rs`
+- Outcome: Gate C passed; the host-only harness stays as the cheap validation rung for NAT/classifier/proxy changes (`common/AGENTS.md`)
+
 `tun_proxy` proves that the data plane extracted into `arcbox-packet` /
 `arcbox-datapath` / `arcbox-conntrack` / `arcbox-fakeip` / `arcbox-proxy` /
 `splicetcp` can power a **Surge-class host proxy**, not just the VM

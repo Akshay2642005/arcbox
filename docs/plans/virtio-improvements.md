@@ -1,5 +1,9 @@
 # VirtIO Improvements — implementation plan
 
+Status: **historical** (2026-04). Kept as the record of what was planned;
+what shipped and what was measured is in `docs/benchmarks/network.md` and
+`virt/AGENTS.md`.
+
 Derived from auditing the current device tree against several mature reference VMMs. Each item below states the gap, the *why* behind the design choice, and the locked fix.
 
 ## Phase structure

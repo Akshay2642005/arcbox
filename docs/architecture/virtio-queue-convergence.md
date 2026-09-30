@@ -1,5 +1,10 @@
 # VirtIO Queue Abstraction Convergence
 
+Status: **historical** (2026-06). The convergence it argues for shipped
+(`arcbox-virtio-core::SplitQueue` everywhere but the VZ/test `VirtQueue`);
+its `Status: Planned` below and the target `VirtioDevice` trait it describes
+no longer match the code — `virt/AGENTS.md` "Datapath map" is current.
+
 ## Status
 
 Planned. Gated on Phase 0 (cold-boot hang root cause). Locked decisions:
