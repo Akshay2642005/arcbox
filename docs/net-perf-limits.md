@@ -157,6 +157,16 @@ The cap at ≈ 10–12 Gbps combined is where the per-IRQ cost in `hv_vcpus_exit
 
 ### What actually remains
 
+> **2026-09-30 update.** Two of the items below have shipped. EVENT_IDX
+> suppression is live in `arcbox-net-inject` (`write_avail_event_current`).
+> The `hv_vcpus_exit` rows above are gone entirely: with the in-kernel GIC an
+> idle vCPU sleeps inside `hv_vcpu_run` and `hv_gic_set_spi` wakes it, so the
+> kick was a forced exit for nothing and every io worker stopped issuing it
+> (`c3004580`). The `pthread_cond_signal` samples are that wake — the
+> framework signalling `VcpuStateManager::wait_for_interrupt` — not a
+> redundant hop of ours. The multi-flow ceiling should be re-measured with
+> the `network_iperf` matrix before the ~10–12 Gbps figure is quoted again.
+
 - **`VIRTIO_F_EVENT_IDX` IRQ suppression.** We already write `avail_event` in `flush_interrupt` but then unconditionally fire: `// Unconditionally fire interrupt. EVENT_IDX suppression can be added later once the basic path is validated.` (`virt/arcbox-net-inject/src/inject.rs`). Consulting the guest's `used_event_idx` before firing lets us skip 50–90 % of IRQs when the guest is already polling. This directly attacks the hot leaves.
 - **Longer `COALESCE_TIMEOUT`.** Currently 200 µs. Bumping to 500 µs or dynamically scaling under load trades tail latency for fewer IRQs. Easy knob.
 - **Avoid the `pthread_cond_signal` hop.** The inject-thread → vCPU wakeup currently goes `set_interrupt_status + pthread_cond_signal`. If the vCPU is already running (`Hv::Vcpu::run`) we only need `hv_vcpus_exit`; the `pthread_cond_signal` is redundant and shows up at 879 samples in P2.

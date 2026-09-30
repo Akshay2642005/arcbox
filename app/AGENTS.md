@@ -504,9 +504,11 @@ reachable mirror rather than weakening a test.
 - Current HV daemon perf is far from targets (root AGENTS.md table):
   daemon-ready ~11s (target <1.5s), idle CPU ~3.87% (<0.05%), idle RSS
   ~1.04GB (<150MB). These are known baselines, not per-change regressions.
-- Per-boot counters (~2301 unpark-broadcasts / ~71 kick-broadcasts) drive
-  R2/R3 acceptance in Linear — a refactor must keep the counter sites honest
-  (see `virt/arcbox-vmm/AGENTS.md`).
+- The `kick_broadcasts` / `unpark_broadcasts` snapshot fields are retired
+  and read 0 (2026-09-30): no io worker kicks vCPUs after an interrupt any
+  more (see `virt/arcbox-vmm/AGENTS.md` "Async-Worker Completion Contract").
+  HV idle CPU is ~6.7%, ~5.6 points of it the `rx-inject` thread's yield/poll
+  loop.
 - ABX-413: tgz-packaged docker-tools are verified only via their sha
   sidecar at download time; the EXTRACTED binary is never re-hashed.
 - ABX-414: lifecycle-hardening umbrella — the three-level readiness split,

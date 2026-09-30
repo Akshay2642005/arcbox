@@ -7,33 +7,35 @@ file owns the HV-framework-specific footguns.
 
 ## Async-Worker Completion Contract (read first)
 
-Raising a GIC SPI alone does NOT wake a WFI-parked vCPU on this backend — the
-guest services the IRQ only on its next VM exit. Any async worker that
-completes guest I/O (blk, net-rx, vsock, console, or a future device) MUST do
-all three, in this order:
+Any async worker that completes guest I/O (blk, net-rx, vsock, console, or a
+future device) does exactly two things, in this order:
 
 1. `VirtioMmioState::trigger_interrupt(1)` — set interrupt_status (INT_VRING).
 2. Fire the `DeviceIrqCallback` (`irq_callback(irq, true)`) — assert the SPI.
-3. Call the worker's exit closure — kick the vCPU that will service the
-   interrupt out of `hv_vcpu_run`. Closures from `make_exit_vcpus_fn` kick
-   every vCPU (blk, net-rx, console); the vsock-io worker's
-   `make_exit_vcpu_fn` kicks only `DeviceManager::irq_ack_vcpu(VirtioVsock)`
-   — the vCPU that last wrote `INTERRUPT_ACK`, i.e. the CPU the guest routes
-   the SPI to (Linux routes every virtio SPI to CPU 0 unless told otherwise;
-   `/proc/interrupts` in the guest shows it) — and falls back to every vCPU
-   until the guest has acknowledged one. `GICD_IROUTER` lives inside the
-   framework's GIC, so the ACK write is the host's only view of the routing.
-   Broadcasting to all 18 vCPUs per completion was ~43% of the vsock-io
-   thread under a bulk `docker run -i` pipe.
 
-Omitting step 3 produces intermittent guest hangs (guest sleeps until an
-unrelated exit) that are invisible in logs. Reference: `blk_worker.rs::trigger_irq`
-(blk_worker.rs:719-729, rationale 176-181); the GIC callback's complementary
-unpark-all loop is `setup.rs:145-154`. Worker exit closures are built by
-`make_exit_vcpus_fn` / `make_exit_vcpu_fn` (`vmm/darwin_hv/mod.rs`) and wired
-at `console.rs`, `vsock.rs`, `lifecycle.rs` (blk, net-rx). The vCPU registry
-they read (`HvVcpuIds`) pairs each `hv_vcpu_t` handle with its logical index,
-in arrival order — never index it by position.
+Asserting the SPI is the whole wake. With the in-kernel GIC (`hv_gic`, the
+only configuration this VMM boots with) the framework handles WFI inside
+`hv_vcpu_run`: an idle vCPU's thread blocks in
+`HvCore::Hypervisor::VcpuStateManager::wait_for_interrupt`, `hv_gic_set_spi`
+signals that wait, and a vCPU running guest code takes the SPI
+asynchronously. Measured 2026-09-30 on macOS 26.4: every vCPU's `wfi` and
+`vtimer` exit counters stay 0 over a full boot, and guest cross-CPU wakeups
+(FIFO ping-pong between cpuset-pinned containers) take 30–55 µs.
+
+**Do not add an `hv_vcpus_exit` kick after the SPI.** Every worker used to,
+on the belief that a WFI-idle vCPU sat parked on the host; the kick was a
+forced `Canceled` exit for nothing. Removing all of them (c3004580): vsock
+RPC p50 0.81 → 0.30 ms (0.96 → 0.32 ms with the target CPU busy), 1 GiB
+stdin pipe 5.9–6.4 → 5.4–5.9 s, `docker load` 300 MB 3.2–4.4 → 2.7–3.3 s,
+idle daemon CPU 9.3 → 6.7%. The same goes for unparking vCPU threads from
+the IRQ callback: nothing is parked there. `hv_vcpus_exit` remains the right
+tool for `stop`/`pause`, where the point is to leave `hv_vcpu_run`.
+
+Reference: `blk_worker.rs::trigger_irq`; the GIC callback in `setup.rs`
+(step 5) is `set_spi` and nothing else. The vCPU loop's WFI branch
+(`vcpu_loop.rs`) is unreachable in this configuration and kept only for a
+framework that does trap WFI — its 1 ms `park_timeout` bounds latency there,
+since no SPI unparks it.
 
 ## vCPU Exit Loop: PC-advance is asymmetric by exit class
 
@@ -112,26 +114,23 @@ selector > 8) and the near-`u64::MAX` ring-address snapshot test.
 
 - `VirtioMmioState::kicks`/`interrupts` (mmio_state.rs:134,136) and
   `vcpu_stats::VcpuStats` are cumulative across device resets.
-- `hv_kick_broadcasts`: incremented ONLY by `make_exit_vcpus_fn` and by
-  `make_exit_vcpu_fn`'s all-vCPU fallback — i.e. every io-worker all-vCPU
-  wake. A targeted kick is not a broadcast and shows up solely in the target
-  vCPU's `kicks_received`; since the vsock worker went targeted (2026-09-29)
-  the per-boot ~71 baseline no longer includes vsock's post-first-ACK kicks,
-  and a 1 GiB host→guest pipe moves it by ~200, not ~290 k. Teardown
-  (`stop`/`pause`) calls `vm.exit_vcpus` directly (lifecycle.rs) and is
-  intentionally NOT counted; do not expect this counter to move during
-  shutdown.
-- `hv_unpark_broadcasts`: incremented by the GIC IRQ callback's unpark-all loop
-  (setup.rs:148).
-- R2/R3 acceptance is measured from these numbers. A refactor that bypasses the
-  counter sites falsifies the metrics.
+- `kick_broadcasts` / `unpark_broadcasts` in the debug snapshot are retired
+  (2026-09-30) and always 0: io workers no longer kick and the IRQ callback
+  no longer unparks. The fields stay on the wire for the e2e forensics
+  mirror. `VcpuStats::kicks_received` still counts `Canceled` exits, which
+  now come only from `stop`/`pause`; a non-zero delta during steady state
+  means someone put a kick back.
+- The R2/R3 acceptance numbers that were read from those counters
+  (~2301 unpark-broadcasts / ~71 kick-broadcasts per boot) describe a
+  mechanism that no longer exists; the campaign's remaining idle-CPU lever
+  is the `rx-inject` thread's yield/poll loop (~5.6 of the ~6.7% idle CPU,
+  `sample`d 2026-09-30), not vCPU wakeups.
 
 ## Debugging: entry points and failure signatures
 
 Two snapshots (HV only; empty/zero under VZ — devices belong to VZ):
 
-- `Vmm::debug_snapshot` (vmm/mod.rs:642) — devices + per-vCPU exit counters +
-  kick/unpark broadcasts.
+- `Vmm::debug_snapshot` (vmm/mod.rs) — devices + per-vCPU exit counters.
 - `DeviceManager::virtio_debug` (device/debug.rs:75) — devices/queues only;
   reads MMIO mirror + live guest ring memory, THROUGH poisoned locks.
 
@@ -144,8 +143,8 @@ archaeology produced multiple WRONG root causes for ABX-386; snapshot first.
 |---|---|---|
 | >8-vCPU cold boot: guest wedges D-state / `folio_wait_bit_common` stall | live snapshot → find a blk queue whose `avail_idx` advances while `used_idx` stays stuck, or config dropped for high `queue_sel` | per-queue register array too small (`MAX_VIRTQUEUES` vs one-queue-per-vCPU), ABX-386 |
 | Guest TLS/cert validation fails right after boot | check whether agent-up ping has fired | no RTC; guest sits at kernel default epoch until the post-readiness ping sets the clock (ABX-416) |
-| Intermittent guest hang just after an I/O completes | audit the worker's completion path | missing `exit_vcpus()` — see Async-Worker Completion Contract |
-| Host→guest vsock bulk (`docker run -i` pipe, `docker load`) slow on HV with the guest idle; `GetVirtioDebug` shows `kick_broadcasts` moving by ~1 per packet | diff `kick_broadcasts` / vsock RX `used_idx` across one transfer | the injection round stopped draining a stream (`rx_injection.rs` re-enqueues RW after a full read) or the vsock worker lost its targeted kick (`irq_ack_vcpu` is `None`, or names a vCPU other than the one `/proc/interrupts` in the guest shows) |
+| Intermittent guest hang just after an I/O completes | audit the worker's completion path: `trigger_interrupt` then `irq_callback(irq, true)`, and the device must be DRIVER_OK (`sync_irq_level` drops the SPI otherwise) | the SPI was never asserted, or asserted before the guest set DRIVER_OK — see Async-Worker Completion Contract |
+| Host→guest vsock bulk (`docker run -i` pipe, `docker load`) slow on HV with the guest idle | diff the vsock device's `interrupts` and RX `used_idx` from `GetVirtioDebug` across one transfer: ~1 interrupt per ≤3776-byte packet means the injection round is back to one packet per connection; a non-zero `kicks_received` delta means a kick came back | `rx_injection.rs` must keep RW pending after a full read (5de23af4); no worker may call `hv_vcpus_exit` (c3004580) |
 
 For config-dependent boot failures, bisect with the `hv_e2e` config-matrix knobs
 (`ARCBOX_HV_E2E_VCPUS/MEMORY_MB/BALLOON/BOOT_ONLY/...`, all share the
@@ -171,14 +170,12 @@ re-reading every join site's comment.
 ## vCPU registration ordering (ABX-367)
 
 `hv_vcpus_exit` on arm64 is a silent no-op for NULL/0 — it needs a concrete list
-of vCPU IDs (mod.rs:153-156). Each vCPU pushes its raw handle then its `Thread`
-into the shared registries ONLY after all register-setup calls succeed
-(vcpu_loop.rs:152-171); pushing earlier risks a dangling handle (UB in Apple's
-framework) or an unbounded registry across failed boots. `make_exit_vcpus_fn`
-snapshots the registry each call and early-returns when empty (mod.rs:162-168);
-`stop` warns when the registry is empty while threads are alive
-(lifecycle.rs:400-404). Consequence: a worker's `exit_vcpus()` firing before
-secondaries register is a no-op for those vCPUs.
+of vCPU IDs. Each vCPU pushes its raw handle then its `Thread` into the shared
+registries ONLY after all register-setup calls succeed (vcpu_loop.rs);
+pushing earlier risks a dangling handle (UB in Apple's framework) or an
+unbounded registry across failed boots. `stop`/`pause` snapshot the registry
+when they run and `stop` warns when it is empty while threads are alive
+(lifecycle.rs). Only those two paths call `hv_vcpus_exit` now.
 
 ## Guest-controlled input
 
