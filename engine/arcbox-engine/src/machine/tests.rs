@@ -310,6 +310,13 @@ async fn test_create_with_shim_assembles_boot_contract() {
     // The console is capped so a loud distro (Debian at console_loglevel 7)
     // does not trickle kernel audit records onto hvc0 forever.
     assert!(cmdline.contains("loglevel=4"), "{cmdline}");
+    // The shim makes the name the guest's hostname.
+    assert!(
+        cmdline
+            .split_whitespace()
+            .any(|t| t == format!("{}shimmed", arcbox_constants::cmdline::MACHINE_NAME_KEY)),
+        "{cmdline}"
+    );
 }
 
 #[tokio::test]
@@ -488,7 +495,7 @@ fn readiness_waits_for_the_distro_init_to_settle() {
         distro_init_pending: true,
         ..Default::default()
     };
-    assert_eq!(readiness_ip(&info, "m", 1), None);
+    assert_eq!(readiness_addresses(&info, "m", 1), None);
 }
 
 #[test]
@@ -498,7 +505,33 @@ fn readiness_reports_the_address_once_the_distro_init_has_settled() {
         distro_init_pending: false,
         ..Default::default()
     };
-    assert_eq!(readiness_ip(&info, "m", 1), Some("10.0.2.2".to_owned()));
+    assert_eq!(
+        readiness_addresses(&info, "m", 1),
+        Some(GuestAddresses {
+            ip: "10.0.2.2".to_owned(),
+            bridge_ip: None,
+        })
+    );
+}
+
+/// The bridge address rides along when the guest reports one, and an empty
+/// report (no bridge NIC, no lease, or an agent predating the field) is
+/// `None` rather than a blocker: readiness must not wait for an address
+/// that is not coming.
+#[test]
+fn readiness_carries_the_bridge_address_when_reported() {
+    let info = arcbox_connect::v1::SystemInfo {
+        ip_addresses: vec!["10.0.2.2".to_owned(), "192.168.64.5".to_owned()],
+        bridge_ip_address: "192.168.64.5".to_owned(),
+        ..Default::default()
+    };
+    assert_eq!(
+        readiness_addresses(&info, "m", 1),
+        Some(GuestAddresses {
+            ip: "10.0.2.2".to_owned(),
+            bridge_ip: Some("192.168.64.5".to_owned()),
+        })
+    );
 }
 
 /// The proto3 default must be the pre-CORE-66 behaviour: an agent that
@@ -514,7 +547,10 @@ fn an_agent_without_the_field_is_not_treated_as_pending() {
         ip_addresses: vec!["10.0.2.2".to_owned()],
         ..Default::default()
     };
-    assert_eq!(readiness_ip(&info, "m", 1), Some("10.0.2.2".to_owned()));
+    assert_eq!(
+        readiness_addresses(&info, "m", 1).map(|a| a.ip),
+        Some("10.0.2.2".to_owned())
+    );
 }
 
 /// A settled init with nothing usable to report still is not ready — the
@@ -526,5 +562,25 @@ fn a_settled_init_without_a_usable_address_is_still_not_ready() {
         distro_init_pending: false,
         ..Default::default()
     };
-    assert_eq!(readiness_ip(&info, "m", 1), None);
+    assert_eq!(readiness_addresses(&info, "m", 1), None);
+}
+
+/// The name becomes the guest's hostname, so it has to be one: the shim
+/// reads it off the cmdline and the host publishes `<name>.arcbox.local`.
+#[test]
+fn machine_names_must_be_hostnames() {
+    for ok in ["dev", "my-box-2", "A1", &"x".repeat(63)] {
+        assert!(validate_machine_name(ok).is_ok(), "{ok}");
+    }
+    for bad in [
+        "",
+        "-dev",
+        "dev-",
+        "my_box",
+        "my.box",
+        "a b",
+        &"x".repeat(64),
+    ] {
+        assert!(validate_machine_name(bad).is_err(), "{bad:?}");
+    }
 }

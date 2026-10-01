@@ -76,6 +76,10 @@ pub struct MachineInfo {
     pub ssh_key_path: Option<PathBuf>,
     /// Guest IP address (reported by agent via vsock).
     pub ip_address: Option<String>,
+    /// Address of the guest's bridge NIC, the one the Mac reaches directly
+    /// and `<name>.arcbox.local` resolves to. Reported by the agent at
+    /// readiness; `None` while stopped or when the guest has no bridge NIC.
+    pub bridge_ip_address: Option<String>,
     /// macOS hypervisor backend this machine boots on.
     pub backend: arcbox_vmm::VmBackend,
     /// Whether the guest may run its own hypervisor.
@@ -247,18 +251,19 @@ fn default_distro_cmdline(rootfs_format: &str) -> String {
 /// Kernel command line for the machine boot shim: the shim EROFS boots as
 /// root and stages the distro rootfs + data disk named by the `arcbox.*`
 /// keys (see `../company/engineering/arcbox/plans/machine-boot-shim.md`). User mounts ride
-/// along as a `tag=guest_path[:ro]` table the shim replays.
-fn machine_shim_cmdline(rootfs_format: &str, mounts: &[MachineMount]) -> String {
+/// along as a `tag=guest_path[:ro]` table the shim replays, and the machine
+/// name rides along for the shim to make the guest's hostname.
+fn machine_shim_cmdline(name: &str, rootfs_format: &str, mounts: &[MachineMount]) -> String {
     use arcbox_constants::cmdline::{
-        MACHINE_DATA_KEY, MACHINE_INIT_PATH, MACHINE_MOUNTS_KEY, MACHINE_ROOTFS_KEY,
-        MACHINE_ROOTFS_TYPE_KEY,
+        MACHINE_DATA_KEY, MACHINE_INIT_PATH, MACHINE_MOUNTS_KEY, MACHINE_NAME_KEY,
+        MACHINE_ROOTFS_KEY, MACHINE_ROOTFS_TYPE_KEY,
     };
     let console = boot_console();
     let mut cmdline = format!(
         "console={console} root=/dev/vda ro rootfstype=erofs earlycon \
          {KEEP_KERNEL_NIC_NAMES} {QUIET_KERNEL_CONSOLE} init={MACHINE_INIT_PATH} \
          {MACHINE_ROOTFS_KEY}/dev/vdb {MACHINE_ROOTFS_TYPE_KEY}{rootfs_format} \
-         {MACHINE_DATA_KEY}/dev/vdc"
+         {MACHINE_DATA_KEY}/dev/vdc {MACHINE_NAME_KEY}{name}"
     );
     if !mounts.is_empty() {
         let table = mounts
@@ -280,6 +285,27 @@ fn machine_shim_cmdline(rootfs_format: &str, mounts: &[MachineMount]) -> String 
 /// VirtioFS tag for the machine's `i`-th user mount.
 fn mount_tag(index: usize) -> String {
     format!("m{index}")
+}
+
+/// Validates a machine name as the hostname it becomes: a DNS label of at
+/// most 63 ASCII letters, digits and hyphens, not starting or ending with a
+/// hyphen (RFC 1123). The name is also what `<name>.arcbox.local` is built
+/// from and what the shim passes on the kernel command line, which a space
+/// or `=` would break.
+fn validate_machine_name(name: &str) -> Result<()> {
+    let is_label = !name.is_empty()
+        && name.len() <= 63
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-');
+    if is_label {
+        Ok(())
+    } else {
+        Err(EngineError::config(format!(
+            "machine name '{name}' is not a valid hostname: use 1-63 letters, digits \
+             and hyphens, not starting or ending with a hyphen"
+        )))
+    }
 }
 
 /// Validates a user mount: the host path must exist and the guest path must
@@ -404,6 +430,7 @@ impl MachineManager {
                     disk_path: persisted.disk_path.clone().map(PathBuf::from),
                     ssh_key_path: persisted.ssh_key_path.clone().map(PathBuf::from),
                     ip_address: persisted.ip_address.clone(),
+                    bridge_ip_address: persisted.bridge_ip_address.clone(),
                     backend: persisted.backend,
                     nested_virt: persisted.nested_virt,
                     created_at: persisted.created_at,
@@ -468,6 +495,7 @@ impl MachineManager {
         // and user-driven, so the alternative (insert a `Creating` sentinel,
         // drop the lock for I/O, then finalize/rollback) is not worth its
         // orphan-state failure mode.
+        validate_machine_name(&config.name)?;
         let mut machines = self
             .machines
             .write()
@@ -561,7 +589,9 @@ impl MachineManager {
                 });
                 let cmdline = config.cmdline.clone().or_else(|| {
                     Some(match &rootfs.shim {
-                        Some(_) => machine_shim_cmdline(&rootfs.format, &config.mounts),
+                        Some(_) => {
+                            machine_shim_cmdline(&config.name, &rootfs.format, &config.mounts)
+                        }
                         None => default_distro_cmdline(&rootfs.format),
                     })
                 });
@@ -606,6 +636,7 @@ impl MachineManager {
             disk_path,
             ssh_key_path: None,
             ip_address: None,
+            bridge_ip_address: None,
             backend: config.backend,
             nested_virt: config.nested_virt,
             created_at: Utc::now(),
@@ -666,6 +697,7 @@ impl MachineManager {
                 machine.state = MachineState::Running;
                 machine.cid = Some(cid);
                 machine.ip_address = None;
+                machine.bridge_ip_address = None;
                 machine.started_at = Some(started_at);
 
                 tracing::info!("Machine '{}' started with CID {}", name, cid);
@@ -679,6 +711,7 @@ impl MachineManager {
         if let Err(e) = self.persistence.update(name, |m| {
             m.state = MachineState::Running.into();
             m.ip_address = None;
+            m.bridge_ip_address = None;
             m.started_at = Some(started_at);
         }) {
             tracing::warn!("Failed to persist state for machine '{}': {}", name, e);
@@ -726,7 +759,7 @@ impl MachineManager {
         let mut delay_ms = INITIAL_DELAY_MS;
         let mut attempt: u32 = 0;
 
-        let ip = loop {
+        let addresses = loop {
             attempt += 1;
 
             let probed = match self.connect_agent(name) {
@@ -739,8 +772,8 @@ impl MachineManager {
                     None
                 }
             };
-            if let Some(ip) = probed {
-                break ip;
+            if let Some(addresses) = probed {
+                break addresses;
             }
 
             if std::time::Instant::now() >= deadline {
@@ -760,13 +793,22 @@ impl MachineManager {
                 .write()
                 .map_err(|_| EngineError::LockPoisoned)?;
             if let Some(machine) = machines.get_mut(name) {
-                machine.ip_address = Some(ip.clone());
+                machine.ip_address = Some(addresses.ip.clone());
+                machine.bridge_ip_address.clone_from(&addresses.bridge_ip);
             }
         }
-        if let Err(e) = self.persistence.update_ip(name, Some(&ip)) {
+        if let Err(e) = self.persistence.update(name, |m| {
+            m.ip_address = Some(addresses.ip.clone());
+            m.bridge_ip_address.clone_from(&addresses.bridge_ip);
+        }) {
             tracing::warn!("Failed to persist IP for machine '{}': {}", name, e);
         }
-        tracing::info!("Machine '{}' ready with IP {}", name, ip);
+        tracing::info!(
+            machine = name,
+            ip = %addresses.ip,
+            bridge_ip = addresses.bridge_ip.as_deref().unwrap_or("none"),
+            "machine ready"
+        );
         Ok(())
     }
 
@@ -1165,10 +1207,10 @@ impl MachineManager {
 
         machine.state = MachineState::Stopped;
         machine.cid = None;
+        machine.bridge_ip_address = None;
         self.stop_serial_drain(name);
 
-        // Update persisted state
-        if let Err(e) = self.persistence.update_state(name, MachineState::Stopped) {
+        if let Err(e) = self.persist_stopped(name) {
             tracing::warn!(
                 "Failed to persist stopped state for machine '{}': {}",
                 name,
@@ -1312,9 +1354,10 @@ impl MachineManager {
                     .ok_or_else(|| EngineError::not_found(name.to_string()))?;
                 machine.state = MachineState::Stopped;
                 machine.cid = None;
+                machine.bridge_ip_address = None;
                 self.stop_serial_drain(name);
 
-                if let Err(e) = self.persistence.update_state(name, MachineState::Stopped) {
+                if let Err(e) = self.persist_stopped(name) {
                     tracing::warn!(
                         "Failed to persist stopped state for machine '{}': {}",
                         name,
@@ -1339,6 +1382,16 @@ impl MachineManager {
                 Err(e)
             }
         }
+    }
+
+    /// Records a stop: the state, and the bridge address, which is only
+    /// meaningful while the machine runs (the uplink address is kept, as
+    /// it always was, for `inspect` on a stopped machine).
+    fn persist_stopped(&self, name: &str) -> Result<()> {
+        self.persistence.update(name, |m| {
+            m.state = MachineState::Stopped.into();
+            m.bridge_ip_address = None;
+        })
     }
 
     /// Rolls a failed graceful stop back to `Running` — but only if the
@@ -1494,6 +1547,7 @@ impl MachineManager {
             disk_path: None,
             ssh_key_path: None,
             ip_address: None,
+            bridge_ip_address: None,
             backend: arcbox_vmm::VmBackend::default(),
             nested_virt: false,
             created_at: Utc::now(),
@@ -1507,6 +1561,16 @@ impl MachineManager {
     }
 }
 
+/// The addresses a ready machine reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GuestAddresses {
+    /// The routable address on the machine's uplink (`10.0.2.x`).
+    ip: String,
+    /// The bridge NIC's address, when the guest has one; see
+    /// [`MachineInfo::bridge_ip_address`].
+    bridge_ip: Option<String>,
+}
+
 /// The readiness verdict for one `SystemInfo` snapshot: `None` means "not
 /// ready yet, retry".
 ///
@@ -1518,14 +1582,24 @@ impl MachineManager {
 /// would otherwise have returned. Waiting for the guest's init to settle is
 /// what makes readiness mean "usable" rather than "the agent is alive"
 /// (CORE-66).
-fn readiness_ip(info: &arcbox_connect::v1::SystemInfo, name: &str, attempt: u32) -> Option<String> {
+///
+/// The bridge address is taken as reported and never waited for: the shim
+/// acquires it before the distro's init runs, so by the time that init has
+/// settled it is either there or not coming (no bridge NIC, no lease).
+fn readiness_addresses(
+    info: &arcbox_connect::v1::SystemInfo,
+    name: &str,
+    attempt: u32,
+) -> Option<GuestAddresses> {
     if info.distro_init_pending {
         tracing::trace!(
             "Machine '{name}' distro init still starting (attempt {attempt}); not ready",
         );
         return None;
     }
-    select_routable_ip(&info.ip_addresses)
+    let ip = select_routable_ip(&info.ip_addresses)?;
+    let bridge_ip = Some(info.bridge_ip_address.clone()).filter(|ip| !ip.is_empty());
+    Some(GuestAddresses { ip, bridge_ip })
 }
 
 /// One readiness attempt over the blocking (HV) transport: ping, protocol
@@ -1536,7 +1610,7 @@ fn probe_ip_blocking(
     mut agent: crate::agent_client::AgentClient,
     name: &str,
     attempt: u32,
-) -> Result<Option<String>> {
+) -> Result<Option<GuestAddresses>> {
     let resp = match agent.ping_blocking() {
         Ok(resp) => resp,
         Err(e) => {
@@ -1552,7 +1626,7 @@ fn probe_ip_blocking(
         attempt,
     );
     match agent.get_system_info_blocking() {
-        Ok(info) => Ok(readiness_ip(&info, name, attempt)),
+        Ok(info) => Ok(readiness_addresses(&info, name, attempt)),
         Err(e) => {
             tracing::trace!(
                 "Machine '{}' get_system_info failed (attempt {attempt}): {e}",
@@ -1569,7 +1643,7 @@ async fn probe_ip_async(
     mut agent: crate::agent_client::AgentClient,
     name: &str,
     attempt: u32,
-) -> Result<Option<String>> {
+) -> Result<Option<GuestAddresses>> {
     let resp = match agent.ping().await {
         Ok(resp) => resp,
         Err(e) => {
@@ -1585,7 +1659,7 @@ async fn probe_ip_async(
         attempt,
     );
     match agent.get_system_info().await {
-        Ok(info) => Ok(readiness_ip(&info, name, attempt)),
+        Ok(info) => Ok(readiness_addresses(&info, name, attempt)),
         Err(e) => {
             tracing::trace!(
                 "Machine '{}' get_system_info failed (attempt {attempt}): {e}",
