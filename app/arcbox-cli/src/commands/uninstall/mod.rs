@@ -1,27 +1,38 @@
-//! Complete uninstall of ArcBox from the system.
+//! `abctl uninstall`: remove ArcBox from this Mac.
 //!
-//! Removes daemon, helper, system files, data, app bundle, and finally the
-//! CLI binary itself. Requires interactive confirmation and sudo for
-//! privileged operations.
+//! The inventory of what ArcBox writes lives in [`inventory`]; the actions
+//! in [`steps`]. This file orders them and reports each one honestly: a
+//! step prints `done`, `skipped (why)`, or `FAILED: why`, and the command
+//! exits non-zero when any step failed (#716).
+//!
+//! Run as the user, not under `sudo`: the Docker context, shell profile,
+//! kubeconfig and login keychain are the user's. Privileged paths are
+//! removed through `sudo`, which asks once up front.
 
 mod host;
 mod inventory;
 mod steps;
 
-use anyhow::{Context, Result, bail};
-use arcbox_constants::paths::{ArcboxProfile, DOCKER_CLI_TOOLS, HostLayout, privileged};
-use clap::Args;
-use std::io::Write;
-use std::process::Command;
+use std::io::Write as _;
 
-/// Uninstall ArcBox from this machine.
+use anyhow::{Context, Result, bail};
+use arcbox_constants::paths::{ArcboxProfile, HostLayout, labels};
+use arcbox_docker::DockerContextManager;
+use clap::Args;
+
+use self::host::{Host, Mac};
+use self::inventory::{Residue, Roots};
+use self::steps::Outcome;
+use super::{kubernetes, setup, ssh};
+
+/// Remove ArcBox from this Mac: daemon, helper, links, integrations, data.
 #[derive(Debug, Args)]
 pub struct UninstallArgs {
-    /// Skip confirmation prompt.
+    /// Skip the confirmation prompt.
     #[arg(long)]
     pub yes: bool,
 
-    /// Preserve container data (~/.arcbox/data).
+    /// Keep container, image and machine data (`~/.arcbox/data`).
     #[arg(long)]
     pub keep_data: bool,
 }
@@ -29,37 +40,16 @@ pub struct UninstallArgs {
 pub async fn execute(args: UninstallArgs) -> Result<()> {
     let profile = ArcboxProfile::from_env_or_default();
     validate_uninstall_scope(profile)?;
-
-    let home = dirs::home_dir().context("cannot determine home directory")?;
-    let daemon_label = profile.daemon_label();
-    let docker_context = profile.docker_context_name();
-    let data_dir = HostLayout::from_env_or_default().data_dir;
-    let app_name = match profile {
-        ArcboxProfile::Production => "ArcBox",
-        ArcboxProfile::Development => "ArcBox Dev",
-    };
-    let app_path = format!("/Applications/{app_name}.app");
-
-    println!("This will remove ArcBox and all its data:\n");
-    println!("  • Stop and remove daemon (LaunchAgent)");
-    println!("  • Stop and remove helper (binary, plist, socket)  [sudo]");
-    println!("  • Remove DNS resolver (/etc/resolver/arcbox.local) [sudo]");
-    println!("  • Remove Docker socket (/var/run/docker.sock)    [sudo]");
-    println!("  • Remove CLI symlinks (/usr/local/bin/docker...) [sudo]");
-    println!("  • Remove Docker context '{docker_context}'");
-    if args.keep_data {
-        println!(
-            "  • Remove app data ({}) — keeping container data",
-            data_dir.display()
-        );
-    } else {
-        println!(
-            "  • Remove ALL app data ({}) including containers",
-            data_dir.display()
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        bail!(
+            "run `abctl uninstall` as yourself, not under sudo: it removes your Docker context, shell integration and keychain trust, and asks for sudo itself"
         );
     }
-    println!("  • Remove app ({app_path})");
-    println!();
+
+    let roots = Roots::from_env()?;
+    let residue = inventory::scan(&roots, args.keep_data);
+    print_plan(&roots, &residue);
 
     if !args.yes {
         print!("Continue? [y/N] ");
@@ -71,169 +61,221 @@ pub async fn execute(args: UninstallArgs) -> Result<()> {
             return Ok(());
         }
     }
-
-    // Cache sudo credentials up front so the user only enters password once.
     println!();
-    let sudo_ok = Command::new("sudo").args(["-v"]).status().is_ok();
-    if !sudo_ok {
-        anyhow::bail!("sudo authentication failed");
+
+    let host = Mac;
+    if residue.needs_root() {
+        // One password prompt, up front, instead of one per privileged step.
+        // Inherits the terminal: sudo reads the password from it.
+        let status = std::process::Command::new("sudo")
+            .arg("-v")
+            .status()
+            .context("could not run sudo")?;
+        if !status.success() {
+            bail!("sudo authentication failed");
+        }
     }
 
-    let mut step = 0u32;
-    let total = 9u32;
-
-    macro_rules! step {
-        ($label:expr, $body:expr) => {
-            step += 1;
-            print!("[{step}/{total}] {:<42}", $label);
-            std::io::stdout().flush().ok();
-            let result: std::result::Result<(), String> = {
-                $body;
-                Ok(())
-            };
-            match result {
-                Ok(()) => println!("✓"),
-                Err(e) => println!("✗ {e}"),
-            }
-        };
+    let report = run(&host, &roots, &residue, &mut |step| println!("{step}")).await;
+    println!();
+    if report.iter().any(Step::failed) {
+        bail!(
+            "{} step(s) failed; fix the cause and run `abctl uninstall` again",
+            report.iter().filter(|step| step.failed()).count()
+        );
     }
-
-    // 1. Quit the app (triggers SMAppService.unregister() via the app's
-    //    termination handler, clearing the BTM / Login Items entry).
-    step!("Quitting ArcBox...", {
-        let _ = Command::new("osascript")
-            .args(["-e", &format!(r#"quit app "{app_name}""#)])
-            .output();
-        // Wait for app to quit and daemon to stop.
-        std::thread::sleep(std::time::Duration::from_secs(3));
-    });
-
-    // 2. Stop daemon.
-    step!("Stopping daemon...", {
-        let uid = unsafe { libc::getuid() };
-        let _ = Command::new("launchctl")
-            .args(["bootout", &format!("gui/{uid}/{daemon_label}")])
-            .output();
-        let _ = Command::new("pkill").args(["-f", daemon_label]).output();
-        // Wait for VM processes to exit gracefully.
-        std::thread::sleep(std::time::Duration::from_secs(3));
-        let _ = Command::new("pkill")
-            .args(["-f", "com.apple.Virtualization.VirtualMachine"])
-            .output();
-        // Remove the daemon launchd plist.
-        let plist = home.join(format!("Library/LaunchAgents/{daemon_label}.plist"));
-        let _ = std::fs::remove_file(plist);
-    });
-
-    // 3. Stop and remove helper.
-    step!("Removing helper...                  [sudo]", {
-        let _ = Command::new("sudo")
-            .args([
-                "launchctl",
-                "bootout",
-                "system/com.arcboxlabs.desktop.helper",
-            ])
-            .output();
-        let _ = Command::new("sudo")
-            .args(["pkill", "-f", "arcbox-helper"])
-            .output();
-        let _ = Command::new("sudo")
-            .args(["rm", "-f", privileged::HELPER_BINARY])
-            .output();
-        let _ = Command::new("sudo")
-            .args(["rm", "-f", privileged::HELPER_PLIST])
-            .output();
-        let _ = Command::new("sudo")
-            .args(["rm", "-f", privileged::HELPER_SOCKET])
-            .output();
-    });
-
-    // 4. Remove DNS resolver.
-    step!("Removing DNS resolver...            [sudo]", {
-        let _ = Command::new("sudo")
-            .args(["rm", "-f", "/etc/resolver/arcbox.local"])
-            .output();
-    });
-
-    // 5. Remove Docker socket symlink.
-    step!("Removing Docker socket...           [sudo]", {
-        if let Ok(target) = std::fs::read_link(privileged::DOCKER_SOCKET) {
-            if target.to_string_lossy().contains(".arcbox") {
-                let _ = Command::new("sudo")
-                    .args(["rm", "-f", privileged::DOCKER_SOCKET])
-                    .output();
-            }
-        }
-    });
-
-    // 6. Remove CLI and Docker symlinks.
-    step!("Removing CLI symlinks...            [sudo]", {
-        // Remove abctl symlink if it points to ArcBox.
-        if let Ok(target) = std::fs::read_link("/usr/local/bin/abctl") {
-            if target.to_string_lossy().contains("ArcBox") {
-                let _ = Command::new("sudo")
-                    .args(["rm", "-f", "/usr/local/bin/abctl"])
-                    .output();
-            }
-        }
-        // Remove Docker CLI symlinks created by helper cli_link.
-        for name in DOCKER_CLI_TOOLS {
-            let path = format!("/usr/local/bin/{name}");
-            if let Ok(target) = std::fs::read_link(&path) {
-                if target
-                    .to_string_lossy()
-                    .contains(".app/Contents/MacOS/xbin/")
-                {
-                    let _ = Command::new("sudo").args(["rm", "-f", &path]).output();
-                }
-            }
-        }
-    });
-
-    // 7. Remove Docker context.
-    step!("Removing Docker context...", {
-        let _ = Command::new("docker")
-            .args(["context", "rm", docker_context])
-            .output();
-        // Restore default context if ArcBox was active.
-        let _ = Command::new("docker")
-            .args(["context", "use", "default"])
-            .output();
-    });
-
-    // 8. Remove data.
-    step!("Removing data...", {
-        if args.keep_data {
-            // Remove everything except data/
-            if let Ok(entries) = std::fs::read_dir(&data_dir) {
-                for entry in entries.flatten() {
-                    if entry.file_name() == "data" {
-                        continue;
-                    }
-                    let path = entry.path();
-                    if path.is_dir() {
-                        let _ = std::fs::remove_dir_all(&path);
-                    } else {
-                        let _ = std::fs::remove_file(&path);
-                    }
-                }
-            }
-        } else {
-            let _ = std::fs::remove_dir_all(&data_dir);
-        }
-    });
-
-    // 9. Remove app bundle.
-    step!("Removing app...", {
-        let _ = std::fs::remove_dir_all(&app_path);
-    });
-
-    println!("\nArcBox has been uninstalled.");
+    println!("ArcBox has been removed.");
     if args.keep_data {
-        println!("Container data preserved at {}/data", data_dir.display());
+        println!(
+            "Container data kept at {}",
+            roots.data_dir.join("data").display()
+        );
     }
-
+    if residue.app_left_to_homebrew {
+        println!("The app was installed by Homebrew; finish with: brew uninstall --cask arcbox");
+    }
     Ok(())
+}
+
+fn print_plan(roots: &Roots, residue: &Residue) {
+    println!("This will remove ArcBox from this Mac:\n");
+    println!("  • Quit the Desktop app and stop the daemon (and its VM)");
+    for found in &residue.files {
+        let root = if found.needs_root { "  [sudo]" } else { "" };
+        println!("  • Remove {} {}{root}", found.what, found.path.display());
+    }
+    if residue.hosts_alias {
+        println!("  • Remove the ArcBox line from /etc/hosts  [sudo]");
+    }
+    println!("  • Remove the Docker context, shell, kubectl and ssh integration");
+    println!("  • Remove trust in the ArcBox local CA, if granted");
+    if residue.preferences {
+        println!("  • Remove the Desktop app's preferences");
+    }
+    if residue.app_left_to_homebrew {
+        println!(
+            "  • Leave {} to Homebrew (brew uninstall --cask arcbox)",
+            roots.app_bundle().display()
+        );
+    }
+    println!();
+}
+
+/// One step of the run, as shown to the user.
+struct Step {
+    label: String,
+    outcome: Result<Outcome>,
+}
+
+impl Step {
+    fn failed(&self) -> bool {
+        self.outcome.is_err()
+    }
+}
+
+impl std::fmt::Display for Step {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:<60} ", self.label)?;
+        match &self.outcome {
+            Ok(Outcome::Done) => write!(f, "done"),
+            Ok(Outcome::Skipped(reason)) => write!(f, "skipped ({reason})"),
+            Err(error) => write!(f, "FAILED: {error:#}"),
+        }
+    }
+}
+
+/// Runs every step against `residue`, calling `report` as each finishes.
+///
+/// Order matters: the app quits before the daemon is stopped (its handler
+/// stops the daemon itself); integrations that need binaries from the data
+/// directory (kubectl, the CA certificate) run before the data directory is
+/// removed; the helper is unregistered before its plist goes.
+async fn run(
+    host: &dyn Host,
+    roots: &Roots,
+    residue: &Residue,
+    report: &mut (dyn FnMut(&Step) + Send),
+) -> Vec<Step> {
+    let mut steps = Vec::new();
+    let mut step = |label: String, outcome: Result<Outcome>| {
+        let step = Step { label, outcome };
+        report(&step);
+        steps.push(step);
+    };
+    let layout = HostLayout::new(roots.data_dir.clone());
+
+    step(
+        format!("Quitting {}", roots.profile.app_name()),
+        steps::quit_app(host, roots.profile.app_bundle_id()),
+    );
+    step(
+        "Stopping the daemon".into(),
+        steps::stop_daemon(
+            host,
+            &layout,
+            &[roots.profile.daemon_label(), labels::LEGACY_SCRIPT_DAEMON],
+        )
+        .await,
+    );
+    if residue.helper_registered {
+        step(
+            "Unregistering the helper".into(),
+            steps::bootout_helper(host),
+        );
+    }
+    step(
+        format!("Unmounting {}", roots.data_export_mount().display()),
+        steps::remove_data_export(host, &roots.data_export_mount()),
+    );
+    step(
+        "Removing the Docker context".into(),
+        remove_docker_context(roots),
+    );
+    step(
+        "Removing shell integration".into(),
+        remove_shell_integration(roots).await,
+    );
+    step(
+        "Removing kubectl integration".into(),
+        remove_kubernetes_integration(roots).await,
+    );
+    step(
+        "Removing the ssh config Include".into(),
+        remove_ssh_include(roots, &layout),
+    );
+    step(
+        "Removing trust in the ArcBox local CA".into(),
+        steps::untrust_local_ca(host, roots),
+    );
+    if residue.hosts_alias {
+        step(
+            "Removing the ArcBox line from /etc/hosts".into(),
+            steps::remove_hosts_alias(host, &roots.hosts()),
+        );
+    }
+    for found in &residue.files {
+        step(
+            format!("Removing {} {}", found.what, found.path.display()),
+            steps::remove_path(host, &found.path).map(|()| Outcome::Done),
+        );
+    }
+    if residue.preferences {
+        step(
+            "Removing the Desktop app's preferences".into(),
+            steps::delete_preferences(host, roots),
+        );
+    }
+    steps
+}
+
+fn remove_docker_context(roots: &Roots) -> Result<Outcome> {
+    let manager = DockerContextManager::with_context_name_and_config_dir(
+        HostLayout::new(roots.data_dir.clone()).docker_socket,
+        roots.docker_context.clone(),
+        roots.docker_config.clone(),
+    );
+    if !manager.context_exists() {
+        return Ok(Outcome::Skipped("absent".into()));
+    }
+    // Restores the previous current context before removing ours: `docker
+    // context rm` refuses the context in use (#716).
+    manager.remove_context()?;
+    Ok(Outcome::Done)
+}
+
+async fn remove_shell_integration(roots: &Roots) -> Result<Outcome> {
+    let integration =
+        setup::Integration::under(&roots.home, &roots.data_dir, roots.docker_config.clone())
+            .await?;
+    let removed = setup::remove_integration(&integration).await?;
+    if let Some(error) = removed.plugin_error {
+        bail!("Docker CLI plugins: {error}");
+    }
+    Ok(Outcome::Done)
+}
+
+async fn remove_kubernetes_integration(roots: &Roots) -> Result<Outcome> {
+    let paths = kubernetes::HostPaths {
+        home: roots.home.clone(),
+        data_dir: roots.data_dir.clone(),
+    };
+    if kubernetes::remove_host_integration(&paths).await? {
+        Ok(Outcome::Done)
+    } else {
+        Ok(Outcome::Skipped("not enabled".into()))
+    }
+}
+
+fn remove_ssh_include(roots: &Roots, layout: &HostLayout) -> Result<Outcome> {
+    let user_config = roots.home.join(".ssh").join("config");
+    if !user_config.exists() {
+        return Ok(Outcome::Skipped("absent".into()));
+    }
+    if ssh::uninstall(&user_config, &layout.ssh_config, &roots.home)? {
+        Ok(Outcome::Done)
+    } else {
+        Ok(Outcome::Skipped("not included".into()))
+    }
 }
 
 fn validate_uninstall_scope(profile: ArcboxProfile) -> Result<()> {
@@ -245,14 +287,30 @@ fn validate_uninstall_scope(profile: ArcboxProfile) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::validate_uninstall_scope;
-    use arcbox_constants::paths::ArcboxProfile;
+/// The user-level part of an uninstall, for the Homebrew cask's pre-uninstall
+/// hook (`abctl _internal brew-uninstall`): the daemon, its LaunchAgent, the
+/// Docker context, the shell integration, our `/usr/local/bin/docker*` links
+/// (through the helper, which is still registered at this point), and the run
+/// directory. The cask removes the app itself; `brew zap` covers the rest of
+/// the user's data; `abctl uninstall` covers the privileged state.
+///
+/// Fails on the first step that fails: Homebrew shows the error and stops.
+pub(super) async fn brew_hook() -> Result<()> {
+    let roots = Roots::from_env()?;
+    let host = Mac;
+    let layout = HostLayout::new(roots.data_dir.clone());
 
-    #[test]
-    fn development_uninstall_is_rejected() {
-        assert!(validate_uninstall_scope(ArcboxProfile::Development).is_err());
-        assert!(validate_uninstall_scope(ArcboxProfile::Production).is_ok());
+    steps::stop_daemon(
+        &host,
+        &layout,
+        &[roots.profile.daemon_label(), labels::LEGACY_SCRIPT_DAEMON],
+    )
+    .await?;
+    for label in [roots.profile.daemon_label(), labels::LEGACY_SCRIPT_DAEMON] {
+        steps::remove_path(&host, &roots.launch_agent(label))?;
     }
+    remove_docker_context(&roots)?;
+    remove_shell_integration(&roots).await?;
+    steps::unlink_cli_tools_through_helper(&roots).await;
+    steps::remove_path(&host, &layout.run_dir)
 }
