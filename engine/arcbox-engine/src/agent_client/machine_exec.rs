@@ -136,7 +136,7 @@ impl OutputWindow {
 /// Takes window for an output frame that just arrived.
 fn take_output_window(available: &AtomicUsize, cost: usize) -> Result<()> {
     available
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |left| {
             left.checked_sub(cost)
         })
         .map(drop)

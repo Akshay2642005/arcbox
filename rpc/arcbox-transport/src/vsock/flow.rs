@@ -75,7 +75,7 @@ impl Credit {
     fn try_take(&self, want: usize) -> Option<usize> {
         let mut taken = 0;
         self.available
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |left| {
                 taken = left.min(want);
                 (taken > 0).then_some(left - taken)
             })
@@ -87,7 +87,7 @@ impl Credit {
     /// a peer sending past the window it holds is a protocol error.
     pub fn take(&self, len: usize) -> io::Result<()> {
         self.available
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |left| {
                 left.checked_sub(len)
             })
             .map(drop)
@@ -99,7 +99,7 @@ impl Credit {
     /// Growing past the window's size is a protocol error.
     pub fn grant(&self, len: usize) -> io::Result<()> {
         self.available
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |left| {
                 left.checked_add(len).filter(|total| *total <= self.limit)
             })
             .map_err(|_| protocol_error("peer granted more flow-control window than exists"))?;
