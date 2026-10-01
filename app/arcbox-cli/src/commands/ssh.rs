@@ -80,7 +80,7 @@ fn install(user_config: &Path, config: &Path, home: &Path) -> Result<bool> {
 }
 
 /// Removes what [`install`] added. Returns whether the file changed.
-fn uninstall(user_config: &Path, config: &Path, home: &Path) -> Result<bool> {
+pub(super) fn uninstall(user_config: &Path, config: &Path, home: &Path) -> Result<bool> {
     let file = UserConfig::read(user_config)?;
     match without_include(&file.content, config, home) {
         Some(content) => {

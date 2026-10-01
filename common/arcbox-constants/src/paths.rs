@@ -89,9 +89,9 @@ pub mod labels {
     pub const DEVELOPMENT_DAEMON: &str = "com.arcboxlabs.desktop.dev.daemon";
     /// Helper (system-level LaunchDaemon).
     pub const HELPER: &str = "com.arcboxlabs.desktop.helper";
-    /// Daemon LaunchAgent written by the retired `curl | bash` installer
-    /// (`scripts/install.sh`). Nothing creates it any more; uninstall still
-    /// removes it.
+    /// Daemon LaunchAgent written by the `curl | bash` installer
+    /// (`scripts/install.sh`), which registers the daemon under its own
+    /// label. Uninstall removes it alongside the Desktop one.
     pub const LEGACY_SCRIPT_DAEMON: &str = "dev.arcbox.daemon";
 }
 

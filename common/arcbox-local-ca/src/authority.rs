@@ -4,6 +4,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 
+use arcbox_constants::dns::LOCAL_CA_COMMON_NAME;
 use arcbox_constants::paths::guest::{TLS_CA_CERT, TLS_CA_KEY};
 use rcgen::{
     BasicConstraints, CertificateParams, CidrSubnet, DistinguishedName, DnType, GeneralSubtree,
@@ -44,7 +45,7 @@ fn generate() -> Result<(String, String), rcgen::Error> {
     let key = KeyPair::generate()?;
     let mut params = CertificateParams::default();
     let mut name = DistinguishedName::new();
-    name.push(DnType::CommonName, "ArcBox Local CA");
+    name.push(DnType::CommonName, LOCAL_CA_COMMON_NAME);
     name.push(DnType::OrganizationName, "ArcBox");
     params.distinguished_name = name;
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
