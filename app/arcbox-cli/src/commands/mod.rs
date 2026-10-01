@@ -61,6 +61,7 @@ fn select_docker_socket_path(
 
 pub mod agent;
 pub mod boot;
+pub mod bundle;
 pub mod cli_plugins;
 pub mod daemon;
 pub mod debug;
@@ -82,7 +83,6 @@ pub mod migrate;
 pub mod sandbox;
 pub mod setup;
 pub mod ssh;
-pub mod symlink;
 pub mod system;
 #[cfg(target_os = "macos")]
 pub mod tls;
@@ -212,9 +212,9 @@ pub enum Commands {
     #[command(name = "_install", hide = true)]
     Install(install::InstallArgs),
 
-    /// Internal: uninstall helper + deregister daemon (used by brew/DMG installers)
+    /// Remove ArcBox from this Mac (daemon, helper, links, integrations, data)
     #[cfg(target_os = "macos")]
-    #[command(name = "_uninstall", hide = true)]
+    #[command(alias = "_uninstall")]
     Uninstall(uninstall::UninstallArgs),
 
     /// Internal: package manager hooks (brew postflight/uninstall)
