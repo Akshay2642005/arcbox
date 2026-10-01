@@ -156,6 +156,8 @@ message MachineSystemInfo {
     uint64 uptime = 10;
     // Guest IP addresses (excluding loopback).
     repeated string ip_addresses = 11;
+    // IPv4 address of the guest's bridge NIC, empty when it has none.
+    string bridge_ip_address = 12;
 }
 
 // Directory mount configuration.
@@ -287,6 +289,14 @@ message MachineNetwork {
     repeated string dns_servers = 4;
     // MAC address of the bridge NAT NIC used for host-side vmnet routing on macOS.
     string bridge_mac_address = 5;
+    // IPv4 address of the bridge NIC: the address the Mac reaches directly
+    // and the one `<machine>.arcbox.local` resolves to. Empty until the
+    // machine has reported it.
+    string bridge_ip_address = 6;
+    // The name the host's DNS answers for this machine while it runs
+    // (`<machine>.<local domain>`). Empty when the machine has no bridge
+    // address to register.
+    string dns_name = 7;
 }
 
 // Machine storage configuration.

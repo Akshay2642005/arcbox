@@ -1561,6 +1561,9 @@ pub struct MachineSystemInfo {
     /// Guest IP addresses (excluding loopback).
     #[prost(string, repeated, tag = "11")]
     pub ip_addresses: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// IPv4 address of the guest's bridge NIC, empty when it has none.
+    #[prost(string, tag = "12")]
+    pub bridge_ip_address: ::prost::alloc::string::String,
 }
 /// Directory mount configuration.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1733,6 +1736,16 @@ pub struct MachineNetwork {
     /// MAC address of the bridge NAT NIC used for host-side vmnet routing on macOS.
     #[prost(string, tag = "5")]
     pub bridge_mac_address: ::prost::alloc::string::String,
+    /// IPv4 address of the bridge NIC: the address the Mac reaches directly
+    /// and the one `<machine>.arcbox.local` resolves to. Empty until the
+    /// machine has reported it.
+    #[prost(string, tag = "6")]
+    pub bridge_ip_address: ::prost::alloc::string::String,
+    /// The name the host's DNS answers for this machine while it runs
+    /// (`<machine>.<local domain>`). Empty when the machine has no bridge
+    /// address to register.
+    #[prost(string, tag = "7")]
+    pub dns_name: ::prost::alloc::string::String,
 }
 /// Machine storage configuration.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -3053,6 +3066,13 @@ pub struct SystemInfo {
     /// still be starting sets it true.
     #[prost(bool, tag = "12")]
     pub distro_init_pending: bool,
+    /// IPv4 address of the guest's bridge NIC (the vmnet interface the Mac
+    /// reaches directly), or empty when the guest has none or it has no
+    /// address yet. The host registers `<machine>.arcbox.local` at this
+    /// address; `ip_addresses` keeps listing every interface, so an older
+    /// host that ignores this field sees exactly what it saw before.
+    #[prost(string, tag = "13")]
+    pub bridge_ip_address: ::prost::alloc::string::String,
 }
 /// Request to ensure runtime services are available.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
