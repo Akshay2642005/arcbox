@@ -52,8 +52,6 @@ pub mod error;
 pub use arcbox_packet::ethernet;
 #[cfg(target_os = "linux")]
 pub mod linux;
-pub mod mdns;
-pub mod mdns_protocol;
 pub mod nat;
 pub mod nat_engine;
 pub mod port_forward;
