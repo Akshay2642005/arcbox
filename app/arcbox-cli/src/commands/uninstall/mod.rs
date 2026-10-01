@@ -4,6 +4,9 @@
 //! CLI binary itself. Requires interactive confirmation and sudo for
 //! privileged operations.
 
+mod host;
+mod inventory;
+
 use anyhow::{Context, Result, bail};
 use arcbox_constants::paths::{ArcboxProfile, DOCKER_CLI_TOOLS, HostLayout, privileged};
 use clap::Args;
