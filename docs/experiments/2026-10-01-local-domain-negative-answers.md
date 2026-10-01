@@ -50,4 +50,34 @@ The responder's log shows the client's schedule: AAAA at 0.45 s, retried at 1.5 
 ## Decisions taken / open
 
 - `DnsForwarder::try_resolve_locally_or_nodata` answers unknown names under the local domain NODATA; the rule and its reason live in `app/AGENTS.md`.
-- Open: registering container names with mDNSResponder directly (Bonjour, as OrbStack's `orb.local` does) would let registered names resolve without `/etc/resolver` and without admin. From an unentitled process on this host both `DNSServiceRegisterRecord` and `DNSServiceRegister` return `kDNSServiceErr_PolicyDenied` (-65570) in the callback, while Apple's `/usr/bin/dns-sd -P`, which carries `com.apple.developer.networking.multicast.BYPASS`, registered a `.foo.local` host record that resolved in 0.01 s including the AAAA negative. Whether a Developer ID LaunchAgent is allowed, or prompted for Local Network access, is untested; the unified log was unreadable from the test shell.
+- The daemon that owns the resolver domain also registers its names with mDNSResponder (`arcbox-daemon/src/mdns/`), so they resolve on a Mac without `/etc/resolver` for clients allowed to resolve `.local` names; see the follow-ups below for the privilege that gates this and the interface the records go on.
+
+## Follow-up, same day: Local Network privacy
+
+Apple's TN3179 ("Understanding local network privacy") names the mechanism behind the `kDNSServiceErr_PolicyDenied` the first attempt at Bonjour registration hit, and it also explains a result above.
+
+- Every Bonjour operation, registration included, and resolving any `.local` name both require the Local Network privilege on macOS 15+. Exempt: `launchd` daemons, root, and command-line tools started from Terminal.app or over SSH. A `launchd` agent is not exempt; it inherits the privilege of the app it belongs to, and macOS prompts for that app once. A short-lived process is denied without a prompt (FB16131937).
+- The privilege is keyed to the responsible *app bundle*. The probes here ran under Homebrew's `python3`, which execs `Python.framework/…/Python.app`, so every probe was "Python" in System Settings › Privacy & Security › Local Network, whichever terminal launched it. That is why a rerun from Terminal.app was still refused (`PolicyDenied` in 1 ms, LocalOnly and Any alike) and why the terminal multiplexer the session ran in never appeared in the list. Once Python was allowed there, the same probe from the same shell registered (`err=0`) and the name resolved.
+- The lookups above went through `dscacheutil`, which asks root's `opendirectoryd`, so they show what an *allowed* client sees. The same lookup from a client without the privilege fails at once, through every path: Python `getaddrinfo` for `lnp-<n>.arcbox.local` returned "nodename nor servname provided" in 0.00 s while the responder on 5553 was answering positively and `dscacheutil` returned the address in the same second. A client without Local Network access therefore cannot resolve `*.arcbox.local` at all; neither the resolver file nor Bonjour records reach it. That is a property of the `.local` suffix, not of either server.
+- With Python allowed, `getaddrinfo` behaves like `dscacheutil` on the unicast answers: a miss with the responder answering NODATA fails in 0.00–0.01 s for `AF_UNSPEC`, `AF_INET` and `AF_INET6`; with NXDOMAIN or silence it takes 5.00 s (one mDNS timeout; `dscacheutil` pays two, 10 s). The NODATA answer holds for the client path too.
+
+## Follow-up, same day: which interface the Bonjour records go on
+
+Registered from the allowed Python, one A record for a fresh name, then `getaddrinfo` for the name with no resolver file involved (5553 had no listener):
+
+| Registration | Registration reply | `AF_UNSPEC` lookup | `AF_INET6` lookup |
+|---|---|---|---|
+| `kDNSServiceInterfaceIndexLocalOnly`, A only | 0.00 s | 5.03 s, address | 5.00 s |
+| LocalOnly, A + a client-registered NSEC (Unique or Shared) | 0.00 s | 5.01 s, address | 5.00 s |
+| `kDNSServiceInterfaceIndexAny`, A only | 0.67 s (probing) | 0.01 s, address | 0.00 s |
+| interface `lo0`, A only | 0.73 s (probing) | 0.01 s, address | 0.00 s |
+
+mDNSResponder synthesizes the negative answer for a type the name lacks only for ordinary interface-bound records, not for the LocalOnly list, and ignores a client-registered NSEC. `lo0` has no multicast peers, so binding the records there keeps them on the host and still gets the fast negative; the mirror uses it. Probing costs about 750 ms before a record is live, which the unicast server covers.
+
+The daemon itself, run from Terminal.app as a development-profile `--no-linux-vm` instance owning `w.dev.arcbox.local`, logged `mDNSResponder serves this host's *.w.dev.arcbox.local names`, and `host.w.dev.arcbox.local` resolved to 10.0.2.1 from `getaddrinfo`; the records were gone after SIGTERM.
+
+## Decisions taken / open
+
+- `DnsForwarder::try_resolve_locally_or_nodata` answers unknown names under the local domain NODATA; the rule and its reason live in `app/AGENTS.md`.
+- The daemon that owns the resolver domain also registers its names with mDNSResponder (`arcbox-daemon/src/mdns/`), on `lo0`, so they resolve on a Mac without `/etc/resolver` for clients allowed to resolve `.local` names. Bonjour cannot make a miss fast (mDNS has no zone-wide denial), so the unicast server with its NODATA answer stays; denied clients need the user to allow them in System Settings › Privacy & Security › Local Network, the same step OrbStack users take for browsers on `orb.local` (its `/etc/resolver` is absent; the names are Bonjour records).
+- Open: the explicit resolver file the test daemon had the helper write, `/etc/resolver/w.dev.arcbox.local`, never appeared in `scutil --dns` while `/etc/resolver/arcbox.local` did, so that domain had no unicast leg and its misses took 5 s. Whether macOS declines a resolver file for a subdomain of another resolver file's domain, or the helper's write is not picked up, is unanswered here.

@@ -108,6 +108,38 @@ Covers `arcbox-daemon` (startup/shutdown), `arcbox-core` (`vm_lifecycle`),
   "not ready" answer either. The guest agent's own DNS server
   (`guest/arcbox-agent/src/dns_server.rs`) keeps NXDOMAIN: its clients are
   Linux resolvers, which have no mDNS leg.
+- **The resolver-domain owner also registers its names with mDNSResponder**
+  (`arcbox-daemon/src/mdns/`, started from `recovery::run` under the same
+  `owns_dns_resolver` predicate that installs `/etc/resolver/<domain>`, and
+  only for a domain ending in `.local`). Unicast and Bonjour answer from
+  one table: `NetworkManager::subscribe_dns_changes` streams every
+  `register_dns`/`deregister_dns`/`set_dns_domain` as a `DnsChange`, and
+  `local_dns_entries` is the snapshot a lagging subscriber resyncs from. The
+  records are `kDNSServiceFlagsUnique` on the **loopback interface**
+  (`if_nametoindex("lo0")`): nothing leaves the host, and mDNSResponder
+  answers a query for a type the name lacks (AAAA for an IPv4 name) at once,
+  which it does not do for `kDNSServiceInterfaceIndexLocalOnly` records (a
+  Mac without the resolver file then waits 5 s on every AAAA; measured
+  2026-10-01). A second owner of a name gets `NameConflict`, which is why
+  only the resolver owner registers (a development daemon shares
+  `host.arcbox.local` with production).
+  Every Bonjour operation needs the Local Network privilege (TN3179):
+  mDNSResponder answers `kDNSServiceErr_PolicyDenied` (-65570) within a
+  millisecond for a process without it, the mirror logs that once and
+  retries every 60 s, and the unicast server keeps answering. `launchd`
+  daemons, root and Terminal.app children are exempt; a `launchd` *agent*
+  (the production daemon under `SMAppService`) inherits ArcBox.app's
+  privilege, so the first registration raises the system's Local Network
+  alert for ArcBox once, and a daemon started from a third-party terminal
+  inherits that terminal's. The privilege follows the *responsible app
+  bundle*: a Homebrew `python3` execs `Python.app`, so a Python probe is
+  "Python" in System Settings, not the terminal it ran from. The same
+  privilege gates the *clients*: on macOS 15+ a process without it cannot
+  resolve any `.local` name, through the resolver file or otherwise
+  (measured 2026-10-01: getaddrinfo fails in 0.00 s while `dscacheutil`,
+  which asks root's opendirectoryd, answers), so "`curl foo.arcbox.local`
+  fails instantly from my terminal" is that terminal's Local Network
+  setting, not a daemon bug.
 - **`SetupStatus.vm_running` is owned by `services::vm_running_loop`**, which
   mirrors `VmLifecycleState::is_ready` (readiness level 2 below) off
   `Runtime::subscribe_system_vm_state`. WHY: it used to be set once by
@@ -358,9 +390,15 @@ Covers `arcbox-daemon` (startup/shutdown), `arcbox-core` (`vm_lifecycle`),
   repairs a lagged receiver with one pass. Entries carry the `machine:`
   owner prefix and `registered_container_ids` excludes it — without that
   the Docker host reconciler tears every machine down as a vanished
-  container within one interval. Regression signature: `dig
-  <name>.arcbox.local` at the daemon's DNS port answers NODATA (NOERROR,
-  no answer) for a running machine whose `inspect` shows a bridge address.
+  container within one interval. The entry goes through
+  `Runtime::register_dns`, so the resolver owner's mDNS mirror (above)
+  announces `<hostname>.arcbox.local` on `lo0` like a container's name and
+  withdraws it when the machine stops: `dns-sd -G v4 <hostname>.arcbox.local`
+  shows the record on interface 1 while the machine runs (verified
+  2026-10-04 with a development daemon on an isolated `.local` domain).
+  Regression signature: `dig <name>.arcbox.local` at the daemon's DNS port
+  answers NODATA (NOERROR, no answer) for a running machine whose `inspect`
+  shows a bridge address.
 - **`restart_generation` reports departures, not arrivals.** It is bumped on
   VM *stop* (`Effect::BumpGeneration`, fired from `stopping` on
   `VmEvent::Stopped`), so a task that waits for it to advance wakes at the
