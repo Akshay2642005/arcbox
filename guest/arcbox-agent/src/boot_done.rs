@@ -30,16 +30,27 @@
 //! `ubuntu-noble` machine boots with no cloud-init at all). The hook is
 //! installed directly instead, which the writable overlay already allows —
 //! `machine-init` writes `/etc/resolv.conf` and the DHCP script the same way.
+//!
+//! The hook is one shell script ([`HOOK_SCRIPT`]) that each init runs at the
+//! end of its boot. Besides the sentinel it finishes what `machine-init`
+//! could only start: the provisional default route the shim installs so the
+//! agent has egress before the distro's network manager runs is removed once
+//! that manager has installed its own ([`hook_script_body`]).
 
 use std::fs;
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
+use arcbox_constants::cmdline::AGENT_DHCP_ROUTE_PROTO;
+
 /// Sentinel carrying the boot it was written for. Lives on `/run` (tmpfs, so
 /// it starts each boot empty); the boot id is compared anyway, so a `/run`
 /// that persists cannot make a previous boot's sentinel look current.
 pub const SENTINEL: &str = "/run/arcbox-boot-done";
+
+/// The script every init adapter runs; see [`hook_script_body`].
+pub const HOOK_SCRIPT: &str = "/etc/arcbox/boot-done.sh";
 
 const BOOT_ID: &str = "/proc/sys/kernel/random/boot_id";
 const SYSTEMD_UNIT: &str = "/etc/systemd/system/arcbox-boot-done.service";
@@ -53,7 +64,42 @@ const SYSVINIT_RC: &str = "/etc/init.d/rc";
 /// later boot finds it already there.
 const SYSVINIT_ENTRY_ID: &str = "abd";
 
-/// The unit that writes the sentinel.
+/// What the hook does before writing the sentinel.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Hook {
+    /// The uplink interface `machine-init` put its provisional default route
+    /// on; `None` when it configured none, and the hook then only writes
+    /// the sentinel.
+    pub primary_interface: Option<String>,
+}
+
+/// The hook script.
+///
+/// `machine-init` installs a default route tagged [`AGENT_DHCP_ROUTE_PROTO`]
+/// so the agent has egress before the distro's init runs. Network managers
+/// that reconfigure the interface from scratch (networkd, dhclient's
+/// `replace`) remove it on their own; one that adds its route next to ours
+/// (alpine's dhcpcd, measured 2026-09-27: two defaults via eth0) leaves two,
+/// so the hook drops ours once a second default route on that interface
+/// exists. It never drops ours while it is the only one: a distro that
+/// configured no network at all would otherwise lose its egress. The
+/// sentinel write comes last, so readiness sees a settled routing table.
+///
+/// `/bin/busybox` is the distro's own on BusyBox images and the static one
+/// the shim copies in everywhere else, so the script runs the same way on
+/// every init.
+fn hook_script_body(hook: &Hook) -> String {
+    let route_cleanup = hook.primary_interface.as_deref().map_or_else(String::new, |iface| {
+        format!(
+            "if [ \"$($bb ip -4 route show default dev {iface} | $bb wc -l)\" -gt 1 ]; then\n  $bb ip route del default dev {iface} proto {AGENT_DHCP_ROUTE_PROTO}\nfi\n"
+        )
+    });
+    format!(
+        "#!/bin/sh\n# ArcBox boot-completion hook, rewritten by `arcbox-agent machine-init` on\n# every boot. Runs once the distro's own init has finished booting.\nbb=/bin/busybox\n{route_cleanup}$bb cat {BOOT_ID} > {SENTINEL}\n"
+    )
+}
+
+/// The unit that runs the hook.
 ///
 /// [`SYSTEMD_TARGET_DROP_IN`] pulls it into the boot; `After=` on the same
 /// target orders it after that target is *reached*. Be precise about what
@@ -83,7 +129,7 @@ After=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/sh -c 'cat {BOOT_ID} > {SENTINEL}'
+ExecStart={HOOK_SCRIPT}
 "
     )
 }
@@ -103,7 +149,7 @@ depend() {{
 }}
 
 start() {{
-    cat {BOOT_ID} > {SENTINEL}
+    {HOOK_SCRIPT}
 }}
 
 stop() {{
@@ -113,7 +159,7 @@ stop() {{
     )
 }
 
-/// The inittab entry that writes the sentinel.
+/// The inittab entry that runs the hook.
 ///
 /// sysvinit runs a runlevel's `wait` entries one at a time, in file order, so
 /// an entry appended after the `rc N` lines runs once every script of the
@@ -122,13 +168,30 @@ stop() {{
 /// no resolver behind it), and until `rc 2` has run dhclient, a started
 /// machine could not resolve anything.
 fn sysvinit_entry() -> String {
-    format!("{SYSVINIT_ENTRY_ID}:2345:wait:/bin/sh -c 'cat {BOOT_ID} > {SENTINEL}'")
+    format!("{SYSVINIT_ENTRY_ID}:2345:wait:{HOOK_SCRIPT}")
+}
+
+fn is_sysvinit_entry(line: &str) -> bool {
+    line.split(':').next() == Some(SYSVINIT_ENTRY_ID)
 }
 
 fn has_sysvinit_entry(inittab: &str) -> bool {
-    inittab
-        .lines()
-        .any(|line| line.split(':').next() == Some(SYSVINIT_ENTRY_ID))
+    inittab.lines().any(is_sysvinit_entry)
+}
+
+/// `inittab` with the hook's entry current: an earlier boot's entry (an
+/// older agent wrote the sentinel inline) is replaced in place, a missing
+/// one is appended after the `rc N` lines.
+fn with_sysvinit_entry(inittab: &str) -> String {
+    let entry = sysvinit_entry();
+    let mut lines: Vec<&str> = inittab.lines().collect();
+    match lines.iter().position(|line| is_sysvinit_entry(line)) {
+        Some(i) => lines[i] = &entry,
+        None => lines.push(&entry),
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
 }
 
 /// The filesystem the hook is installed into.
@@ -217,13 +280,20 @@ fn sentinel_matches(sentinel: &str, boot_id: &str) -> bool {
 /// predates the hook — strictly better than a half-installed hook that never
 /// fires and burns the readiness timeout instead.
 #[cfg(target_os = "linux")]
-pub fn install() -> bool {
-    Layout::guest().install()
+pub fn install(hook: &Hook) -> bool {
+    Layout::guest().install(hook)
 }
 
 impl Layout {
     /// Installs the hook for whichever init this image ships, if recognized.
-    fn install(&self) -> bool {
+    ///
+    /// The script is written first and only then wired into the init, so
+    /// an init adapter never points at a script that is not there.
+    fn install(&self, hook: &Hook) -> bool {
+        if let Err(e) = write_file(&self.path(HOOK_SCRIPT), &hook_script_body(hook), 0o755) {
+            tracing::warn!(error = %e, "failed to write the boot-done hook script");
+            return false;
+        }
         if self.path("/usr/lib/systemd/systemd").exists()
             || self.path("/lib/systemd/systemd").exists()
         {
@@ -287,26 +357,23 @@ impl Layout {
         true
     }
 
-    /// Appends the entry once; the overlay keeps it for later boots.
+    /// Keeps one entry current; the overlay keeps it for later boots, and a
+    /// boot that finds it already right leaves `/etc/inittab` untouched.
     fn install_sysvinit(&self) -> bool {
         let path = self.path(SYSVINIT_INITTAB);
-        let mut inittab = match fs::read_to_string(&path) {
+        let inittab = match fs::read_to_string(&path) {
             Ok(inittab) => inittab,
             Err(e) => {
                 tracing::warn!(error = %e, "failed to read /etc/inittab");
                 return false;
             }
         };
-        if !has_sysvinit_entry(&inittab) {
-            if !inittab.is_empty() && !inittab.ends_with('\n') {
-                inittab.push('\n');
-            }
-            inittab.push_str(&sysvinit_entry());
-            inittab.push('\n');
-            if let Err(e) = write_file(&path, &inittab, 0o644) {
-                tracing::warn!(error = %e, "failed to add the boot-done entry to /etc/inittab");
-                return false;
-            }
+        let wanted = with_sysvinit_entry(&inittab);
+        if wanted != inittab
+            && let Err(e) = write_file(&path, &wanted, 0o644)
+        {
+            tracing::warn!(error = %e, "failed to add the boot-done entry to /etc/inittab");
+            return false;
         }
         tracing::info!("installed the sysvinit boot-completion hook");
         true
@@ -360,14 +427,50 @@ mod tests {
         fs::write(&path, "").expect("write");
     }
 
+    fn hook() -> Hook {
+        Hook {
+            primary_interface: Some("eth0".to_owned()),
+        }
+    }
+
     /// An image whose init we do not recognize gets no hook, and readiness
     /// must then not wait — `hook_installed` staying false is what encodes
     /// "no signal is coming".
     #[test]
     fn an_unrecognized_init_installs_nothing_and_promises_nothing() {
         let (_dir, layout) = image();
-        assert!(!layout.install());
+        assert!(!layout.install(&hook()));
         assert!(!layout.hook_installed());
+    }
+
+    /// The route cleanup is the half of the hook a wrong line in would make
+    /// a machine lose its egress: it must name the interface and the tag
+    /// `machine-init` used, and it must only ever run behind a count that
+    /// found a second default route.
+    #[test]
+    fn the_script_removes_only_a_duplicated_provisional_route() {
+        let body = hook_script_body(&hook());
+        assert!(body.starts_with("#!/bin/sh\n"), "{body}");
+        assert!(
+            body.contains("ip -4 route show default dev eth0 | $bb wc -l)\" -gt 1 ]"),
+            "{body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "ip route del default dev eth0 proto {AGENT_DHCP_ROUTE_PROTO}"
+            )),
+            "{body}"
+        );
+        // The sentinel is the last thing the hook does.
+        assert!(
+            body.trim_end()
+                .ends_with(&format!("{BOOT_ID} > {SENTINEL}")),
+            "{body}"
+        );
+
+        let without = hook_script_body(&Hook::default());
+        assert!(!without.contains("route"), "{without}");
+        assert!(without.contains(SENTINEL), "{without}");
     }
 
     /// The unit must be pulled in by the target's drop-in and carry no
@@ -379,7 +482,7 @@ mod tests {
         let (_dir, layout) = image();
         touch(&layout, "/usr/lib/systemd/systemd");
 
-        assert!(layout.install());
+        assert!(layout.install(&hook()));
         assert!(layout.hook_installed());
         let drop_in = fs::read_to_string(layout.path(SYSTEMD_TARGET_DROP_IN)).expect("drop-in");
         assert!(
@@ -388,6 +491,12 @@ mod tests {
         );
         let unit = fs::read_to_string(layout.path(SYSTEMD_UNIT)).expect("unit");
         assert!(!unit.contains("[Install]"), "{unit}");
+        assert!(unit.contains(&format!("ExecStart={HOOK_SCRIPT}")), "{unit}");
+        let mode = fs::metadata(layout.path(HOOK_SCRIPT))
+            .expect("script")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755, "every init execs the script directly");
     }
 
     #[test]
@@ -395,7 +504,7 @@ mod tests {
         let (_dir, layout) = image();
         touch(&layout, "/sbin/openrc");
 
-        assert!(layout.install());
+        assert!(layout.install(&hook()));
         assert!(layout.hook_installed());
         let runlevel = layout.path(OPENRC_RUNLEVEL);
         assert_eq!(
@@ -423,8 +532,8 @@ mod tests {
         )
         .expect("write");
 
-        assert!(layout.install());
-        assert!(layout.install());
+        assert!(layout.install(&hook()));
+        assert!(layout.install(&hook()));
         assert!(layout.hook_installed());
         let lines: Vec<String> = fs::read_to_string(&inittab)
             .expect("inittab")
@@ -436,13 +545,38 @@ mod tests {
         assert_eq!(lines[3], sysvinit_entry());
     }
 
+    /// An inittab from a machine first booted by an older agent carries the
+    /// entry in that agent's shape; the install must bring it up to date
+    /// rather than leave the old command running forever.
+    #[test]
+    fn a_stale_sysvinit_entry_is_replaced_in_place() {
+        let (_dir, layout) = image();
+        touch(&layout, SYSVINIT_RC);
+        let inittab = layout.path(SYSVINIT_INITTAB);
+        fs::write(
+            &inittab,
+            "l2:2:wait:/etc/init.d/rc 2\nabd:2345:wait:/bin/sh -c 'cat x > y'\nz6:6:respawn:/sbin/sulogin\n",
+        )
+        .expect("write");
+
+        assert!(layout.install(&hook()));
+        let lines: Vec<String> = fs::read_to_string(&inittab)
+            .expect("inittab")
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(lines[1], sysvinit_entry());
+        assert_eq!(lines[2], "z6:6:respawn:/sbin/sulogin");
+    }
+
     /// BusyBox init reads an inittab too, but has no runlevels to order
     /// against; without sysv-rc's `rc` script the image gets no hook.
     #[test]
     fn a_busybox_inittab_alone_is_not_sysvinit() {
         let (_dir, layout) = image();
         touch(&layout, SYSVINIT_INITTAB);
-        assert!(!layout.install());
+        assert!(!layout.install(&hook()));
         assert!(!layout.hook_installed());
     }
 
@@ -475,7 +609,7 @@ mod tests {
         let staged = layout.path(SYSTEMD_UNIT).with_extension("arcbox-tmp");
         fs::create_dir_all(&staged).expect("mkdir");
 
-        assert!(!layout.install());
+        assert!(!layout.install(&hook()));
         assert!(!layout.path(SYSTEMD_UNIT).exists());
         assert!(!layout.hook_installed());
     }

@@ -44,6 +44,29 @@ PREROUTING rule matching the uplink interface instead (`publish_mirror.rs`).
 The rules are tagged `arcbox-publish:<container id>`, removed when the
 container dies, and swept at agent startup.
 
+## Distro Machines
+
+A distro machine boots through the machine boot shim, which runs
+`arcbox-agent machine-init` before the distro's own init. That one-shot step
+gives the machine the identity and network the distro cannot know on its own
+(`init.rs`, `machine_identity.rs`, `boot_done.rs`):
+
+- the machine name from `arcbox.machine_name=` on the kernel command line
+  becomes the hostname — the kernel nodename, `/etc/hostname`, and a
+  `127.0.1.1` line in `/etc/hosts` — so every init re-applies it at boot;
+- the uplink (`eth0`, ArcBox's own network stack) gets its address by DHCP
+  and a default route tagged `proto 200`; the boot-done hook removes that
+  route once the distro's network manager has installed its own next to it,
+  so a machine ends up with exactly one default route, via the uplink;
+- the bridge NIC (`eth1`, the vmnet interface the Mac reaches directly) gets
+  an address and nothing else, and is declared unmanaged to systemd-networkd
+  and NetworkManager by MAC so the distro never routes out of it. The agent
+  reports that address as `SystemInfo.bridge_ip_address`, and the daemon
+  publishes `<name>.arcbox.local` there while the machine runs.
+
+The agent in a machine then serves RPC and nothing else: none of the System
+VM services below run there.
+
 ## Container Domains
 
 `http://<container>.arcbox.local` (and `<service>.<project>.arcbox.local`)

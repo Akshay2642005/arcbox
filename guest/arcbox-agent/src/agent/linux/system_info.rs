@@ -26,24 +26,36 @@ pub(super) async fn handle_get_system_info() -> RpcResponse {
     RpcResponse::SystemInfo(info)
 }
 
-/// Every address on the guest's interfaces, in interface order, minus
-/// loopback and IPv6 link-local — the set `hostname -I` prints.
-///
+/// The guest's addresses: every one on its interfaces, in interface order,
+/// minus loopback and IPv6 link-local (the set `hostname -I` prints), and
+/// the bridge NIC's IPv4 address on its own, when the guest has one.
+struct Addresses {
+    all: Vec<String>,
+    bridge_v4: Option<String>,
+}
+
 /// Read from the kernel rather than from a `hostname` binary: a distro image
 /// need not ship one (NixOS and Oracle Linux do not, and machine readiness
 /// then never saw an address), and BusyBox's `hostname -i` resolves the host
 /// *name* instead of listing interfaces — through a proxy's fake-IP DNS it
 /// reported 198.18.19.141 for a machine whose only address was 10.0.2.2.
-fn interface_addresses() -> Vec<String> {
+fn interface_addresses() -> Addresses {
+    let mut addresses = Addresses {
+        all: Vec::new(),
+        bridge_v4: None,
+    };
     let interfaces = match nix::ifaddrs::getifaddrs() {
         Ok(interfaces) => interfaces,
         Err(e) => {
             tracing::warn!(error = %e, "getifaddrs failed; reporting no addresses");
-            return Vec::new();
+            return addresses;
         }
     };
-    let mut ips = Vec::new();
-    for address in interfaces.filter_map(|interface| interface.address) {
+    let bridge = crate::init::detect_bridge_interface();
+    for interface in interfaces {
+        let Some(address) = interface.address else {
+            continue;
+        };
         let ip = if let Some(v4) = address.as_sockaddr_in() {
             IpAddr::V4(v4.ip())
         } else if let Some(v6) = address.as_sockaddr_in6() {
@@ -55,12 +67,18 @@ fn interface_addresses() -> Vec<String> {
         if ip.is_loopback() || link_local {
             continue;
         }
+        if ip.is_ipv4()
+            && addresses.bridge_v4.is_none()
+            && bridge.as_deref() == Some(interface.interface_name.as_str())
+        {
+            addresses.bridge_v4 = Some(ip.to_string());
+        }
         let ip = ip.to_string();
-        if !ips.contains(&ip) {
-            ips.push(ip);
+        if !addresses.all.contains(&ip) {
+            addresses.all.push(ip);
         }
     }
-    ips
+    addresses
 }
 
 /// Collects system information from the guest.
@@ -125,7 +143,9 @@ fn collect_system_info() -> SystemInfo {
         }
     }
 
-    info.ip_addresses = interface_addresses();
+    let addresses = interface_addresses();
+    info.ip_addresses = addresses.all;
+    info.bridge_ip_address = addresses.bridge_v4.unwrap_or_default();
     info.distro_init_pending = distro_init_pending();
 
     info

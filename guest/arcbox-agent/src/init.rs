@@ -19,6 +19,7 @@ mod platform {
     use std::process::{Command, Stdio};
     use std::time::Duration;
 
+    use arcbox_constants::cmdline::{AGENT_DHCP_ROUTE_PROTO, MACHINE_NAME_KEY};
     use arcbox_constants::paths::JAILER_CHROOT_BASE;
     use nix::mount::{MsFlags, mount};
     use nix::sys::resource::{Resource, setrlimit};
@@ -477,7 +478,23 @@ mod platform {
         // This NIC is connected to Apple's vmnet bridge (bridge100) and
         // provides a real L2 path for host → container traffic.
         // We only take an IP — no default route (outbound stays on eth0).
-        configure_bridge_nic();
+        if let Some(bridge_iface) = detect_bridge_interface() {
+            configure_bridge_nic_address(&bridge_iface);
+            // Proxy ARP on the bridge NIC makes the guest answer ARP for
+            // container IPs (172.17.x.x) on behalf of docker0, so the host
+            // can route `-interface bridge100` without knowing the guest's
+            // bridge address as a gateway.
+            if let Err(e) = fs::write(
+                format!("/proc/sys/net/ipv4/conf/{bridge_iface}/proxy_arp"),
+                b"1\n",
+            ) {
+                tracing::warn!(interface = bridge_iface, error = %e, "failed to enable proxy_arp");
+            } else {
+                tracing::info!(interface = bridge_iface, "proxy ARP enabled");
+            }
+        } else {
+            tracing::debug!("no bridge NIC found");
+        }
 
         // Allow forwarding between the primary interface and sandbox TAP
         // interfaces. Docker/containerd sets the default FORWARD policy to
@@ -488,24 +505,61 @@ mod platform {
     /// One-shot init for distro machines (boot shim path).
     ///
     /// The overlay root is the distro's own filesystem: no tmpfs staging and
-    /// no `/etc` population — the distro init owns those. Only networking is
-    /// brought up here (mirrored images ship without the incus network
-    /// config, so nothing in the guest would configure eth0 otherwise), plus
+    /// no `/etc` population — the distro init owns those. What is set up
+    /// here is what the distro cannot know on its own: its name (the
+    /// machine's, from the kernel cmdline), the uplink (mirrored images
+    /// ship without the incus network config, so nothing in the guest would
+    /// configure eth0 otherwise), the bridge NIC the Mac reaches it on, and
     /// a resolver when the distro image left none.
     pub fn machine_init() {
+        match machine_name() {
+            Some(name) => crate::machine_identity::set_hostname(&name),
+            None => tracing::warn!(
+                "no machine name on the kernel cmdline; keeping the image's hostname"
+            ),
+        }
         run_init_cmd(
             "/bin/busybox",
             &["ip", "link", "set", "lo", "up"],
             "ip link lo up",
             Duration::from_secs(5),
         );
-        configure_primary_interface_dhcp();
+        let primary = configure_primary_interface_dhcp();
+        // The bridge NIC is ArcBox's whether or not its lease arrives: the
+        // distro's network manager is told so by MAC first, then the NIC
+        // gets its address and nothing else — egress stays on the uplink,
+        // and a manager that configured this NIC too would route out of it
+        // (`machine_identity`).
+        if let Some(bridge_iface) = detect_bridge_interface() {
+            match fs::read_to_string(format!("/sys/class/net/{bridge_iface}/address")) {
+                Ok(mac) => crate::machine_identity::claim_bridge_nic(mac.trim()),
+                Err(e) => {
+                    tracing::warn!(interface = bridge_iface, error = %e, "cannot read the bridge NIC's MAC");
+                }
+            }
+            configure_bridge_nic_address(&bridge_iface);
+        }
         write_machine_resolv_conf();
         // Installed last, and before the shim hands off to the distro's init:
         // the hook this writes is what tells the host when that init has
         // settled, so readiness does not return into the window where the
         // distro reconfigures the interface configured just above (CORE-66).
-        crate::boot_done::install();
+        // It also drops the provisional default route above once the distro
+        // has installed its own.
+        crate::boot_done::install(&crate::boot_done::Hook {
+            primary_interface: primary,
+        });
+    }
+
+    /// The machine's name, from the `arcbox.machine_name=` the host put on
+    /// the kernel cmdline.
+    fn machine_name() -> Option<String> {
+        let cmdline = fs::read_to_string("/proc/cmdline").ok()?;
+        cmdline
+            .split_whitespace()
+            .find_map(|token| token.strip_prefix(MACHINE_NAME_KEY))
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
     }
 
     /// Points `/etc/resolv.conf` at the NAT gateway resolver (10.0.2.1), but
@@ -523,10 +577,16 @@ mod platform {
         }
     }
 
-    fn configure_primary_interface_dhcp() {
+    /// Configures the uplink by DHCP; returns the interface it configured.
+    ///
+    /// The default route it installs is tagged [`AGENT_DHCP_ROUTE_PROTO`]:
+    /// in a distro machine that is what lets the boot-done hook tell this
+    /// provisional route from the one the distro's own network manager adds
+    /// next to it (`boot_done`).
+    fn configure_primary_interface_dhcp() -> Option<String> {
         let Some(interface) = detect_primary_interface() else {
             tracing::warn!("no non-loopback network interface found for DHCP");
-            return;
+            return None;
         };
 
         run_init_cmd(
@@ -538,32 +598,33 @@ mod platform {
 
         // BusyBox udhcpc requires a script to apply lease settings.
         let udhcpc_script = "/run/udhcpc.script";
-        let script = r#"#!/bin/sh
+        let script = format!(
+            r#"#!/bin/sh
 set -e
 case "$1" in
   deconfig)
     /bin/busybox ifconfig "$interface" 0.0.0.0 || true
     ;;
   renew|bound)
-    /bin/busybox ifconfig "$interface" "$ip" netmask "${subnet:-255.255.255.0}" broadcast "${broadcast:-+}" up
-    if [ -n "${router:-}" ]; then
-      while /bin/busybox route del default gw 0.0.0.0 dev "$interface" 2>/dev/null; do :; done
+    /bin/busybox ifconfig "$interface" "$ip" netmask "${{subnet:-255.255.255.0}}" broadcast "${{broadcast:-+}}" up
+    if [ -n "${{router:-}}" ]; then
       for r in $router; do
-        /bin/busybox route add default gw "$r" dev "$interface" && break
+        /bin/busybox ip route replace default via "$r" dev "$interface" proto {AGENT_DHCP_ROUTE_PROTO} && break
       done
     fi
     ;;
 esac
 exit 0
-"#;
+"#
+        );
 
         if let Err(e) = fs::write(udhcpc_script, script) {
             tracing::warn!(error = %e, "failed to write udhcpc script");
-            return;
+            return None;
         }
         if let Err(e) = fs::set_permissions(udhcpc_script, fs::Permissions::from_mode(0o755)) {
             tracing::warn!(error = %e, "failed to chmod udhcpc script");
-            return;
+            return None;
         }
 
         if run_init_cmd(
@@ -586,21 +647,17 @@ exit 0
         ) {
             tracing::info!(interface, "DHCP lease acquired");
         }
+        Some(interface)
     }
 
-    /// Configures the bridge NIC (second interface) via DHCP.
+    /// Gives the bridge NIC an address by DHCP and nothing else.
     ///
-    /// Uses a custom udhcpc script that only sets the IP address — no default
-    /// route, no DNS. This ensures outbound traffic still goes through eth0
-    /// (socketpair datapath), while the bridge NIC is reachable from the host
-    /// for inbound container traffic.
-    fn configure_bridge_nic() {
-        let Some(bridge_iface) = detect_bridge_interface() else {
-            tracing::debug!("no bridge NIC found");
-            return;
-        };
-        let bridge_iface = bridge_iface.as_str();
-
+    /// The udhcpc script only sets the IP address — no default route, no
+    /// DNS. Outbound traffic therefore still goes through the uplink, while
+    /// the bridge NIC is reachable from the host: for inbound container
+    /// traffic in the System VM, and as `<machine>.arcbox.local` in a distro
+    /// machine.
+    fn configure_bridge_nic_address(bridge_iface: &str) {
         // Bring up the interface.
         run_init_cmd(
             "/bin/busybox",
@@ -648,19 +705,6 @@ exit 0
             Duration::from_secs(15),
         ) {
             tracing::info!(interface = bridge_iface, "bridge NIC DHCP lease acquired");
-        }
-
-        // Enable proxy ARP on the bridge NIC so the guest answers ARP
-        // requests for container IPs (172.17.x.x) on behalf of docker0.
-        // This lets the host use `-interface bridge100` routing without
-        // needing to know the guest's bridge IP as a gateway.
-        if let Err(e) = fs::write(
-            format!("/proc/sys/net/ipv4/conf/{bridge_iface}/proxy_arp"),
-            b"1\n",
-        ) {
-            tracing::warn!(interface = bridge_iface, error = %e, "failed to enable proxy_arp");
-        } else {
-            tracing::info!(interface = bridge_iface, "proxy ARP enabled");
         }
     }
 
