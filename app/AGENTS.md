@@ -458,6 +458,26 @@ above). When editing either side, keep in lockstep:
   of an accidental stale/missing pin: boots keep an old kernel/cmdline with
   only that warn — grep the daemon log for it.
 
+## Uninstall contract (`arcbox-cli` `commands/uninstall/`)
+
+- `uninstall/inventory.rs` and `docs/data-directories.md` "11. Uninstall" are
+  one contract: a new path ArcBox writes on the host lands in both, with its
+  owner check. A privileged path is removed only when it passes the helper's
+  ownership rule, and `is_arcbox_owned` requires an ArcBox bundle name, not
+  only the `xbin` layout: OrbStack links its CLI tools from the same layout,
+  and a layout-only check replaced and deleted its links (#715).
+- Stop the daemon by launchd label or by the PID in `daemon.lock`, never by
+  process name. `pkill -f com.apple.Virtualization.VirtualMachine` stopped
+  every VZ guest on the Mac, other tools' included (#716). The daemon stops
+  its own System VM on SIGTERM; a free flock means the process is gone.
+- Every step reports `Done`, `Skipped(why)` or an error, and the command exits
+  non-zero when any step failed. Never print a checkmark for a step whose
+  body discarded its result (#716).
+- A CLI test that reaches `setup::profile` must inject the home through
+  `setup::Integration::under`. `profile_path()` probes the real login shell's
+  `ZDOTDIR`, and a test that resolved it from the environment rewrote a
+  developer's `~/.config/zsh/.zprofile` (2026-10-01).
+
 ## Extending checklists
 
 - Changing a phase's ordering or adding a phase: update the chain in
