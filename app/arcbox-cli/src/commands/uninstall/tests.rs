@@ -21,6 +21,7 @@ use super::host::Host;
 use super::inventory::{Roots, scan};
 use super::steps::Outcome;
 use super::{Step, run};
+use crate::commands::setup;
 
 type Answer = Box<dyn Fn(&str, &[&OsStr]) -> Option<Output> + Send + Sync>;
 
@@ -180,19 +181,40 @@ impl Install {
             &roots.home.join(".ssh/config"),
             "# Added by `abctl ssh install`: ssh <machine>@arcbox\nInclude ~/.arcbox/ssh/config\n\nHost *\n  User me\n",
         );
-        // The shell profile under THIS home, as `setup install` leaves it. The
-        // path must come from the install's home, never from the process's
-        // own (a probe of the real login shell once pointed the removal at
-        // the developer's profile).
-        write(
-            &roots.home.join(".zprofile"),
-            &format!(
-                "export KEEP=1\n\n# Added by ArcBox: command-line tools and integration\nsource \"{}\" 2>/dev/null || : # managed by ArcBox\n",
-                data.join("shell/init.zsh").display()
-            ),
-        );
 
         Self { _dir: dir, roots }
+    }
+
+    /// Writes the shell profile under THIS home, as `setup install` leaves
+    /// it, and returns its path. The shell is the one `setup` detects from
+    /// `$SHELL` (zsh here, bash on a CI runner), and the path must come from
+    /// the install's home, never from the process's own: a probe of the real
+    /// login shell once pointed the removal at the developer's profile.
+    async fn write_shell_profile(&self) -> PathBuf {
+        let integration = setup::Integration::under(
+            &self.roots.home,
+            &self.roots.data_dir,
+            self.roots.docker_config.clone(),
+        )
+        .await
+        .unwrap();
+        let init = self
+            .roots
+            .data_dir
+            .join(format!("shell/init.{}", integration.shell_kind.as_str()));
+        let source = match integration.shell_kind {
+            setup::ShellKind::Fish => format!("source \"{}\"; or true", init.display()),
+            setup::ShellKind::Zsh | setup::ShellKind::Bash => {
+                format!("source \"{}\" 2>/dev/null || :", init.display())
+            }
+        };
+        write(
+            &integration.profile,
+            &format!(
+                "export KEEP=1\n\n# Added by ArcBox: command-line tools and integration\n{source} # managed by ArcBox\n"
+            ),
+        );
+        integration.profile
     }
 
     fn roots(&self) -> &Roots {
@@ -234,6 +256,7 @@ async fn everything_arcbox_wrote_is_removed_and_nothing_else_is_touched() {
     );
     write(&bin.join("docker-credential-pass"), "real binary");
     write(&roots.home.join("ArcBox/README"), "the user's own folder");
+    let shell_profile = install.write_shell_profile().await;
 
     let host = Recorder::new();
     let steps = uninstall(&install, &host, false).await;
@@ -299,7 +322,7 @@ async fn everything_arcbox_wrote_is_removed_and_nothing_else_is_touched() {
         "Host *\n  User me\n"
     );
     assert_eq!(
-        fs::read_to_string(roots.home.join(".zprofile")).unwrap(),
+        fs::read_to_string(&shell_profile).unwrap(),
         "export KEEP=1\n"
     );
 

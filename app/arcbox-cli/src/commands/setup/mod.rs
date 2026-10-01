@@ -99,7 +99,7 @@ pub enum ShellKind {
 }
 
 impl ShellKind {
-    const fn as_str(self) -> &'static str {
+    pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::Zsh => "zsh",
             Self::Bash => "bash",
