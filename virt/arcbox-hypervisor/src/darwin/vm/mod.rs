@@ -251,8 +251,7 @@ impl DarwinVm {
         // Port 0 (hvc0): kernel/init console
         let (console_port, console_read, console_write, console_guest) = make_port("console")?;
         self.console_fds = Some((console_read, console_write));
-        self.guest_serial_fds
-            .extend([console_guest.0, console_guest.1]);
+        self.guest_serial_fds.extend(<[_; 2]>::from(console_guest));
         tracing::info!(
             "Console port (hvc0): read_fd={}, write_fd={}",
             console_read,
@@ -262,7 +261,7 @@ impl DarwinVm {
         // Port 1 (hvc1): agent log channel
         let (agent_log_port, agent_read, agent_write, agent_guest) = make_port("agent-log")?;
         self.agent_log_fds = Some((agent_read, agent_write));
-        self.guest_serial_fds.extend([agent_guest.0, agent_guest.1]);
+        self.guest_serial_fds.extend(<[_; 2]>::from(agent_guest));
         tracing::info!(
             "Agent log port (hvc1): read_fd={}, write_fd={}",
             agent_read,
