@@ -6,6 +6,7 @@
 
 mod host;
 mod inventory;
+mod steps;
 
 use anyhow::{Context, Result, bail};
 use arcbox_constants::paths::{ArcboxProfile, DOCKER_CLI_TOOLS, HostLayout, privileged};
