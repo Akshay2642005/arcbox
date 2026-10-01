@@ -9,7 +9,7 @@
 //! whether the user opens the app first or installs via `brew`.
 
 use anyhow::{Context, Result};
-use arcbox_constants::paths::{DOCKER_CLI_TOOLS, HostLayout};
+use arcbox_constants::paths::{DOCKER_CLI_TOOLS, HostLayout, is_arcbox_owned};
 use clap::Subcommand;
 
 use super::OutputFormat;
@@ -121,15 +121,18 @@ async fn brew_uninstall() -> Result<()> {
     super::setup::execute(super::setup::SetupCommands::Uninstall, OutputFormat::Quiet).await?;
 
     // 4. Remove `/usr/local/bin/docker*` via the helper. The helper plist
-    //    survives this hook (its full removal belongs to `sudo abctl _uninstall`),
+    //    survives this hook (its full removal belongs to `abctl uninstall`),
     //    so its launchd-activated socket is still reachable here. Best-effort:
     //    a missing or incompatible helper makes the checked connection fail;
-    //    the full sudo uninstall removes any remaining owned links directly.
-    //    The helper's `cli_unlink` is gated on `is_arcbox_owned`, so foreign
-    //    symlinks are left alone.
+    //    the full uninstall removes any remaining owned links directly.
+    //    Ownership is checked here as well as in the helper: a helper built
+    //    before #715 still deletes OrbStack's links, which share our layout.
     if let Ok(client) = arcbox_helper::client::Client::connect().await {
         for name in DOCKER_CLI_TOOLS {
-            let _ = client.cli_unlink(name).await;
+            let link = std::path::Path::new("/usr/local/bin").join(name);
+            if std::fs::read_link(&link).is_ok_and(|target| is_arcbox_owned(&target)) {
+                let _ = client.cli_unlink(name).await;
+            }
         }
     }
 

@@ -89,6 +89,20 @@ pub mod labels {
     pub const DEVELOPMENT_DAEMON: &str = "com.arcboxlabs.desktop.dev.daemon";
     /// Helper (system-level LaunchDaemon).
     pub const HELPER: &str = "com.arcboxlabs.desktop.helper";
+    /// Daemon LaunchAgent written by the retired `curl | bash` installer
+    /// (`scripts/install.sh`). Nothing creates it any more; uninstall still
+    /// removes it.
+    pub const LEGACY_SCRIPT_DAEMON: &str = "dev.arcbox.daemon";
+}
+
+/// Desktop app bundle identity.
+pub mod bundles {
+    /// Bundle name of the production Desktop app, without `.app`.
+    pub const APP_NAME: &str = "ArcBox";
+    /// Bundle identifier of the production Desktop app.
+    pub const DESKTOP: &str = "com.arcboxlabs.desktop";
+    /// Bundle identifier of the development Desktop app.
+    pub const DEVELOPMENT_DESKTOP: &str = "com.arcboxlabs.desktop.dev";
 }
 
 /// Runtime profile names and derived host identity.
@@ -148,6 +162,24 @@ impl ArcboxProfile {
         match self {
             Self::Production => crate::ports::DNS_HOST_PORT,
             Self::Development => crate::ports::DEVELOPMENT_DNS_HOST_PORT,
+        }
+    }
+
+    /// Returns the Desktop app's bundle name for this profile, without `.app`.
+    #[must_use]
+    pub const fn app_name(self) -> &'static str {
+        match self {
+            Self::Production => bundles::APP_NAME,
+            Self::Development => "ArcBox Dev",
+        }
+    }
+
+    /// Returns the Desktop app's bundle identifier for this profile.
+    #[must_use]
+    pub const fn app_bundle_id(self) -> &'static str {
+        match self {
+            Self::Production => bundles::DESKTOP,
+            Self::Development => bundles::DEVELOPMENT_DESKTOP,
         }
     }
 
@@ -222,15 +254,24 @@ pub const DOCKER_CLI_TOOLS: &[&str] = &[
 /// are discovered via a different, credsStore-based mechanism).
 pub const DOCKER_CLI_PLUGINS: &[&str] = &["docker-buildx", "docker-compose"];
 
-/// Returns true if a symlink target looks like it belongs to an ArcBox app bundle.
+/// Returns true if a symlink target points inside an ArcBox app bundle's
+/// `Contents/MacOS/xbin/`.
 ///
-/// Used by multiple subsystems (privileged helper, brew hooks, setup install)
-/// to decide whether an existing `/usr/local/bin/` symlink can be safely replaced.
+/// Used by multiple subsystems (privileged helper, brew hooks, setup install,
+/// uninstall) to decide whether an existing `/usr/local/bin/` symlink is ours
+/// to replace or remove.
 ///
 /// Single source of truth for the path shape also enforced by the helper's
 /// `CliTarget` parser: absolute, under `/Applications/` or `/Users/`, contains
-/// `.app/Contents/MacOS/xbin/`, no `..`. Kept in this crate so callers do not
-/// need to depend on the helper.
+/// `<bundle>.app/Contents/MacOS/xbin/` where `<bundle>` is an ArcBox bundle
+/// name (see [`is_arcbox_bundle_name`]), no `..`. The bundle name matters:
+/// OrbStack lays out its CLI links exactly the same way
+/// (`/usr/local/bin/docker -> /Applications/OrbStack.app/Contents/MacOS/xbin/docker`),
+/// so the layout alone classified its links as ours (#715). The check stays
+/// on the path string rather than on `Info.plist`: a link left by a deleted
+/// bundle must still be recognized, and its `Info.plist` is gone.
+///
+/// Kept in this crate so callers do not need to depend on the helper.
 ///
 /// Gated on the `std` feature: it takes a `std::path::Path`, so it is
 /// unavailable (and unusable) in `no_std` builds.
@@ -252,17 +293,29 @@ pub fn is_arcbox_owned(target: &std::path::Path) -> bool {
         return false;
     }
 
-    has_app_xbin_structure(target)
+    has_arcbox_xbin_structure(target)
 }
 
-/// `true` when some component window is `.app/Contents/MacOS/xbin`.
+/// `true` when `name` is a `.app` bundle name the Desktop app ships under:
+/// `ArcBox.app`, `ArcBox Dev.app`, or a copy Finder renamed, such as
+/// `ArcBox 2.app`.
+#[must_use]
+pub fn is_arcbox_bundle_name(name: &[u8]) -> bool {
+    let Some(stem) = name.strip_suffix(b".app") else {
+        return false;
+    };
+    let app = bundles::APP_NAME.as_bytes();
+    stem == app || (stem.starts_with(app) && stem.get(app.len()) == Some(&b' '))
+}
+
+/// `true` when some component window is `<ArcBox bundle>.app/Contents/MacOS/xbin`.
 #[cfg(feature = "std")]
-fn has_app_xbin_structure(target: &std::path::Path) -> bool {
+fn has_arcbox_xbin_structure(target: &std::path::Path) -> bool {
     use std::path::Component;
 
     let components: Vec<_> = target.components().collect();
     components.windows(4).any(|w| {
-        matches!(&w[0], Component::Normal(name) if name.as_encoded_bytes().ends_with(b".app"))
+        matches!(&w[0], Component::Normal(name) if is_arcbox_bundle_name(name.as_encoded_bytes()))
             && w[1] == Component::Normal("Contents".as_ref())
             && w[2] == Component::Normal("MacOS".as_ref())
             && w[3] == Component::Normal("xbin".as_ref())
@@ -504,6 +557,13 @@ mod tests {
         assert!(is_arcbox_owned(std::path::Path::new(
             "/Users/alice/Apps/ArcBox.app/Contents/MacOS/xbin/docker-compose"
         )));
+        // The development app and a Finder-renamed copy are ours too.
+        assert!(is_arcbox_owned(std::path::Path::new(
+            "/Applications/ArcBox Dev.app/Contents/MacOS/xbin/docker"
+        )));
+        assert!(is_arcbox_owned(std::path::Path::new(
+            "/Applications/ArcBox 2.app/Contents/MacOS/xbin/docker"
+        )));
         // Relative / traversal / wrong prefix — must not count as ours.
         assert!(!is_arcbox_owned(std::path::Path::new(
             "Contents/MacOS/xbin/docker"
@@ -512,15 +572,48 @@ mod tests {
             "/Applications/ArcBox.app/Contents/MacOS/xbin/../../evil"
         )));
         assert!(!is_arcbox_owned(std::path::Path::new(
-            "/tmp/evil.app/Contents/MacOS/xbin/docker"
+            "/tmp/ArcBox.app/Contents/MacOS/xbin/docker"
         )));
         assert!(!is_arcbox_owned(std::path::Path::new(
             "/usr/local/bin/docker"
         )));
-        // Nested .app/xbin (same rule as CliTarget) is still owned.
+    }
+
+    /// OrbStack links its CLI tools from the same `xbin` layout (#715); the
+    /// layout alone must not make a bundle ours.
+    #[test]
+    fn foreign_bundles_with_the_xbin_layout_are_not_ours() {
+        for target in [
+            "/Applications/OrbStack.app/Contents/MacOS/xbin/docker",
+            "/Applications/OrbStack.app/Contents/MacOS/xbin/docker-credential-osxkeychain",
+            "/Users/alice/Applications/OrbStack.app/Contents/MacOS/xbin/docker-compose",
+            "/Applications/ArcBoxClone.app/Contents/MacOS/xbin/docker",
+            "/Users/evil/not-really.app/Contents/MacOS/xbin/nested.app/Contents/MacOS/xbin/docker",
+        ] {
+            assert!(
+                !is_arcbox_owned(std::path::Path::new(target)),
+                "{target} must not be ArcBox-owned"
+            );
+        }
+        // A nested bundle inside an ArcBox bundle's xbin is still inside ours.
         assert!(is_arcbox_owned(std::path::Path::new(
-            "/Users/evil/not-really.app/Contents/MacOS/xbin/nested.app/Contents/MacOS/xbin/docker"
+            "/Users/alice/ArcBox.app/Contents/MacOS/xbin/nested.app/Contents/MacOS/xbin/docker"
         )));
+    }
+
+    #[test]
+    fn bundle_names_the_desktop_app_ships_under() {
+        assert!(is_arcbox_bundle_name(b"ArcBox.app"));
+        assert!(is_arcbox_bundle_name(b"ArcBox Dev.app"));
+        assert!(is_arcbox_bundle_name(b"ArcBox 2.app"));
+        assert!(!is_arcbox_bundle_name(b"ArcBox"));
+        assert!(!is_arcbox_bundle_name(b"ArcBoxClone.app"));
+        assert!(!is_arcbox_bundle_name(b"OrbStack.app"));
+        assert!(!is_arcbox_bundle_name(b"arcbox.app"));
+        assert_eq!(ArcboxProfile::Production.app_name(), "ArcBox");
+        assert!(is_arcbox_bundle_name(
+            format!("{}.app", ArcboxProfile::Development.app_name()).as_bytes()
+        ));
     }
 
     #[test]
