@@ -198,9 +198,31 @@ Created by the privileged helper. Removed by `abctl uninstall`.
 | `/usr/local/bin/docker-compose` | App bundle xbin | helper |
 | `/usr/local/bin/docker-credential-osxkeychain` | App bundle xbin | helper |
 | `/usr/local/bin/abctl` | App bundle or `~/.arcbox/bin/abctl` | desktop / cli |
+| `/usr/local/bin/arcbox-daemon` | Daemon binary from the `curl \| bash` installer | cli (`scripts/install.sh`) |
 
 The list of Docker CLI tools is defined in
-`common/arcbox-constants/src/paths.rs` (`DOCKER_CLI_TOOLS`).
+`common/arcbox-constants/src/paths.rs` (`DOCKER_CLI_TOOLS`). A link is
+ArcBox's only when it points into an ArcBox bundle's `xbin/`
+(`is_arcbox_owned`); OrbStack links its own CLI tools from the same layout
+(`/Applications/OrbStack.app/Contents/MacOS/xbin/docker`), and those are
+never replaced or removed.
+
+The Homebrew cask links `abctl` from Homebrew's bin directory
+(`/opt/homebrew/bin/abctl` on Apple Silicon) instead; that link is Homebrew's.
+
+---
+
+## 4.1 Other Host State
+
+Not files under a fixed directory, but state ArcBox leaves on the Mac.
+
+| State | Created by | Removed by |
+|-------|-----------|------------|
+| `/etc/hosts` line `127.0.0.1 ArcBox # managed by arcbox-helper` | helper (`hosts_alias_install`), so the `~/ArcBox` mount shows `ArcBox` as its source | `abctl uninstall` |
+| `~/ArcBox` NFS mount of the guest's Docker data, and the mount point | daemon (`nfs_mount`) | daemon on shutdown; `abctl uninstall` when a daemon left it |
+| Login keychain: the `ArcBox Local CA` certificate and its TLS trust | user (`abctl tls trust`) | `abctl tls untrust`, `abctl uninstall` |
+| `~/.kube/config`: the `arcbox` context, cluster and user; `~/.arcbox/kube/` | user (`abctl k8s enable`) | `abctl k8s disable`, `abctl uninstall` |
+| Login Items entry for the daemon (BTM database) | desktop (SMAppService) | the Desktop app when it quits |
 
 ---
 
@@ -229,11 +251,35 @@ Opt-in: nothing touches it unless the user runs the command.
 | Path | Purpose | Creator |
 |------|---------|---------|
 | `/Library/LaunchDaemons/com.arcboxlabs.desktop.helper.plist` | Helper (system-level, socket-activation) | cli |
-| `~/Library/LaunchAgents/com.arcboxlabs.desktop.daemon.plist` | Daemon (user-level, production) | cli (`abctl install`) / desktop (SMAppService) |
+| `~/Library/LaunchAgents/com.arcboxlabs.desktop.daemon.plist` | Daemon (user-level, production) | cli (`abctl _install`) / desktop (SMAppService) |
+| `~/Library/LaunchAgents/dev.arcbox.daemon.plist` | Daemon registered by the `curl \| bash` installer | cli (`scripts/install.sh`) |
 
 Labels defined in `common/arcbox-constants/src/paths.rs`, `labels` module:
 - `com.arcboxlabs.desktop.daemon`
 - `com.arcboxlabs.desktop.helper`
+- `dev.arcbox.daemon` (`curl | bash` installer)
+
+The Desktop app registers its daemon through `SMAppService`, which keeps the
+plist inside the bundle (`ArcBox.app/Contents/Library/LaunchAgents/`) and
+records the job in the Background Task Management database (the Login Items
+entry) rather than in `~/Library/LaunchAgents`. Quitting the app unregisters it.
+
+---
+
+## 6.1 Desktop App Per-User Files
+
+Written by macOS on the Desktop app's behalf, keyed by its bundle identifier
+(`com.arcboxlabs.desktop`; `com.arcboxlabs.desktop.dev` for the development
+app).
+
+| Path | Purpose |
+|------|---------|
+| `~/Library/Application Support/com.arcboxlabs.desktop/` | App state |
+| `~/Library/Preferences/com.arcboxlabs.desktop.plist` | Preferences (`defaults` domain, cached by `cfprefsd`) |
+| `~/Library/Caches/com.arcboxlabs.desktop/` | Caches |
+| `~/Library/HTTPStorages/com.arcboxlabs.desktop/` | URL session storage |
+| `~/Library/Saved Application State/com.arcboxlabs.desktop.savedState/` | Window state |
+| `~/Library/Logs/arcbox/` | Daemon stdout/stderr from the `curl \| bash` installer's plist |
 
 ---
 
@@ -351,6 +397,58 @@ older installations. They can be safely deleted.
 | `~/.arcbox/log/daemon.stdout.log` | Old CLI `daemon start` stdout | Legacy |
 | `~/.arcbox/log/daemon.stderr.log` | Old CLI `daemon start` stderr | Legacy |
 | `~/.arcbox/log/daemon.err` | Old `arcbox install` plist stderr | Legacy |
+
+---
+
+## 11. Uninstall
+
+`abctl uninstall` removes everything above that is ArcBox's. Run it as
+yourself, not under `sudo`: the Docker context, shell profile, kubeconfig and
+keychain trust are the user's, and the command asks for `sudo` itself, once,
+for the privileged paths. It prints what it found before asking to continue,
+then reports each step as `done`, `skipped (why)` or `FAILED: why`, and exits
+non-zero when any step failed. `--keep-data` keeps `~/.arcbox/data`
+(containers, images, volumes, machines); `--yes` skips the prompt.
+
+```bash
+abctl uninstall                 # everything
+abctl uninstall --keep-data     # keep ~/.arcbox/data for a reinstall
+brew uninstall --cask arcbox    # when the app came from Homebrew
+```
+
+With Homebrew, run `abctl uninstall` first and `brew uninstall --cask arcbox`
+second: the cask's `abctl` link points into the app, and the command leaves
+the app bundle to Homebrew (removing it first would make the cask uninstall
+fail on the missing app). `brew uninstall --zap` is then redundant.
+
+What the command does, in order:
+
+1. Quits the Desktop app (its termination handler unregisters the daemon's
+   Login Items entry), then stops the daemon: through `launchctl bootout` when
+   launchd manages it, otherwise through the PID in `~/.arcbox/run/daemon.lock`.
+   The daemon stops its own System VM; no other process is killed by name.
+2. Unregisters the helper LaunchDaemon and unmounts `~/ArcBox` if the daemon
+   left the mount behind.
+3. Removes the Docker context (restoring the previous current context), the
+   shell integration (section 1.6, 1.7, 1.8, 7, and the Docker CLI plugin
+   registration in section 5), the kubectl integration, the `~/.ssh/config`
+   Include, and trust in the local CA.
+4. Removes every path in sections 3, 4, 4.1, 6 and 6.1 that is ArcBox's, then
+   `~/.arcbox` (or all of it but `data/`), then `/Applications/ArcBox.app`
+   unless Homebrew installed it.
+
+Ownership is checked before anything privileged is removed, with the rules
+the helper applies when it creates them: a `/usr/local/bin` link must point
+into an ArcBox bundle, `/var/run/docker.sock` into `~/.arcbox`, and
+`/etc/resolver/arcbox.local` must carry the ArcBox marker. Another tool's
+files are left alone and never listed.
+
+Not removed: `~/.config/arcbox/config.toml` and `/etc/arcbox/config.toml`
+(section 2), which the user wrote.
+
+The list in this document is the contract behind the command
+(`app/arcbox-cli/src/commands/uninstall/inventory.rs`). A new path ArcBox
+writes goes into both.
 
 ---
 

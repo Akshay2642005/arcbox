@@ -325,6 +325,19 @@ container, image, and volume filesystems. Source:
 - The Docker CLI. ArcBox replaces the engine, not the CLI; `abctl docker setup`
   can install it for you.
 
+## Uninstall
+
+```bash
+abctl uninstall                 # daemon, helper, links, integrations, data
+brew uninstall --cask arcbox    # then, if the app came from Homebrew
+```
+
+Add `--keep-data` to keep containers, images and volumes for a reinstall. The
+command lists what it found, asks once, reports every step, and leaves anything
+that belongs to another tool (OrbStack's or Docker Desktop's links) alone. The
+full inventory of what ArcBox writes is in
+[docs/data-directories.md](docs/data-directories.md#11-uninstall).
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for build instructions, code standards, and
