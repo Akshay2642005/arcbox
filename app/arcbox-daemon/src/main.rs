@@ -6,6 +6,7 @@ mod disk_reclaim;
 mod dns_service;
 mod kubernetes_lb;
 mod kubernetes_proxy;
+mod machine_dns;
 mod nfs_mount;
 mod power;
 mod recovery;

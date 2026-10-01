@@ -293,6 +293,13 @@ impl pb::MachineService for MachineServiceImpl {
             .get(&id)
             .ok_or_else(|| ConnectError::not_found("machine not found"))?;
 
+        // Published only while the machine holds a bridge address, which the
+        // engine clears on every stop.
+        let dns_name = machine
+            .bridge_ip_address
+            .as_ref()
+            .and_then(|_| runtime.machine_dns_name(&machine.name))
+            .unwrap_or_default();
         let resp = pb::MachineInfo {
             id: machine.name.clone(),
             name: machine.name,
@@ -321,6 +328,8 @@ impl pb::MachineService for MachineServiceImpl {
                 ip_address: machine.ip_address.clone().unwrap_or_default(),
                 mac_address: String::new(),
                 bridge_mac_address: arcbox_core::vm::bridge_nic_mac_for_vm_id(&machine.vm_id),
+                dns_name,
+                bridge_ip_address: machine.bridge_ip_address.clone().unwrap_or_default(),
                 ..Default::default()
             }
             .into(),
@@ -409,6 +418,7 @@ impl pb::MachineService for MachineServiceImpl {
             hostname: info.hostname,
             uptime: info.uptime,
             ip_addresses: info.ip_addresses,
+            bridge_ip_address: info.bridge_ip_address,
             ..Default::default()
         })
     }

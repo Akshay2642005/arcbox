@@ -175,6 +175,17 @@ impl NetworkManager {
         }
     }
 
+    /// The domain local names are published under (`arcbox.local` unless
+    /// [`Self::set_dns_domain`] changed it); `None` when no local domain is
+    /// configured and every name is forwarded upstream.
+    #[must_use]
+    pub fn dns_domain(&self) -> Option<String> {
+        self.dns_forwarder
+            .read()
+            .ok()
+            .and_then(|forwarder| forwarder.config().local_domain.clone())
+    }
+
     /// Returns the network configuration.
     #[must_use]
     pub fn config(&self) -> &NetConfig {

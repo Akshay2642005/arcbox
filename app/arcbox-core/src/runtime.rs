@@ -4,6 +4,7 @@ mod assets;
 mod engine_config;
 mod kubeconfig;
 mod kubernetes_lb;
+mod machine_dns;
 mod progress;
 mod sandbox_host;
 
@@ -1856,7 +1857,11 @@ impl Runtime {
             .read()
             .await
             .keys()
-            .filter(|owner| !owner.starts_with("sandbox:") && !owner.starts_with("system:"))
+            .filter(|owner| {
+                !owner.starts_with("sandbox:")
+                    && !owner.starts_with("system:")
+                    && !owner.starts_with(machine_dns::MACHINE_DNS_OWNER_PREFIX)
+            })
             .cloned()
             .collect();
         ids.extend(self.container_aliases.read().await.values().cloned());

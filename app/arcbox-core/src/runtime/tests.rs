@@ -633,3 +633,39 @@ fn resolve_bind_ip_defaults_and_loopback() {
     );
     assert_eq!(super::resolve_bind_ip("not-an-ip", lan), None);
 }
+
+/// A machine's name is published under the local domain at its bridge
+/// address and owned apart from containers: the Docker reconciler must not
+/// see it as a container that stopped running, or every machine would lose
+/// its name within one reconcile interval.
+#[tokio::test]
+async fn machine_dns_is_published_under_the_local_domain_and_owned_apart_from_containers() {
+    let (runtime, _tmp) = networking_test_runtime();
+    let ip: std::net::IpAddr = "192.168.64.5".parse().unwrap();
+    runtime.register_machine_dns("dev", ip).await;
+
+    let hosts = runtime.network_manager.local_hosts_table();
+    assert_eq!(hosts.read().unwrap().get("dev"), Some(&ip));
+    assert_eq!(hosts.read().unwrap().get("dev.arcbox.local"), Some(&ip));
+    assert!(runtime.registered_container_ids().await.is_empty());
+    assert_eq!(runtime.registered_machine_dns_names().await, vec!["dev"]);
+
+    runtime.deregister_machine_dns("dev").await;
+    assert!(hosts.read().unwrap().get("dev.arcbox.local").is_none());
+    assert!(runtime.registered_machine_dns_names().await.is_empty());
+}
+
+/// The published name follows the daemon's DNS domain, not a literal.
+#[tokio::test]
+async fn machine_dns_name_follows_the_configured_domain() {
+    let (runtime, _tmp) = networking_test_runtime();
+    assert_eq!(
+        runtime.machine_dns_name("dev").as_deref(),
+        Some("dev.arcbox.local")
+    );
+    runtime.network_manager().set_dns_domain("test.local");
+    assert_eq!(
+        runtime.machine_dns_name("dev").as_deref(),
+        Some("dev.test.local")
+    );
+}
