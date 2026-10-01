@@ -19,6 +19,10 @@ mod agent;
 #[cfg(any(target_os = "linux", test))]
 mod boot_done;
 mod init;
+// The hostname and network-manager files `machine_init` writes into a distro
+// machine's root. Gated like `boot_done`, for the same reason.
+#[cfg(any(target_os = "linux", test))]
+mod machine_identity;
 // Discovery half of the live-container NFS view. Pure parsing and
 // naming, gated like `boot_done` so the tests run on a host build too.
 // The containerd config the agent writes at runtime. Gated like
