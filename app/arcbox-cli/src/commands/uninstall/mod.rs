@@ -314,3 +314,6 @@ pub(super) async fn brew_hook() -> Result<()> {
     steps::unlink_cli_tools_through_helper(&roots).await;
     steps::remove_path(&host, &layout.run_dir)
 }
+
+#[cfg(test)]
+mod tests;
