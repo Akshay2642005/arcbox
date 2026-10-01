@@ -244,8 +244,7 @@ impl DnsForwarder {
         let hostname = hostname.to_lowercase();
         if let Ok(mut hosts) = self.local_hosts.write() {
             hosts.insert(hostname.clone(), ip);
-            if let Some(ref domain) = self.config.local_domain {
-                let fqdn = format!("{}.{}", hostname, domain);
+            if let Some(fqdn) = self.local_fqdn(&hostname) {
                 hosts.insert(fqdn, ip);
             }
         }
@@ -257,11 +256,38 @@ impl DnsForwarder {
         let hostname = hostname.to_lowercase();
         if let Ok(mut hosts) = self.local_hosts.write() {
             hosts.remove(&hostname);
-            if let Some(ref domain) = self.config.local_domain {
-                let fqdn = format!("{}.{}", hostname, domain);
+            if let Some(fqdn) = self.local_fqdn(&hostname) {
                 hosts.remove(&fqdn);
             }
         }
+    }
+
+    /// The name `hostname` is served under in the local domain
+    /// (`<hostname>.<local_domain>`, lowercased), or `None` without a
+    /// local domain.
+    #[must_use]
+    pub fn local_fqdn(&self, hostname: &str) -> Option<String> {
+        let domain = self.config.local_domain.as_ref()?;
+        Some(format!("{}.{domain}", hostname.to_lowercase()))
+    }
+
+    /// Every `(fqdn, ip)` the table holds under the local domain.
+    #[must_use]
+    pub fn local_domain_entries(&self) -> Vec<(String, IpAddr)> {
+        let Some(domain) = self.config.local_domain.as_ref() else {
+            return Vec::new();
+        };
+        let suffix = format!(".{domain}");
+        self.local_hosts.read().map_or_else(
+            |_| Vec::new(),
+            |hosts| {
+                hosts
+                    .iter()
+                    .filter(|(name, _)| name.ends_with(&suffix))
+                    .map(|(name, ip)| (name.clone(), *ip))
+                    .collect()
+            },
+        )
     }
 
     /// Resolves a local hostname.
