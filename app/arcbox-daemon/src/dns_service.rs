@@ -2,7 +2,11 @@
 //!
 //! Listens on `127.0.0.1:{port}` and resolves container hostnames registered
 //! via [`NetworkManager`]. Queries for unregistered names in that domain
-//! get an NXDOMAIN response; all other queries are forwarded to upstream DNS.
+//! get a NODATA response (NOERROR, no records); all other queries are
+//! forwarded to upstream DNS. NODATA rather than NXDOMAIN because the domain
+//! ends in `.local`: mDNSResponder also multicasts the query and ignores a
+//! unicast NXDOMAIN, so the lookup would wait out the mDNS timeout instead
+//! (`DnsForwarder::try_resolve_locally_or_nodata`).
 
 use anyhow::{Context, Result};
 use arcbox_net::NetworkManager;
@@ -104,9 +108,9 @@ impl DnsService {
                 }
             };
 
-            // Fast path: local resolution or NXDOMAIN for the configured domain.
+            // Fast path: local resolution or NODATA for the configured domain.
             // Operates on a borrowed slice to avoid allocation.
-            if let Some(response) = network_manager.try_resolve_dns_or_nxdomain(&buf[..len]) {
+            if let Some(response) = network_manager.try_resolve_dns_or_nodata(&buf[..len]) {
                 if let Err(e) = socket.send_to(&response, src).await {
                     tracing::debug!("Failed to send DNS response to {}: {}", src, e);
                 }
@@ -265,9 +269,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dns_nxdomain_for_unregistered_local() {
+    async fn test_dns_nodata_for_unregistered_local() {
         let nm = Arc::new(NetworkManager::new(arcbox_net::NetConfig::default()));
-        // Don't register anything — query should get NXDOMAIN.
+        // Nothing registered: the query gets NODATA, not NXDOMAIN.
 
         let service = DnsService::bind_requested(Some(0), 0).await.unwrap();
         let server_addr = ("127.0.0.1", service.host_port().unwrap());
@@ -289,9 +293,9 @@ mod tests {
         .unwrap();
 
         let response = &buf[..len];
-        // Verify NXDOMAIN: QR=1, RCODE=3.
+        // NODATA: QR=1, RCODE=0, no answer records.
         assert_eq!(response[2] & 0x80, 0x80, "QR bit should be set");
-        assert_eq!(response[3] & 0x0F, 3, "RCODE should be 3 (NXDOMAIN)");
+        assert_eq!(response[3] & 0x0F, 0, "RCODE should be 0 (NoError)");
         assert_eq!(response[7], 0, "ANCOUNT should be 0");
 
         server_handle.abort();

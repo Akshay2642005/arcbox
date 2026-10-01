@@ -391,12 +391,13 @@ impl NetworkManager {
         }
     }
 
-    /// Tries to resolve a DNS query locally, returning NXDOMAIN for unresolved
-    /// `*.arcbox.local` queries. Returns `None` only when the query should be
-    /// forwarded to upstream DNS.
-    pub fn try_resolve_dns_or_nxdomain(&self, query: &[u8]) -> Option<Vec<u8>> {
+    /// Tries to resolve a DNS query locally, answering NODATA for unresolved
+    /// names under the local domain (see
+    /// `DnsForwarder::try_resolve_locally_or_nodata` for why not NXDOMAIN).
+    /// Returns `None` only when the query should be forwarded to upstream DNS.
+    pub fn try_resolve_dns_or_nodata(&self, query: &[u8]) -> Option<Vec<u8>> {
         let forwarder = self.dns_forwarder.read().ok()?;
-        forwarder.try_resolve_locally_or_nxdomain(query)
+        forwarder.try_resolve_locally_or_nodata(query)
     }
 
     /// Handles a full DNS query: local resolution first, then upstream forwarding.
@@ -453,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn test_set_dns_domain_switches_nxdomain_scope() {
+    fn test_set_dns_domain_switches_local_domain_scope() {
         let manager = NetworkManager::new(NetConfig::default());
         let ip = IpAddr::V4(std::net::Ipv4Addr::new(172, 17, 0, 2));
         manager.register_dns("web", ip);
@@ -473,8 +474,9 @@ mod tests {
 
         // Default domain: web.arcbox.local resolves.
         let q = build_query("web.arcbox.local");
-        let resp = manager.try_resolve_dns_or_nxdomain(&q).unwrap();
+        let resp = manager.try_resolve_dns_or_nodata(&q).unwrap();
         assert_eq!(resp[3] & 0x0F, 0, "should resolve under default domain");
+        assert_eq!(resp[7], 1, "ANCOUNT=1");
 
         // Switch to custom domain — old registrations are gone (forwarder rebuilt).
         manager.set_dns_domain("custom.test");
@@ -482,22 +484,24 @@ mod tests {
         // Re-register under new domain.
         manager.register_dns("web", ip);
         let q = build_query("web.custom.test");
-        let resp = manager.try_resolve_dns_or_nxdomain(&q).unwrap();
+        let resp = manager.try_resolve_dns_or_nodata(&q).unwrap();
         assert_eq!(resp[3] & 0x0F, 0, "should resolve under custom domain");
+        assert_eq!(resp[7], 1, "ANCOUNT=1");
 
-        // Unknown under custom domain → NXDOMAIN.
+        // Unknown under custom domain → NODATA.
         let q = build_query("nope.custom.test");
-        let resp = manager.try_resolve_dns_or_nxdomain(&q).unwrap();
+        let resp = manager.try_resolve_dns_or_nodata(&q).unwrap();
         assert_eq!(
             resp[3] & 0x0F,
-            3,
-            "NXDOMAIN for unregistered custom-domain host"
+            0,
+            "NOERROR for unregistered custom-domain host"
         );
+        assert_eq!(resp[7], 0, "no answer for unregistered custom-domain host");
 
-        // Old default domain → forwarded (None), not NXDOMAIN.
+        // Old default domain → forwarded (None), not answered.
         let q = build_query("web.arcbox.local");
         assert!(
-            manager.try_resolve_dns_or_nxdomain(&q).is_none(),
+            manager.try_resolve_dns_or_nodata(&q).is_none(),
             "old domain queries should not match after set_dns_domain"
         );
     }

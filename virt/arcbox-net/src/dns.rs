@@ -283,25 +283,31 @@ impl DnsForwarder {
         self.build_local_response(&query, ip).ok()
     }
 
-    /// Attempts local resolution, returning NXDOMAIN for unresolved local-domain queries.
+    /// Attempts local resolution, answering authoritatively for the local domain.
     ///
     /// - Registered local host → `Some(A/AAAA response)`
-    /// - Unregistered `*.arcbox.local` (or `*.<local_domain>`) → `Some(NXDOMAIN)`
+    /// - Unregistered `*.<local_domain>` (and the bare domain) → `Some(NODATA)`
     /// - Other domains → `None` (caller should forward to upstream)
-    pub fn try_resolve_locally_or_nxdomain(&self, data: &[u8]) -> Option<Vec<u8>> {
+    ///
+    /// An unknown name under the local domain is answered NODATA (NOERROR
+    /// with no records), never NXDOMAIN. The domain ends in `.local`, which
+    /// RFC 6762 reserves for mDNS, so macOS's mDNSResponder multicasts every
+    /// query for it as well and takes a unicast answer only when it is
+    /// positive or NODATA; NXDOMAIN, SERVFAIL and REFUSED are ignored and the
+    /// lookup waits out the 5 s mDNS timeout per record type (measured
+    /// 2026-10-01, `docs/experiments/2026-10-01-local-domain-negative-answers.md`).
+    /// Either form keeps the name from leaking upstream.
+    pub fn try_resolve_locally_or_nodata(&self, data: &[u8]) -> Option<Vec<u8>> {
         let query = DnsQuery::parse(data).ok()?;
 
-        // Check local hosts first.
         if let Some(ip) = self.resolve_local(&query.name) {
             return self.build_local_response(&query, ip).ok();
         }
 
-        // If the query is for our local domain, return NXDOMAIN instead of
-        // forwarding to upstream (prevents leaking internal names).
         if let Some(ref domain) = self.config.local_domain {
             let name_lower = query.name.to_lowercase();
             if name_lower == *domain || name_lower.ends_with(&format!(".{domain}")) {
-                return Some(Self::build_nxdomain_response(&query));
+                return Some(Self::build_nodata_response(&query));
             }
         }
 
@@ -309,28 +315,21 @@ impl DnsForwarder {
         None
     }
 
-    /// Builds an NXDOMAIN response for a query.
+    /// Builds a NODATA response: NOERROR with an empty answer section.
     ///
-    /// Zeroes all section counts (ANCOUNT, NSCOUNT, ARCOUNT) so that EDNS(0)
-    /// queries (which set ARCOUNT=1 in the header) don't produce malformed
-    /// responses with advertised-but-missing additional records.
-    fn build_nxdomain_response(query: &DnsQuery) -> Vec<u8> {
+    /// Zeroes ANCOUNT, NSCOUNT and ARCOUNT so that an EDNS(0) query (ARCOUNT=1
+    /// for its OPT pseudo-record) does not produce a response advertising a
+    /// record that is not there.
+    fn build_nodata_response(query: &DnsQuery) -> Vec<u8> {
         let mut response = Vec::with_capacity(query.raw_header.len() + query.raw_question.len());
         response.extend_from_slice(&query.raw_header);
 
         // QR=1, Opcode=0, AA=1, TC=0, RD=1
         response[2] = 0x85;
-        // RA=1, Z=0, RCODE=3 (NXDOMAIN)
-        response[3] = 0x83;
-        // ANCOUNT = 0
-        response[6] = 0x00;
-        response[7] = 0x00;
-        // NSCOUNT = 0
-        response[8] = 0x00;
-        response[9] = 0x00;
-        // ARCOUNT = 0 (clears EDNS OPT record count from query)
-        response[10] = 0x00;
-        response[11] = 0x00;
+        // RA=1, Z=0, RCODE=0
+        response[3] = 0x80;
+        // ANCOUNT, NSCOUNT, ARCOUNT = 0; QDCOUNT keeps the question.
+        response[6..12].fill(0);
 
         response.extend_from_slice(&query.raw_question);
         response
@@ -395,7 +394,7 @@ impl DnsForwarder {
         // query header) so an EDNS query, which sets ARCOUNT=1 for its OPT
         // pseudo-record, doesn't leave the response advertising a record we
         // dropped — strict resolvers reject that as malformed. ANCOUNT is
-        // set per branch below. Mirrors `build_nxdomain_response`.
+        // set below. Mirrors `build_nodata_response`.
         response[8..12].fill(0);
 
         // Only answer with the address record the client actually asked for.
@@ -407,10 +406,7 @@ impl DnsForwarder {
             (DnsRecordType::A, IpAddr::V4(_)) | (DnsRecordType::Aaaa, IpAddr::V6(_))
         );
         if !qtype_matches {
-            response[6] = 0x00; // ANCOUNT high
-            response[7] = 0x00; // ANCOUNT low — NODATA
-            response.extend_from_slice(&query.raw_question);
-            return Ok(response);
+            return Ok(Self::build_nodata_response(query));
         }
 
         response[6] = 0x00; // ANCOUNT high
@@ -991,7 +987,7 @@ mod tests {
     }
 
     #[test]
-    fn test_try_resolve_locally_or_nxdomain_returns_response_for_registered() {
+    fn test_try_resolve_locally_or_nodata_returns_response_for_registered() {
         let config = DnsConfig::default();
         let mut forwarder = DnsForwarder::new(config);
         let ip = IpAddr::V4(Ipv4Addr::new(172, 17, 0, 2));
@@ -999,7 +995,7 @@ mod tests {
 
         let query = build_test_query("my-nginx.arcbox.local");
         let response = forwarder
-            .try_resolve_locally_or_nxdomain(&query)
+            .try_resolve_locally_or_nodata(&query)
             .expect("should resolve registered host");
 
         // Verify QR=1, RCODE=0, ANCOUNT=1.
@@ -1009,49 +1005,52 @@ mod tests {
     }
 
     #[test]
-    fn test_try_resolve_locally_or_nxdomain_returns_nxdomain() {
+    fn test_try_resolve_locally_or_nodata_returns_nodata_for_unregistered() {
         let config = DnsConfig::default();
         let forwarder = DnsForwarder::new(config);
 
         let query = build_test_query("nonexistent.arcbox.local");
         let response = forwarder
-            .try_resolve_locally_or_nxdomain(&query)
-            .expect("should return NXDOMAIN for unregistered local host");
+            .try_resolve_locally_or_nodata(&query)
+            .expect("should answer for an unregistered local host");
 
-        // Verify QR=1, RCODE=3 (NXDOMAIN), ANCOUNT=0.
+        // NODATA, not NXDOMAIN: QR=1, RCODE=0, the question echoed, no records.
         assert_eq!(response[2] & 0x80, 0x80, "QR bit");
-        assert_eq!(response[3] & 0x0F, 3, "RCODE=NXDOMAIN");
-        assert_eq!(response[7], 0, "ANCOUNT=0");
+        assert_eq!(response[3] & 0x0F, 0, "RCODE=NoError");
+        assert_eq!(response[5], 1, "QDCOUNT=1");
+        assert_eq!(&response[6..12], &[0; 6], "ANCOUNT, NSCOUNT, ARCOUNT = 0");
+        assert_eq!(response.len(), query.len(), "header + question only");
     }
 
     #[test]
-    fn test_try_resolve_locally_or_nxdomain_returns_none_for_external() {
+    fn test_try_resolve_locally_or_nodata_returns_none_for_external() {
         let config = DnsConfig::default();
         let forwarder = DnsForwarder::new(config);
 
         let query = build_test_query("google.com");
-        let result = forwarder.try_resolve_locally_or_nxdomain(&query);
+        let result = forwarder.try_resolve_locally_or_nodata(&query);
 
         assert!(result.is_none(), "should return None for non-local domains");
     }
 
     #[test]
-    fn test_try_resolve_locally_or_nxdomain_bare_domain() {
-        // Query for "arcbox.local" itself (no subdomain) should also NXDOMAIN
-        // if not registered.
+    fn test_try_resolve_locally_or_nodata_bare_domain() {
+        // Query for "arcbox.local" itself (no subdomain) is also answered
+        // NODATA when not registered.
         let config = DnsConfig::default();
         let forwarder = DnsForwarder::new(config);
 
         let query = build_test_query("arcbox.local");
         let response = forwarder
-            .try_resolve_locally_or_nxdomain(&query)
-            .expect("bare domain should return NXDOMAIN");
+            .try_resolve_locally_or_nodata(&query)
+            .expect("bare domain should be answered");
 
-        assert_eq!(response[3] & 0x0F, 3, "RCODE=NXDOMAIN");
+        assert_eq!(response[3] & 0x0F, 0, "RCODE=NoError");
+        assert_eq!(response[7], 0, "ANCOUNT=0");
     }
 
     #[test]
-    fn test_custom_domain_nxdomain() {
+    fn test_custom_domain_nodata() {
         let config = DnsConfig::default().with_local_domain("myorg.test");
         let mut forwarder = DnsForwarder::new(config);
 
@@ -1061,22 +1060,23 @@ mod tests {
         // Registered host under custom domain resolves.
         let query = build_test_query("web.myorg.test");
         let response = forwarder
-            .try_resolve_locally_or_nxdomain(&query)
+            .try_resolve_locally_or_nodata(&query)
             .expect("should resolve registered host under custom domain");
         assert_eq!(response[3] & 0x0F, 0, "RCODE=NoError");
         assert_eq!(response[7], 1, "ANCOUNT=1");
 
-        // Unregistered host under custom domain → NXDOMAIN.
+        // Unregistered host under custom domain → NODATA.
         let query = build_test_query("unknown.myorg.test");
         let response = forwarder
-            .try_resolve_locally_or_nxdomain(&query)
-            .expect("should NXDOMAIN for unregistered custom-domain host");
-        assert_eq!(response[3] & 0x0F, 3, "RCODE=NXDOMAIN");
+            .try_resolve_locally_or_nodata(&query)
+            .expect("should answer for an unregistered custom-domain host");
+        assert_eq!(response[3] & 0x0F, 0, "RCODE=NoError");
+        assert_eq!(response[7], 0, "ANCOUNT=0");
 
-        // Query under default arcbox.local → None (forwarded), not NXDOMAIN.
+        // Query under default arcbox.local → None (forwarded), not answered.
         let query = build_test_query("something.arcbox.local");
         assert!(
-            forwarder.try_resolve_locally_or_nxdomain(&query).is_none(),
+            forwarder.try_resolve_locally_or_nodata(&query).is_none(),
             "old default domain should not be handled after domain change"
         );
     }

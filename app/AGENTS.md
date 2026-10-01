@@ -95,6 +95,19 @@ Covers `arcbox-daemon` (startup/shutdown), `arcbox-core` (`vm_lifecycle`),
   crash-looped under launchd for three days, a full VM boot per 5 s cycle,
   because the bind then sat after `boot_runtime`; a bind failure now costs
   no boot.
+- **An unknown name under the local domain is answered NODATA, never
+  NXDOMAIN** (`DnsForwarder::try_resolve_locally_or_nodata`). WHY: the
+  domain ends in `.local`, which RFC 6762 gives to mDNS, so mDNSResponder
+  multicasts every `*.arcbox.local` question as well and takes the unicast
+  answer only when it is positive or NODATA; NXDOMAIN, SERVFAIL and REFUSED
+  are ignored and the lookup waits out the 5 s mDNS timeout per record type,
+  10 s for a getaddrinfo miss (measured 2026-10-01,
+  `docs/experiments/2026-10-01-local-domain-negative-answers.md`). A bound
+  socket that does not answer yet behaves exactly like no listener, so the
+  startup window between the DNS bind and `start_services` needs no
+  "not ready" answer either. The guest agent's own DNS server
+  (`guest/arcbox-agent/src/dns_server.rs`) keeps NXDOMAIN: its clients are
+  Linux resolvers, which have no mDNS leg.
 - **`SetupStatus.vm_running` is owned by `services::vm_running_loop`**, which
   mirrors `VmLifecycleState::is_ready` (readiness level 2 below) off
   `Runtime::subscribe_system_vm_state`. WHY: it used to be set once by
@@ -346,8 +359,8 @@ Covers `arcbox-daemon` (startup/shutdown), `arcbox-core` (`vm_lifecycle`),
   owner prefix and `registered_container_ids` excludes it — without that
   the Docker host reconciler tears every machine down as a vanished
   container within one interval. Regression signature: `dig
-  <name>.arcbox.local` at the daemon's DNS port answers NXDOMAIN for a
-  running machine whose `inspect` shows a bridge address.
+  <name>.arcbox.local` at the daemon's DNS port answers NODATA (NOERROR,
+  no answer) for a running machine whose `inspect` shows a bridge address.
 - **`restart_generation` reports departures, not arrivals.** It is bumped on
   VM *stop* (`Effect::BumpGeneration`, fired from `stopping` on
   `VmEvent::Stopped`), so a task that waits for it to advance wakes at the
