@@ -21,6 +21,10 @@
 //!   DNS server, and a machine address inside `10.0.2.0/24`.
 //! - **M5 SSH contract**: `ssh_info` is still `unimplemented` — pins the
 //!   documented gap so a future SSH feature flags this test to grow.
+//! - **M6 identity**: the guest's hostname is the machine name, it holds
+//!   exactly one default route and that route leaves through the uplink,
+//!   and `inspect` reports the bridge NIC's address with the DNS name the
+//!   daemon publishes it under.
 //!
 //! Not covered, by architecture (no active test; rationale in
 //! `../company/engineering/arcbox/plans/machine-network-e2e.md`):
@@ -42,8 +46,8 @@ use arcbox_e2e::metrics::RunMetrics;
 use arcbox_e2e::net_fixtures::{spawn_blob_server, spawn_pattern_server};
 use arcbox_grpc::v1::machine_service_client::MachineServiceClient;
 use arcbox_protocol::v1::{
-    CreateMachineRequest, InspectMachineRequest, MachineExecRequest, RemoveMachineRequest,
-    SshInfoRequest, StartMachineRequest, StopMachineRequest,
+    CreateMachineRequest, InspectMachineRequest, MachineAgentRequest, MachineExecRequest,
+    RemoveMachineRequest, SshInfoRequest, StartMachineRequest, StopMachineRequest,
 };
 use tonic::transport::Channel;
 
@@ -159,6 +163,7 @@ fn scenario(daemon: &mut DaemonHandle, metrics: &mut RunMetrics) -> Result<()> {
                 "m5_ssh_unimplemented",
                 m5_ssh_unimplemented(&mut machines).await,
             ),
+            ("m6_identity", m6_identity(&mut machines).await),
         ] {
             match result {
                 Ok(()) => tracing::info!(scenario = name, "passed"),
@@ -188,7 +193,7 @@ fn scenario(daemon: &mut DaemonHandle, metrics: &mut RunMetrics) -> Result<()> {
             Ok(())
         } else {
             bail!(
-                "{} of 5 machine-network scenarios failed:\n{}",
+                "{} of 6 machine-network scenarios failed:\n{}",
                 failures.len(),
                 failures.join("\n")
             )
@@ -524,6 +529,69 @@ fn nslookup_wrong_answer_is_distinguishable() {
         vec![Ipv4Addr::new(203, 0, 113, 9)],
         "a wrong answer must not be masked by the gateway in the preamble"
     );
+}
+
+/// M6: what `machine-init` arranges for the distro's init to inherit. The
+/// hostname is read through the agent (`uname`'s nodename), so a distro init
+/// that reset it from a stale `/etc/hostname` would show here. The route
+/// check is the one the boot-done hook exists for: alpine's dhcpcd adds its
+/// default route next to the shim's provisional one, and the hook has to
+/// remove exactly the latter. The bridge address and DNS name are the host's
+/// half: the daemon publishes `<name>.arcbox.local` at that address.
+async fn m6_identity(machines: &mut MachineServiceClient<Channel>) -> Result<()> {
+    let info = machines
+        .get_system_info(MachineAgentRequest {
+            id: MACHINE.to_owned(),
+        })
+        .await
+        .context("get_system_info failed")?
+        .into_inner();
+    if info.hostname != MACHINE {
+        bail!("guest hostname is {:?}, expected {MACHINE}", info.hostname);
+    }
+
+    let (routes, code) = exec_capture(
+        machines,
+        &["/bin/sh", "-c", "ip -4 route show default"],
+        RPC_BUDGET,
+    )
+    .await?;
+    if code != 0 {
+        bail!("ip route exited {code}: {routes}");
+    }
+    let defaults: Vec<&str> = routes.lines().filter(|l| !l.trim().is_empty()).collect();
+    if defaults.len() != 1 {
+        bail!(
+            "expected one default route, got {}: {routes}",
+            defaults.len()
+        );
+    }
+    if !defaults[0].contains("dev eth0") {
+        bail!("default route does not leave through eth0: {routes}");
+    }
+
+    let inspected = machines
+        .inspect(InspectMachineRequest {
+            id: MACHINE.to_owned(),
+        })
+        .await
+        .context("inspect failed")?
+        .into_inner();
+    let net = inspected.network.context("no network in inspect")?;
+    let bridge: Ipv4Addr = net.bridge_ip_address.parse().with_context(|| {
+        format!(
+            "bridge address {:?} is not an IPv4 address (agent reported {:?})",
+            net.bridge_ip_address, info.bridge_ip_address
+        )
+    })?;
+    if bridge.octets()[..3] == [10, 0, 2] {
+        bail!("bridge address {bridge} is on the uplink subnet, not the vmnet bridge");
+    }
+    let expected_name = format!("{MACHINE}.arcbox.local");
+    if net.dns_name != expected_name {
+        bail!("dns_name is {:?}, expected {expected_name}", net.dns_name);
+    }
+    Ok(())
 }
 
 /// M5: host→Machine SSH is not implemented; pin that contract so a future

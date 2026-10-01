@@ -306,6 +306,12 @@ async fn execute_start(args: StartArgs) -> Result<()> {
         if !info.network.ip_address.is_empty() {
             println!("IP:      {}", info.network.ip_address);
         }
+        if !info.network.bridge_ip_address.is_empty() {
+            println!("Bridge:  {}", info.network.bridge_ip_address);
+        }
+        if !info.network.dns_name.is_empty() {
+            println!("DNS:     {}", info.network.dns_name);
+        }
     }
 
     Ok(())
@@ -422,9 +428,7 @@ async fn execute_status(args: StatusArgs) -> Result<()> {
     let cpus = machine.hardware.cpus;
     let memory_mb = machine.hardware.memory / (1024 * 1024);
     let disk_gb = machine.storage.disk_size / (1024 * 1024 * 1024);
-    let ip_address = Some(machine.network.ip_address.as_str())
-        .filter(|ip| !ip.is_empty())
-        .unwrap_or("-");
+    let or_dash = |value: &str| if value.is_empty() { "-" } else { value }.to_owned();
 
     println!("Machine: {}", machine.name);
     println!("State:   {}", title_case_state(&machine.state));
@@ -432,7 +436,9 @@ async fn execute_status(args: StatusArgs) -> Result<()> {
     println!("Memory:  {} MB", memory_mb);
     println!("Disk:    {} GB", disk_gb);
     println!("VM ID:   {}", machine.id);
-    println!("IP:      {}", ip_address);
+    println!("IP:      {}", or_dash(&machine.network.ip_address));
+    println!("Bridge:  {}", or_dash(&machine.network.bridge_ip_address));
+    println!("DNS:     {}", or_dash(&machine.network.dns_name));
 
     Ok(())
 }
@@ -459,6 +465,8 @@ async fn execute_inspect(args: InspectArgs) -> Result<()> {
         "memory_mb": machine.hardware.memory / (1024 * 1024),
         "disk_gb": machine.storage.disk_size / (1024 * 1024 * 1024),
         "ip_address": Some(machine.network.ip_address.clone()).filter(|ip| !ip.is_empty()),
+        "bridge_ip_address": Some(machine.network.bridge_ip_address.clone()).filter(|ip| !ip.is_empty()),
+        "dns_name": Some(machine.network.dns_name.clone()).filter(|name| !name.is_empty()),
         "kernel": machine.os.kernel.clone(),
         "distro": machine.os.distro.clone(),
         "distro_version": machine.os.version.clone(),
@@ -521,6 +529,9 @@ async fn execute_info(args: InfoArgs) -> Result<()> {
     );
     if !info.ip_addresses.is_empty() {
         println!("IP Addresses: {}", info.ip_addresses.join(", "));
+    }
+    if !info.bridge_ip_address.is_empty() {
+        println!("Bridge IP: {}", info.bridge_ip_address);
     }
 
     Ok(())

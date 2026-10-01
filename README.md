@@ -221,6 +221,11 @@ abctl machine ls
 Create, start, stop, inspect, directory mounts, interactive shells, and command
 execution work today for Alpine, Arch Linux, Debian, Fedora, and Ubuntu.
 
+A machine is its name: the guest's hostname is the machine name, and while it
+runs the Mac reaches it as `<name>.arcbox.local` (`ssh user@dev.arcbox.local`,
+`curl http://dev.arcbox.local:3000`). The name must be a hostname: letters,
+digits and hyphens, up to 63 characters.
+
 ## macOS guests
 
 On Apple Silicon, ArcBox also runs disposable macOS VMs: pull a published base
