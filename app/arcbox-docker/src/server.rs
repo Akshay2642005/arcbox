@@ -127,11 +127,13 @@ impl DockerApiServer {
         };
         let proxy = Arc::new(ProxyState::new(connector).with_activity_hook(activity_hook));
 
-        // Backstop host-networking teardown for containers that stop without a
-        // stop/kill/remove API call (natural exit, --rm, prune, OOM, guest-side
-        // stop). The handlers do immediate teardown; this reconciles the rest.
-        // It shares the router's ProxyState so its queries go through the same
-        // pooled client — including the restart-generation reset.
+        // Keep host container networking in step with the guest for every
+        // change that reaches no handler: containers that stop without a
+        // stop/kill/remove call (natural exit, --rm, prune, OOM, guest-side
+        // stop) and containers dockerd brings back by itself after a System
+        // VM restart. It shares the router's ProxyState so its queries go
+        // through the same pooled client — including the restart-generation
+        // reset.
         crate::host_reconciler::spawn(
             Arc::clone(&self.runtime),
             Arc::clone(&proxy),
