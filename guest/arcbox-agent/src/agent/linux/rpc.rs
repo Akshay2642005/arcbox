@@ -459,7 +459,7 @@ pub(super) fn sync_clock_from_host(timestamp_secs: i64) -> bool {
     };
     // SAFETY: `ts` points to a valid initialized timespec for this call,
     // and CLOCK_REALTIME is a valid clock ID on Linux guests.
-    let ret = unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) };
+    let ret = unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &raw const ts) };
     if ret != 0 {
         tracing::warn!(
             timestamp_secs,

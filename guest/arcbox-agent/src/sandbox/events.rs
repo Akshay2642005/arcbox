@@ -22,7 +22,7 @@ impl SandboxService {
     /// Replay durable cleanup tickets, then stream tickets created by terminal
     /// lifecycle events. The live broadcast subscription is opened before the
     /// snapshot so no event can fall into a subscribe/snapshot gap.
-    pub(crate) async fn handle_cleanup_events<S>(
+    pub async fn handle_cleanup_events<S>(
         &self,
         stream: &mut S,
         trace_id: &str,

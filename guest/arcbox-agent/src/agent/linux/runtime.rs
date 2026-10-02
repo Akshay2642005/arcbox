@@ -677,14 +677,13 @@ pub(super) fn ensure_runtime_prerequisites() -> Vec<String> {
     // this with the real host time.
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     let min_epoch = option_env!("SOURCE_DATE_EPOCH")
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0)
         .max(MIN_SANE_EPOCH);
     if now_secs < min_epoch {
-        if sync_clock_from_host(min_epoch as i64) {
+        if sync_clock_from_host(min_epoch.cast_signed()) {
             notes.push("clock guard: set to minimum sane time (pre-ping fallback)".to_string());
         } else {
             notes.push("clock guard: failed to set clock (pre-ping fallback)".to_string());

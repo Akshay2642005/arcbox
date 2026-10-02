@@ -233,14 +233,14 @@ mod tests {
 
     #[test]
     fn no_ports_or_no_ip_yields_nothing() {
-        assert!(pinned_publishes(&serde_json::json!({})).is_empty());
+        assert_eq!(pinned_publishes(&serde_json::json!({})), []);
         let no_ip = serde_json::json!({
             "NetworkSettings": {
                 "Ports": {"80/tcp": [{"HostIp": "127.0.0.1", "HostPort": "1"}]},
                 "Networks": {}
             }
         });
-        assert!(pinned_publishes(&no_ip).is_empty());
+        assert_eq!(pinned_publishes(&no_ip), []);
     }
 
     #[test]

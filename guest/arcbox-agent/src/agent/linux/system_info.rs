@@ -114,9 +114,7 @@ fn collect_system_info() -> SystemInfo {
     }
 
     // CPU count
-    info.cpu_count = std::thread::available_parallelism()
-        .map(|p| p.get() as u32)
-        .unwrap_or(1);
+    info.cpu_count = std::thread::available_parallelism().map_or(1, |p| p.get() as u32);
 
     // Load average
     if let Ok(loadavg) = std::fs::read_to_string("/proc/loadavg") {

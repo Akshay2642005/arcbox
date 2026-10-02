@@ -251,8 +251,7 @@ async fn main() -> Result<()> {
 
         // Install SIGCHLD handler so orphaned grandchildren (containerd shims,
         // etc.) don't accumulate as zombies.
-        let sv = std::sync::Arc::new(tokio::sync::Mutex::new(supervisor::Supervisor::new()));
-        supervisor::spawn_reaper(sv);
+        supervisor::spawn_reaper();
     }
 
     let guest = agent::Guest::detect();

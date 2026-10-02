@@ -208,8 +208,8 @@ mod tests {
                  -j DNAT --to-destination 172.18.0.3:3000",
             ]
         );
-        assert!(facts.rules(Some(80), false).is_empty(), "80 needs no rule");
-        assert!(facts.rules(None, false).is_empty());
+        assert_eq!(facts.rules(Some(80), false), [], "80 needs no rule");
+        assert_eq!(facts.rules(None, false), []);
     }
 
     #[test]

@@ -133,7 +133,7 @@ mod tests {
 
     fn default_daemon_json() -> Value {
         let rendered = render(ContainerNetwork::default(), Map::new());
-        assert!(rendered.refused.is_empty());
+        assert_eq!(rendered.refused, Vec::<String>::new());
         serde_json::from_str(&rendered.content).expect("valid JSON")
     }
 
