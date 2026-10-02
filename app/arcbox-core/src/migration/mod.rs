@@ -818,7 +818,7 @@ exit 0
         restore_path(previous_path);
         let response = response.unwrap();
 
-        assert!(!response.plan_id.is_empty());
+        assert_ne!(response.plan_id, "");
         assert_eq!(manager.prepared.read().await.len(), 1);
         // The plan embeds container environments; it ships only when a caller
         // explicitly asked to inspect it.

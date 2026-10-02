@@ -169,7 +169,7 @@ mod listeners {
             .await;
         runtime.close_kubernetes_load_balancers().await;
         assert!(!accepts(web).await, "closing removes every listener");
-        assert!(report(&runtime).await.is_empty());
+        assert_eq!(report(&runtime).await, []);
     }
 
     #[tokio::test]
@@ -187,7 +187,7 @@ mod listeners {
             .await;
 
         assert!(!accepts(port).await);
-        assert!(report(&runtime).await.is_empty());
+        assert_eq!(report(&runtime).await, []);
     }
 
     #[tokio::test]

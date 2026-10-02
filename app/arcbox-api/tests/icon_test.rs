@@ -58,6 +58,6 @@ async fn get_icon_not_found() {
         .await
         .unwrap();
 
-    assert!(resp.url.is_empty());
+    assert_eq!(resp.url, "");
     assert_eq!(resp.source, "not_found");
 }

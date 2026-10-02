@@ -512,7 +512,7 @@ mod tests {
         let (snapshot, mut updates) = state.subscribe();
 
         assert_eq!(snapshot.phase, setup_status::Phase::AssetsReady);
-        assert!(drain(&mut updates).is_empty());
+        assert_eq!(drain(&mut updates), []);
     }
 
     /// Flags travel the same path as phases: a client watching for the route

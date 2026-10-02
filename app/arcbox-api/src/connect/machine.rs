@@ -689,6 +689,6 @@ mod tests {
     fn resync_event_carries_no_name() {
         let event = resync_event();
         assert_eq!(event.action, "resync");
-        assert!(event.name.is_empty());
+        assert_eq!(event.name, "");
     }
 }

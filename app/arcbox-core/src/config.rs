@@ -710,7 +710,7 @@ registry-mirrors = ["https://ignored.example.com"]
     fn network_proxy_defaults_to_following_the_system() {
         let network = Config::default().network;
         assert_eq!(network.proxy, ProxyPolicy::System);
-        assert!(network.proxy_exclude.is_empty());
+        assert_eq!(network.proxy_exclude, Vec::<String>::new());
     }
 
     #[test]
