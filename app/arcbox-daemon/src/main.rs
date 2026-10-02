@@ -10,6 +10,7 @@ mod machine_dns;
 mod nfs_mount;
 mod power;
 mod recovery;
+mod sandbox_cleanup;
 mod self_setup;
 mod services;
 mod shutdown;

@@ -44,6 +44,8 @@ connectrpc-reflection = { package = "arcbox-connectrpc-reflection", version = "0
 arcbox-connect.workspace = true
 arcbox-ssh.workspace = true
 arcbox-error.workspace = true
+arcbox-computer.workspace = true
+arcbox-engine.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 arcbox-route.workspace = true

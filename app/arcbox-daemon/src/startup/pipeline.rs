@@ -148,6 +148,7 @@ impl RuntimeBooted {
             if linux_vm {
                 services::enable_docker_integration(&self.ctx);
                 crate::kubernetes_lb::spawn(&self.ctx, &self.runtime);
+                crate::sandbox_cleanup::spawn(&self.ctx, &self.runtime);
             }
             crate::disk_reclaim::spawn(&self.ctx, &self.runtime);
             crate::nfs_mount::spawn(&self.ctx, &self.runtime);

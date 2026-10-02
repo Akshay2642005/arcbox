@@ -288,27 +288,27 @@ async fn init_runtime(ctx: &DaemonContext) -> Result<Arc<Runtime>> {
         runtime.network_manager().set_dns_domain(&ctx.dns_domain);
     }
 
+    // Replay the startup cleanup before the runtime is published, so no
+    // sandbox state from a previous daemon outlives it. The stream is a
+    // streaming RPC, which the HV backend's blocking agent transport cannot
+    // carry; HV runs no sandboxes, so there is nothing to replay there. The
+    // same gate, re-evaluated per VM incarnation, keeps the long-lived watch
+    // (`sandbox_cleanup::spawn`) off backends that cannot carry it.
     let backend = runtime.system_vm_backend();
-    let sandbox_cleanup_supported = if !runtime.config().vm.autostart {
-        false
+    if !runtime.config().vm.autostart {
+        // No guest, nothing to clean.
     } else if backend.supports_nested_virt() {
-        arcbox_api::initialize_sandbox_cleanup(runtime.as_ref())
+        let replayed = arcbox_computer::cleanup::initialize(runtime.as_ref())
             .await
-            .context("Failed to initialize sandbox cleanup")?
+            .context("Failed to initialize sandbox cleanup")?;
+        if !replayed {
+            info!("sandbox cleanup skipped: the guest runs no sandboxes");
+        }
     } else {
-        // No sandbox can run on this backend, so there is nothing for the
-        // cleanup protocol to reconcile. Asking anyway would fail the boot:
-        // the cleanup watch is a streaming RPC, and the HV backend's
-        // blocking agent transport cannot carry one.
         info!(
             backend = backend.as_str(),
             "sandbox cleanup skipped: the backend does not run sandboxes"
         );
-        false
-    };
-
-    if sandbox_cleanup_supported {
-        arcbox_api::spawn_sandbox_cleanup(Arc::clone(&runtime));
     }
     Ok(runtime)
 }

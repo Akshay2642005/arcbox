@@ -580,6 +580,7 @@ version = "0.8.0"
 dependencies = [
  "anyhow",
  "arcbox-api",
+ "arcbox-computer",
  "arcbox-connect",
  "arcbox-connectrpc",
  "arcbox-connectrpc-reflection",
@@ -587,6 +588,7 @@ dependencies = [
  "arcbox-core",
  "arcbox-docker",
  "arcbox-docker-tools",
+ "arcbox-engine",
  "arcbox-error",
  "arcbox-grpc",
  "arcbox-helper",
