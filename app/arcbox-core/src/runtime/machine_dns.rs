@@ -10,6 +10,11 @@
 //! of their own so the Docker host-networking reconciler, which treats
 //! every unprefixed owner as a container, never tears a machine down as a
 //! vanished container.
+//!
+//! `MachineManager::create` refuses a name whose hostname another machine
+//! already has, so two running machines sharing a label can only be ones
+//! created before that rule; the table then answers for the one that
+//! started last, and the registration says so.
 
 use std::net::IpAddr;
 
@@ -32,8 +37,38 @@ impl Runtime {
                 return;
             }
         };
+        if let Some(other) = self.machine_holding_hostname(machine, &hostname).await {
+            tracing::warn!(
+                machine,
+                hostname,
+                other_machine = other,
+                "two machines share one hostname; the name now answers for the one that \
+                 started last — rename one of them"
+            );
+        }
         self.register_dns(&Self::machine_dns_owner(machine), &[hostname], ip)
             .await;
+    }
+
+    /// The machine other than `machine` whose published hostname is
+    /// `hostname`, if any.
+    pub(super) async fn machine_holding_hostname(
+        &self,
+        machine: &str,
+        hostname: &str,
+    ) -> Option<String> {
+        let own = Self::machine_dns_owner(machine);
+        self.dns_entries
+            .read()
+            .await
+            .iter()
+            .filter(|(owner, _)| **owner != own)
+            .find(|(owner, entry)| {
+                owner.starts_with(MACHINE_DNS_OWNER_PREFIX)
+                    && entry.hostnames.iter().any(|name| name == hostname)
+            })
+            .and_then(|(owner, _)| owner.strip_prefix(MACHINE_DNS_OWNER_PREFIX))
+            .map(str::to_owned)
     }
 
     /// Withdraws `machine`'s name; a no-op when it was never published.

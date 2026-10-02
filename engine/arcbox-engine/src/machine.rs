@@ -519,6 +519,20 @@ impl MachineManager {
         if machines.contains_key(&config.name) {
             return Err(EngineError::already_exists(config.name));
         }
+        // The hostname is a key too: `my_box` and `my-box` would answer to
+        // one `my-box.arcbox.local`, and the DNS table keeps whichever
+        // started last, so a user's `ssh` lands on the wrong machine with
+        // nothing to say why. Refuse the second name instead.
+        if let Some(other) = machines
+            .keys()
+            .find(|existing| machine_hostname(existing).ok().as_deref() == Some(hostname.as_str()))
+        {
+            return Err(EngineError::already_exists(format!(
+                "machine name '{}' would take hostname '{hostname}', which machine '{other}' \
+                 already has",
+                config.name
+            )));
+        }
 
         let machine_dir = self.machines_dir.join(&config.name);
         std::fs::create_dir_all(&machine_dir)?;

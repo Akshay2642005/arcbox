@@ -596,3 +596,42 @@ fn machine_names_become_hostnames() {
         assert!(machine_hostname(bad).is_err(), "{bad:?}");
     }
 }
+
+/// Two names that map to one hostname would share one DNS record, with the
+/// table keeping whichever machine started last; the second name is refused
+/// and the error names the machine that holds the hostname.
+#[tokio::test]
+async fn a_name_whose_hostname_another_machine_has_is_refused() {
+    let temp_dir = tempdir().unwrap();
+    let manager = test_machine_manager(temp_dir.path());
+    manager
+        .create(MachineConfig {
+            name: "my_box".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let err = manager
+        .create(MachineConfig {
+            name: "my-box".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("'my-box'") && message.contains("'my_box'"),
+        "{message}"
+    );
+    assert!(manager.get("my-box").is_none());
+
+    // A different hostname is still fine.
+    manager
+        .create(MachineConfig {
+            name: "my-box-2".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+}

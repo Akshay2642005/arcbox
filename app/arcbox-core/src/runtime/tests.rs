@@ -686,3 +686,28 @@ async fn machine_dns_name_follows_the_configured_domain_and_the_hostname() {
         vec!["my_box.v2"]
     );
 }
+
+/// Machines created before `create` refused hostname collisions can still
+/// share a label; the registration must notice the other holder so the
+/// override is logged rather than silent. Containers using the same label
+/// are not machines and do not count.
+#[tokio::test]
+async fn a_machine_sharing_a_hostname_with_another_machine_is_detected() {
+    let (runtime, _tmp) = networking_test_runtime();
+    let ip: std::net::IpAddr = "192.168.64.5".parse().unwrap();
+    runtime.register_machine_dns("my_box", ip).await;
+    runtime.register_dns("c0ffee", &["my-box".into()], ip).await;
+
+    assert_eq!(
+        runtime.machine_holding_hostname("my-box", "my-box").await,
+        Some("my_box".to_owned())
+    );
+    assert_eq!(
+        runtime.machine_holding_hostname("my_box", "my-box").await,
+        None
+    );
+    assert_eq!(
+        runtime.machine_holding_hostname("other", "other").await,
+        None
+    );
+}
