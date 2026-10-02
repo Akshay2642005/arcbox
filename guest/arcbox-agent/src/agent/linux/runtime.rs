@@ -80,6 +80,7 @@ async fn do_ensure_runtime_start() -> RuntimeEnsureResponse {
     let note = match try_start_bundled_runtime().await {
         Ok(note) => note,
         Err(message) => {
+            tracing::warn!(%message, "bundled runtime start failed");
             return RuntimeEnsureResponse {
                 ready: false,
                 endpoint: format!("vsock:{}", docker_api_vsock_port()),
@@ -122,6 +123,9 @@ async fn do_ensure_runtime_start() -> RuntimeEnsureResponse {
     }
 
     let ready = status.docker_ready && routing_error.is_none();
+    if !ready {
+        tracing::warn!(%message, "bundled runtime did not become ready");
+    }
     let result_status = if ready {
         ensure_runtime::STATUS_STARTED.to_string()
     } else {
