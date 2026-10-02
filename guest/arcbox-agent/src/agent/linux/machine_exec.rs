@@ -22,6 +22,7 @@
 mod control;
 mod debug;
 mod flow;
+mod login_path;
 mod process;
 mod session;
 mod tcp;
@@ -66,7 +67,7 @@ where
     if let Some(window) = flow.initial_stdin_window() {
         session::write_window(stream, trace_id, window).await?;
     }
-    let spec = match ProcessSpec::resolve(&req) {
+    let spec = match ProcessSpec::resolve(&req).await {
         Ok(spec) => spec,
         Err(err) => return session::write_error(stream, trace_id, &err).await,
     };
@@ -104,7 +105,7 @@ where
         Ok(ns) => ns,
         Err(err) => return session::write_error(stream, trace_id, &err).await,
     };
-    let mut spec = match ProcessSpec::resolve(&req) {
+    let mut spec = match ProcessSpec::resolve(&req).await {
         Ok(spec) => spec,
         Err(err) => return session::write_error(stream, trace_id, &err).await,
     };

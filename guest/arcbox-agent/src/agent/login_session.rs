@@ -9,10 +9,6 @@ use std::ffi::OsString;
 use std::hash::BuildHasher;
 use std::path::{Path, PathBuf};
 
-/// Directories sshd puts on `PATH` for root (Debian's build defaults).
-const ROOT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-/// Directories sshd puts on `PATH` for everyone else.
-const USER_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games";
 /// The shell of an account whose passwd entry names none.
 const DEFAULT_SHELL: &str = "/bin/sh";
 
@@ -23,6 +19,18 @@ pub struct Account {
     pub home: PathBuf,
     /// Empty when the passwd entry names no shell.
     pub shell: PathBuf,
+}
+
+impl Account {
+    /// The shell a session of this account runs: the passwd entry's, or
+    /// `/bin/sh` when it names none.
+    pub fn shell_program(&self) -> PathBuf {
+        if self.shell.as_os_str().is_empty() {
+            PathBuf::from(DEFAULT_SHELL)
+        } else {
+            self.shell.clone()
+        }
+    }
 }
 
 /// The process a login session runs, with its complete environment.
@@ -42,19 +50,18 @@ impl LoginProcess {
     ///
     /// An empty `cmd` is an interactive login shell; otherwise `cmd` is
     /// joined with spaces into one command line for `shell -c`, the way an
-    /// SSH client joins its arguments. `env` is applied over the account's
-    /// variables, and `working_dir` (when set) replaces HOME as the cwd.
+    /// SSH client joins its arguments. `path` is the machine's login `PATH`
+    /// for the account (the caller derives it; see `machine_exec::login_path`).
+    /// `env` is applied over the account's variables, and `working_dir`
+    /// (when set) replaces HOME as the cwd.
     pub fn plan<S: BuildHasher>(
         account: &Account,
         cmd: &[String],
+        path: &str,
         env: &HashMap<String, String, S>,
         working_dir: &str,
     ) -> Self {
-        let program = if account.shell.as_os_str().is_empty() {
-            PathBuf::from(DEFAULT_SHELL)
-        } else {
-            account.shell.clone()
-        };
+        let program = account.shell_program();
         let (arg0, args) = if cmd.is_empty() {
             (login_arg0(&program), Vec::new())
         } else {
@@ -64,11 +71,6 @@ impl LoginProcess {
             )
         };
 
-        let path = if account.uid == 0 {
-            ROOT_PATH
-        } else {
-            USER_PATH
-        };
         let home = account.home.to_string_lossy().into_owned();
         let mut vars: HashMap<String, String> = HashMap::from([
             ("HOME".to_owned(), home),
@@ -125,36 +127,31 @@ mod tests {
             .find_map(|(k, v)| (k == name).then_some(v.as_str()))
     }
 
+    const PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+
     #[test]
     fn an_empty_command_is_an_interactive_login_shell_in_home() {
-        let process = LoginProcess::plan(&account(0, "/bin/bash"), &[], &HashMap::new(), "");
+        let process = LoginProcess::plan(&account(0, "/bin/bash"), &[], PATH, &HashMap::new(), "");
 
         assert_eq!(process.program, PathBuf::from("/bin/bash"));
         assert_eq!(process.arg0, OsString::from("-bash"));
-        assert!(process.args.is_empty());
+        assert_eq!(process.args, Vec::<String>::new());
         assert_eq!(process.working_dir, PathBuf::from("/root"));
         assert_eq!(var(&process, "HOME"), Some("/root"));
         assert_eq!(var(&process, "USER"), Some("root"));
         assert_eq!(var(&process, "LOGNAME"), Some("root"));
         assert_eq!(var(&process, "SHELL"), Some("/bin/bash"));
+        assert_eq!(var(&process, "PATH"), Some(PATH));
     }
 
     #[test]
     fn a_command_runs_through_the_shell_joined_like_ssh_joins_arguments() {
         let cmd = ["ls".to_owned(), "-la".to_owned(), "/tmp".to_owned()];
-        let process = LoginProcess::plan(&account(1000, "/bin/zsh"), &cmd, &HashMap::new(), "");
+        let process =
+            LoginProcess::plan(&account(1000, "/bin/zsh"), &cmd, PATH, &HashMap::new(), "");
 
         assert_eq!(process.arg0, OsString::from("/bin/zsh"));
         assert_eq!(process.args, ["-c", "ls -la /tmp"]);
-    }
-
-    #[test]
-    fn path_depends_on_whether_the_account_is_root() {
-        let root = LoginProcess::plan(&account(0, "/bin/sh"), &[], &HashMap::new(), "");
-        let user = LoginProcess::plan(&account(1000, "/bin/sh"), &[], &HashMap::new(), "");
-
-        assert!(var(&root, "PATH").unwrap().contains("/usr/sbin"));
-        assert!(!var(&user, "PATH").unwrap().contains("sbin"));
     }
 
     #[test]
@@ -163,7 +160,7 @@ mod tests {
             ("TERM".to_owned(), "xterm-256color".to_owned()),
             ("PATH".to_owned(), "/opt/bin".to_owned()),
         ]);
-        let process = LoginProcess::plan(&account(0, "/bin/sh"), &[], &env, "/srv");
+        let process = LoginProcess::plan(&account(0, "/bin/sh"), &[], PATH, &env, "/srv");
 
         assert_eq!(var(&process, "TERM"), Some("xterm-256color"));
         assert_eq!(var(&process, "PATH"), Some("/opt/bin"));
@@ -172,7 +169,7 @@ mod tests {
 
     #[test]
     fn an_account_without_a_shell_gets_bin_sh() {
-        let process = LoginProcess::plan(&account(0, ""), &[], &HashMap::new(), "");
+        let process = LoginProcess::plan(&account(0, ""), &[], PATH, &HashMap::new(), "");
 
         assert_eq!(process.program, PathBuf::from("/bin/sh"));
         assert_eq!(process.arg0, OsString::from("-sh"));

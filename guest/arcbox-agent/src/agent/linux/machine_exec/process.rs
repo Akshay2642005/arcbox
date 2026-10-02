@@ -8,6 +8,7 @@ use arcbox_connect::v1::MachineExecRequest;
 use arcbox_pty::RunAs;
 use tokio::process::Command;
 
+use super::login_path;
 use crate::agent::exec_error::spawn_error;
 use crate::agent::login_session::{Account, LoginProcess};
 use crate::rpc::ErrorResponse;
@@ -32,15 +33,20 @@ pub(super) struct ProcessSpec {
 
 impl ProcessSpec {
     /// Resolves `req`, or the error frame explaining why it cannot run.
-    pub(super) fn resolve(req: &MachineExecRequest) -> Result<Self, ErrorResponse> {
+    pub(super) async fn resolve(req: &MachineExecRequest) -> Result<Self, ErrorResponse> {
         if req.login {
-            Self::login(req)
+            Self::login(req).await
         } else {
-            Self::plain(req)
+            Self::plain(req).await
         }
     }
 
-    fn plain(req: &MachineExecRequest) -> Result<Self, ErrorResponse> {
+    /// A plain command: the agent's environment with the request's applied
+    /// over it and, unless the request sets its own, the machine's login
+    /// `PATH` in front of the agent's — so an exec finds what a login finds.
+    /// A container-debug exec keeps the agent's `PATH`: it runs in the
+    /// container's namespaces, where the machine's `PATH` means nothing.
+    async fn plain(req: &MachineExecRequest) -> Result<Self, ErrorResponse> {
         let Some((program, args)) = req.cmd.split_first() else {
             return Err(ErrorResponse::new(400, "cmd must not be empty"));
         };
@@ -52,37 +58,37 @@ impl ProcessSpec {
                     .map_err(|e| ErrorResponse::new(400, e.to_string()))?,
             )
         };
+        let mut env: Vec<(String, String)> = req
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        if req.container.is_empty() && !env.iter().any(|(k, _)| k == "PATH") {
+            env.push((
+                "PATH".to_owned(),
+                machine_path(&req.user, run_as.as_ref()).await,
+            ));
+        }
         Ok(Self {
             program: PathBuf::from(program),
             arg0: None,
             args: args.to_vec(),
             clear_env: false,
-            env: req
-                .env
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
+            env,
             working_dir: (!req.working_dir.is_empty()).then(|| PathBuf::from(&req.working_dir)),
             run_as,
         })
     }
 
-    fn login(req: &MachineExecRequest) -> Result<Self, ErrorResponse> {
+    async fn login(req: &MachineExecRequest) -> Result<Self, ErrorResponse> {
         let user = if req.user.is_empty() {
             DEFAULT_LOGIN_USER
         } else {
             &req.user
         };
-        let entry = lookup_account(user).map_err(|e| ErrorResponse::new(400, e))?;
-        let run_as = RunAs::for_account(&entry.name, entry.uid.as_raw(), entry.gid.as_raw())
-            .map_err(|e| ErrorResponse::new(500, format!("groups of {}: {e}", entry.name)))?;
-        let account = Account {
-            name: entry.name,
-            uid: entry.uid.as_raw(),
-            home: entry.dir,
-            shell: entry.shell,
-        };
-        let mut process = LoginProcess::plan(&account, &req.cmd, &req.env, &req.working_dir);
+        let (account, run_as) = login_account(user)?;
+        let path = login_path::login_path(&account, &run_as).await;
+        let mut process = LoginProcess::plan(&account, &req.cmd, &path, &req.env, &req.working_dir);
         // sshd starts the session in / when the home directory is missing.
         if req.working_dir.is_empty() && !process.working_dir.is_dir() {
             process.working_dir = PathBuf::from("/");
@@ -149,6 +155,40 @@ impl ProcessSpec {
     }
 }
 
+/// The `PATH` a plain exec as `user` gets: the machine's login `PATH` for
+/// the account, then whatever the agent's own adds to it. A numeric `user`
+/// with no passwd entry has no profile to run, so it starts from the sshd
+/// default instead.
+async fn machine_path(user: &str, run_as: Option<&RunAs>) -> String {
+    let user = if user.is_empty() {
+        DEFAULT_LOGIN_USER
+    } else {
+        user
+    };
+    let login = match login_account(user) {
+        Ok((account, login_as)) => login_path::login_path(&account, &login_as).await,
+        Err(_) => login_path::sshd_default(run_as.map_or(0, |run_as| run_as.uid)).to_owned(),
+    };
+    match std::env::var("PATH") {
+        Ok(agent) => login_path::join_paths(&login, &agent),
+        Err(_) => login,
+    }
+}
+
+/// The account `user` names, and the credentials a login as it gets.
+fn login_account(user: &str) -> Result<(Account, RunAs), ErrorResponse> {
+    let entry = lookup_account(user).map_err(|e| ErrorResponse::new(400, e))?;
+    let run_as = RunAs::for_account(&entry.name, entry.uid.as_raw(), entry.gid.as_raw())
+        .map_err(|e| ErrorResponse::new(500, format!("groups of {}: {e}", entry.name)))?;
+    let account = Account {
+        name: entry.name,
+        uid: entry.uid.as_raw(),
+        home: entry.dir,
+        shell: entry.shell,
+    };
+    Ok((account, run_as))
+}
+
 /// The passwd entry of a user name or numeric uid.
 fn lookup_account(user: &str) -> Result<nix::unistd::User, String> {
     let entry = match user.parse::<u32>() {
@@ -164,15 +204,17 @@ fn lookup_account(user: &str) -> Result<nix::unistd::User, String> {
 mod tests {
     use super::*;
 
-    fn spec(env: &[(&str, &str)]) -> ProcessSpec {
+    async fn spec(container: &str, env: &[(&str, &str)]) -> ProcessSpec {
         ProcessSpec::resolve(&MachineExecRequest {
             cmd: vec!["sh".to_owned()],
+            container: container.to_owned(),
             env: env
                 .iter()
                 .map(|&(k, v)| (k.to_owned(), v.to_owned()))
                 .collect(),
             ..Default::default()
         })
+        .await
         .unwrap()
     }
 
@@ -182,13 +224,34 @@ mod tests {
             .find_map(|(k, v)| (k == "PATH").then_some(v.as_str()))
     }
 
+    /// A plain exec gets the machine's login `PATH` first and keeps every
+    /// directory the agent itself has, so nothing that resolved before
+    /// stops resolving.
+    #[tokio::test]
+    async fn a_plain_exec_puts_the_login_path_in_front_of_the_agents() {
+        let resolved = spec("", &[]).await;
+        let path = path(&resolved).unwrap();
+
+        let (account, run_as) = login_account(DEFAULT_LOGIN_USER).unwrap();
+        let login = login_path::login_path(&account, &run_as).await;
+        assert!(path.starts_with(&login), "{path} should start with {login}");
+
+        let dirs: Vec<&str> = path.split(':').collect();
+        for dir in std::env::var("PATH").unwrap().split(':') {
+            assert!(dirs.contains(&dir), "{dir} missing from {path}");
+        }
+    }
+
     #[test]
     fn an_appended_dir_goes_last_on_the_path_the_process_would_get() {
-        let mut requested = spec(&[("PATH", "/opt/bin")]);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut requested = rt.block_on(spec("", &[("PATH", "/opt/bin")]));
         requested.append_path("/tools");
         assert_eq!(path(&requested), Some("/opt/bin:/tools"));
 
-        let mut inherited = spec(&[]);
+        // A container-debug exec keeps the agent's PATH: the machine's
+        // login PATH means nothing inside the container's namespaces.
+        let mut inherited = rt.block_on(spec("some-container", &[]));
         inherited.append_path("/tools");
         let agent = std::env::var("PATH").unwrap();
         assert_eq!(path(&inherited), Some(format!("{agent}:/tools").as_str()));
