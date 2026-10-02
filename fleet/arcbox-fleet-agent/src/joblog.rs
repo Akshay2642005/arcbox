@@ -352,7 +352,7 @@ mod tests {
     fn list_is_newest_first_and_empty_before_the_first_job() {
         let dir = tempfile::tempdir().unwrap();
         let logs = logs(dir.path());
-        assert!(logs.list().is_empty());
+        assert_eq!(logs.list(), []);
 
         logs.open("rjob_older").unwrap();
         logs.open("rjob_newer").unwrap();

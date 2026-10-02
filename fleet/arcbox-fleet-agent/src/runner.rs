@@ -1595,7 +1595,7 @@ mod tests {
                 job_id: "rjob_a".to_owned(),
             };
         }
-        assert!(sup.inner.state.current().in_flight.is_empty());
+        assert_eq!(sup.inner.state.current().in_flight, []);
     }
 
     #[tokio::test]

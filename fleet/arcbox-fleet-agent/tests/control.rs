@@ -128,7 +128,7 @@ async fn unenrolled_agent_reports_status_and_rejects_drain() {
     assert_eq!(info.agent_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(info.api_version, 1);
     assert!(info.features.iter().any(|f| f == "restart"), "{info:?}");
-    assert!(!info.instance_id.is_empty());
+    assert_ne!(info.instance_id, "");
 
     let status = client
         .get_status(GetStatusRequest {})
@@ -162,9 +162,9 @@ async fn unenrolled_agent_reports_status_and_rejects_drain() {
         Enrollment::Unenrolled
     );
     assert_eq!(snapshot.machine_id, "");
-    assert!(snapshot.capabilities.is_empty());
-    assert!(snapshot.in_flight.is_empty());
-    assert!(snapshot.recent_verdicts.is_empty());
+    assert_eq!(snapshot.capabilities, []);
+    assert_eq!(snapshot.in_flight, []);
+    assert_eq!(snapshot.recent_verdicts, []);
 
     // FleetSettingsService.GetSettings: a fresh agent reports current ==
     // target everywhere, seeded from its env configuration.
