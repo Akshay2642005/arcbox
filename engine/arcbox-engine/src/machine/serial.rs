@@ -375,7 +375,7 @@ mod tests {
     fn an_unterminated_line_past_the_bound_is_dropped_and_reported() {
         let mut splitter = LineSplitter::new(64);
         let split = splitter.push(&[b'x'; 65]);
-        assert!(split.lines.is_empty());
+        assert_eq!(split.lines, Vec::<String>::new());
         assert!(split.overflowed);
         assert!(splitter.flush().is_none());
     }
@@ -383,10 +383,10 @@ mod tests {
     #[test]
     fn nul_padding_is_neither_output_nor_buffered() {
         let mut splitter = LineSplitter::new(64);
-        assert!(splitter.push(b"\0\0\n").lines.is_empty());
+        assert_eq!(splitter.push(b"\0\0\n").lines, Vec::<String>::new());
         assert_eq!(splitter.push(b"\0abc\0\n").lines, ["abc"]);
         let split = splitter.push(&[0u8; 200]);
-        assert!(split.lines.is_empty());
+        assert_eq!(split.lines, Vec::<String>::new());
         assert!(!split.overflowed, "a NUL flood is not an unterminated line");
         assert!(splitter.flush().is_none());
     }

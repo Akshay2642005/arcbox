@@ -1034,7 +1034,7 @@ mod tests {
         h.commands.send(BalloonCommand::ExitIdle).unwrap();
         h.settle().await;
 
-        assert!(h.targets().is_empty());
+        assert_eq!(h.targets(), Vec::<u64>::new());
         assert_eq!(h.activity_count(), 0);
     }
 }
