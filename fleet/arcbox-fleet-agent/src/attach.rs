@@ -13,7 +13,8 @@ use anyhow::{Context, Result};
 use arcbox_fleet_control_proto::v1 as control_proto;
 use arcbox_fleet_proto::v1::fleet_gateway_service_client::FleetGatewayServiceClient;
 use arcbox_fleet_proto::v1::{
-    Attach, AttachRequest, Heartbeat, HostTelemetry, attach_request, attach_response,
+    Attach, AttachRequest, Heartbeat, HostFactsUpdate, HostTelemetry, attach_request,
+    attach_response,
 };
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
@@ -393,15 +394,16 @@ async fn connect_and_serve(
     // before sending anything the whole stream idle-times-out. The mpsc
     // buffer holds the message until tonic drains it once the stream opens.
     //
-    // The host facts come from a probe on its own thread, waited for only
-    // briefly (`HostFacts::PROBE_WAIT`): a stalled volume on the host must
-    // neither block a runtime worker nor hold the handshake for its stall.
-    // Nor may that wait outlive a shutdown.
-    let host_info_json = tokio::select! {
-        biased;
-        () = shutdown.cancelled() => return Ok(StreamEnd::Closed),
-        json = facts.json() => json,
-    };
+    // The host facts the handshake declares: the probed set when the probe
+    // on its own thread has finished, else the quick set — the handshake
+    // never waits for it, so a stalled volume on the host neither blocks a
+    // runtime worker nor holds the Attach. A probe that finishes during this
+    // stream completes the set with one HostFactsUpdate (the `facts_rx` arm
+    // of the loop below).
+    let mut facts_rx = facts.subscribe();
+    let probed = facts_rx.borrow_and_update().clone();
+    let mut facts_pending = probed.is_none();
+    let host_info_json = probed.unwrap_or_else(|| facts.current());
     let attach_msg = AttachRequest {
         msg: Some(attach_request::Msg::Attach(Attach {
             agent_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -504,6 +506,22 @@ async fn connect_and_serve(
     loop {
         tokio::select! {
             () = shutdown.cancelled() => break Ok(StreamEnd::Closed),
+            // The probe finished after the handshake declared the quick
+            // facts: complete the set once. A dropped sender means the probe
+            // thread died, and the quick facts stand.
+            changed = facts_rx.changed(), if facts_pending => {
+                facts_pending = false;
+                if changed.is_err() {
+                    continue;
+                }
+                let Some(host_info_json) = facts_rx.borrow_and_update().clone() else {
+                    continue;
+                };
+                let update = attach_request::Msg::HostFactsUpdate(HostFactsUpdate { host_info_json });
+                if req_tx.send(AttachRequest { msg: Some(update) }).await.is_err() {
+                    break Err(anyhow::anyhow!("request stream closed while completing the host facts"));
+                }
+            }
             () = &mut quiescing, if pending_update.is_some() => {
                 break Err(anyhow::Error::new(
                     pending_update.take().expect("guarded by is_some"),
@@ -935,11 +953,12 @@ mod tests {
         );
     }
 
-    /// A gateway that accepts every `Attach`, records each handshake, and
-    /// holds the stream open (draining inbound so heartbeats don't
-    /// backpressure) until the client leaves.
+    /// A gateway that accepts every `Attach`, records each handshake and
+    /// every `HostFactsUpdate`, and holds the stream open (draining inbound
+    /// so heartbeats don't backpressure) until the client leaves.
     struct RecordingGateway {
         attaches: Arc<tokio::sync::Mutex<Vec<Attach>>>,
+        updates: Arc<tokio::sync::Mutex<Vec<HostFactsUpdate>>>,
     }
 
     #[tonic::async_trait]
@@ -981,11 +1000,16 @@ mod tests {
                     )),
                 }))
                 .await;
+            let updates = Arc::clone(&self.updates);
             tokio::spawn(async move {
                 // Keep the response stream open while draining heartbeats;
                 // dropping `tx` when the client hangs up closes it.
                 let _hold = tx;
-                while let Ok(Some(_)) = inbound.message().await {}
+                while let Ok(Some(message)) = inbound.message().await {
+                    if let Some(attach_request::Msg::HostFactsUpdate(update)) = message.msg {
+                        updates.lock().await.push(update);
+                    }
+                }
             });
             Ok(tonic::Response::new(
                 tokio_stream::wrappers::ReceiverStream::new(rx),
@@ -1012,22 +1036,35 @@ mod tests {
         .unwrap_or_else(|_| panic!("gateway never saw {n} Attach handshakes"));
     }
 
-    /// Serves a [`RecordingGateway`] on a loopback port; returns its URL
-    /// and the handshakes it records.
-    async fn recording_gateway() -> (String, Arc<tokio::sync::Mutex<Vec<Attach>>>) {
+    /// What a [`RecordingGateway`] saw: its URL, the handshakes, and the
+    /// host facts updates.
+    struct Recorded {
+        gateway: String,
+        attaches: Arc<tokio::sync::Mutex<Vec<Attach>>>,
+        updates: Arc<tokio::sync::Mutex<Vec<HostFactsUpdate>>>,
+    }
+
+    /// Serves a [`RecordingGateway`] on a loopback port.
+    async fn recording_gateway() -> Recorded {
         use arcbox_fleet_proto::v1::fleet_gateway_service_server::FleetGatewayServiceServer;
 
         let attaches = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let updates = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let gateway = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(
             tonic::transport::Server::builder()
                 .add_service(FleetGatewayServiceServer::new(RecordingGateway {
                     attaches: Arc::clone(&attaches),
+                    updates: Arc::clone(&updates),
                 }))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
         );
-        (gateway, attaches)
+        Recorded {
+            gateway,
+            attaches,
+            updates,
+        }
     }
 
     /// The re-attach contract end to end: a backend activating mid-stream
@@ -1036,7 +1073,9 @@ mod tests {
     /// reconnect is what propagates a capability change to the gateway.
     #[tokio::test]
     async fn backend_activation_reattaches_with_fresh_capabilities() {
-        let (gateway, attaches) = recording_gateway().await;
+        let Recorded {
+            gateway, attaches, ..
+        } = recording_gateway().await;
 
         let state = AgentState::new(&PersistedSettings {
             gateway: gateway.clone(),
@@ -1099,10 +1138,15 @@ mod tests {
     /// The host facts probe walks every mounted volume, and a stalled one
     /// holds it for as long as the stall. The handshake must not wait for
     /// that: with a probe that never answers, `Attach` still goes out — with
-    /// the facts that answer at once and `disks` left null.
+    /// the facts that answer at once and `disks` left null — and no update
+    /// follows while the probe stays silent.
     #[tokio::test]
     async fn attach_does_not_wait_for_a_stalled_host_probe() {
-        let (gateway, attaches) = recording_gateway().await;
+        let Recorded {
+            gateway,
+            attaches,
+            updates,
+        } = recording_gateway().await;
 
         let state = AgentState::new(&PersistedSettings {
             gateway: gateway.clone(),
@@ -1141,6 +1185,74 @@ mod tests {
         assert!(facts["disks"].is_null(), "{facts}");
         assert_eq!(facts["arch"], std::env::consts::ARCH);
         assert_eq!(facts["agent_pid"], std::process::id());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            *updates.lock().await,
+            Vec::<HostFactsUpdate>::new(),
+            "no update without a probe answer"
+        );
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), run_task)
+            .await
+            .expect("attach loop exits on shutdown")
+            .expect("attach task must not panic")
+            .expect("clean exit");
+    }
+
+    /// A probe that finishes after the handshake completes the declared
+    /// facts with exactly one `HostFactsUpdate` carrying the probed set.
+    #[tokio::test]
+    async fn a_probe_finishing_after_the_handshake_completes_the_facts_once() {
+        let Recorded {
+            gateway,
+            attaches,
+            updates,
+        } = recording_gateway().await;
+
+        let state = AgentState::new(&PersistedSettings {
+            gateway: gateway.clone(),
+            ..seed()
+        });
+        let config = AgentConfig {
+            gateway,
+            ..config()
+        };
+        let backends = Backends::new(false, None, None, None, state.clone());
+        let handover = Handover::new(state.clone());
+        let (supervisor, egress_rx) = spawn_supervisor(
+            &config,
+            Arc::clone(&backends),
+            state.clone(),
+            Arc::clone(&handover),
+        );
+        let shutdown = CancellationToken::new();
+        let (probe, facts) = HostFacts::pending();
+        let run_task = tokio::spawn(run(
+            config,
+            credential(),
+            supervisor,
+            egress_rx,
+            backends,
+            shutdown.clone(),
+            state,
+            handover,
+            facts,
+        ));
+
+        wait_for_attaches(&attaches, 1).await;
+        probe.send_replace(Some(r#"{"probed":true}"#.to_owned()));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while updates.lock().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the gateway must receive the host facts update");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let updates = updates.lock().await;
+        assert_eq!(updates.len(), 1, "exactly one update per stream");
+        assert_eq!(updates[0].host_info_json, r#"{"probed":true}"#);
 
         shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(5), run_task)

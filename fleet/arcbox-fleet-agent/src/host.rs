@@ -1,7 +1,5 @@
 //! Host facts reported to the gateway at enrollment and in heartbeats.
 
-use std::time::Duration;
-
 use arcbox_fleet_proto::v1::{Backend, Capability, HostTelemetry};
 use serde::Serialize;
 use tokio::sync::watch;
@@ -150,19 +148,17 @@ impl HostInfo {
 
 /// The host facts, probed once per process on a thread of their own.
 ///
-/// A reader never blocks on the probe: [`Self::json`] waits for it only up
-/// to [`Self::PROBE_WAIT`], then reports the facts that answer at once.
+/// A reader never waits for the probe: [`Self::current`] answers with the
+/// probed facts once they exist and with the quick facts (`disks` null)
+/// until then, and [`Self::subscribe`] tells when they arrive — the attach
+/// handshake sends what it has and completes the set with one
+/// `HostFactsUpdate` when the probe finishes afterwards.
 #[derive(Clone)]
 pub struct HostFacts {
     probed: watch::Receiver<Option<String>>,
 }
 
 impl HostFacts {
-    /// How long a reader waits for the probe. A healthy host finishes it in
-    /// milliseconds; a host with a stalled volume must not hold its
-    /// enrollment or attach for the stall.
-    pub const PROBE_WAIT: Duration = Duration::from_secs(1);
-
     /// Start the probe. On a plain thread rather than `spawn_blocking`: the
     /// runtime's drop waits for blocking tasks, and a stalled probe must not
     /// hold up the exec handover of a self-update.
@@ -184,17 +180,18 @@ impl HostFacts {
         (tx, Self { probed: rx })
     }
 
-    /// The probed facts, or — when the probe has not answered within
-    /// [`Self::PROBE_WAIT`] — the quick facts with `disks` null.
-    pub async fn json(&self) -> String {
-        let mut probed = self.probed.clone();
-        if let Ok(Ok(full)) =
-            tokio::time::timeout(Self::PROBE_WAIT, probed.wait_for(Option::is_some)).await
-            && let Some(full) = full.as_ref()
-        {
-            return full.clone();
-        }
-        HostInfo::quick().to_json()
+    /// The probed facts, or — while the probe has not answered — the quick
+    /// facts with `disks` null.
+    pub fn current(&self) -> String {
+        self.probed
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| HostInfo::quick().to_json())
+    }
+
+    /// Where the probe's answer lands: `Some(json)` once, then unchanged.
+    pub fn subscribe(&self) -> watch::Receiver<Option<String>> {
+        self.probed.clone()
     }
 }
 
@@ -406,17 +403,17 @@ mod tests {
         assert_eq!(triple(&caps[0]), ("darwin", "arm64", Backend::Vm as i32));
     }
 
-    /// A probe that has not answered within the wait yields the quick
-    /// facts; one that has yields what it probed.
-    #[tokio::test(start_paused = true)]
-    async fn facts_fall_back_to_the_quick_set_until_the_probe_answers() {
+    /// Until the probe answers, the quick facts stand in; once it has, the
+    /// probed set is what every reader gets.
+    #[tokio::test]
+    async fn facts_are_the_quick_set_until_the_probe_answers() {
         let (probe, facts) = HostFacts::pending();
 
-        let quick: serde_json::Value = serde_json::from_str(&facts.json().await).unwrap();
+        let quick: serde_json::Value = serde_json::from_str(&facts.current()).unwrap();
         assert!(quick["disks"].is_null(), "{quick}");
         assert_eq!(quick["agent_pid"], std::process::id());
 
         probe.send_replace(Some(r#"{"probed":true}"#.to_owned()));
-        assert_eq!(facts.json().await, r#"{"probed":true}"#);
+        assert_eq!(facts.current(), r#"{"probed":true}"#);
     }
 }

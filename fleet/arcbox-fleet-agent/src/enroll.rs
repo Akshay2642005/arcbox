@@ -79,7 +79,7 @@ pub async fn enroll(
         cpu_cores: host::cpu_cores(),
         mem_mib: host::mem_mib(),
         capabilities,
-        host_info_json: facts.json().await,
+        host_info_json: facts.current(),
         agent_version: env!("CARGO_PKG_VERSION").to_owned(),
         host_os: host::host_os(),
     };
