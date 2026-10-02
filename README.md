@@ -223,8 +223,10 @@ execution work today for Alpine, Arch Linux, Debian, Fedora, and Ubuntu.
 
 A machine is its name: the guest's hostname is the machine name, and while it
 runs the Mac reaches it as `<name>.arcbox.local` (`ssh user@dev.arcbox.local`,
-`curl http://dev.arcbox.local:3000`). The name must be a hostname: letters,
-digits and hyphens, up to 63 characters.
+`curl http://dev.arcbox.local:3000`). `_` and `.` in a name become `-` in the
+hostname (`my_box.v2` answers as `my-box-v2`); what is left must be a DNS label
+of up to 63 letters, digits and hyphens. The System VM behind `docker` is
+`default.arcbox.local`.
 
 ## macOS guests
 

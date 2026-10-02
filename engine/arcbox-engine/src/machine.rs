@@ -251,9 +251,10 @@ fn default_distro_cmdline(rootfs_format: &str) -> String {
 /// Kernel command line for the machine boot shim: the shim EROFS boots as
 /// root and stages the distro rootfs + data disk named by the `arcbox.*`
 /// keys (see `../company/engineering/arcbox/plans/machine-boot-shim.md`). User mounts ride
-/// along as a `tag=guest_path[:ro]` table the shim replays, and the machine
-/// name rides along for the shim to make the guest's hostname.
-fn machine_shim_cmdline(name: &str, rootfs_format: &str, mounts: &[MachineMount]) -> String {
+/// along as a `tag=guest_path[:ro]` table the shim replays, and the
+/// machine's hostname ([`machine_hostname`]) rides along for the shim to
+/// give the guest.
+fn machine_shim_cmdline(hostname: &str, rootfs_format: &str, mounts: &[MachineMount]) -> String {
     use arcbox_constants::cmdline::{
         MACHINE_DATA_KEY, MACHINE_INIT_PATH, MACHINE_MOUNTS_KEY, MACHINE_NAME_KEY,
         MACHINE_ROOTFS_KEY, MACHINE_ROOTFS_TYPE_KEY,
@@ -263,7 +264,7 @@ fn machine_shim_cmdline(name: &str, rootfs_format: &str, mounts: &[MachineMount]
         "console={console} root=/dev/vda ro rootfstype=erofs earlycon \
          {KEEP_KERNEL_NIC_NAMES} {QUIET_KERNEL_CONSOLE} init={MACHINE_INIT_PATH} \
          {MACHINE_ROOTFS_KEY}/dev/vdb {MACHINE_ROOTFS_TYPE_KEY}{rootfs_format} \
-         {MACHINE_DATA_KEY}/dev/vdc {MACHINE_NAME_KEY}{name}"
+         {MACHINE_DATA_KEY}/dev/vdc {MACHINE_NAME_KEY}{hostname}"
     );
     if !mounts.is_empty() {
         let table = mounts
@@ -287,23 +288,37 @@ fn mount_tag(index: usize) -> String {
     format!("m{index}")
 }
 
-/// Validates a machine name as the hostname it becomes: a DNS label of at
-/// most 63 ASCII letters, digits and hyphens, not starting or ending with a
-/// hyphen (RFC 1123). The name is also what `<name>.arcbox.local` is built
-/// from and what the shim passes on the kernel command line, which a space
-/// or `=` would break.
-fn validate_machine_name(name: &str) -> Result<()> {
-    let is_label = !name.is_empty()
-        && name.len() <= 63
-        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        && !name.starts_with('-')
-        && !name.ends_with('-');
+/// The hostname a machine named `name` gets, which is also the label of
+/// its `<hostname>.arcbox.local` record and what the shim is handed on the
+/// kernel command line.
+///
+/// A machine name may carry `_` and `.`, which a DNS label may not; both
+/// become `-`, so `my_box.v2` answers as `my-box-v2`. What remains must be
+/// a label (RFC 1123): 1 to 63 ASCII letters, digits and hyphens, not
+/// starting or ending with a hyphen. Two names that map to one hostname
+/// share the DNS record; the ownership table keeps the latest.
+///
+/// # Errors
+///
+/// Returns an error when the name cannot become a hostname.
+pub fn machine_hostname(name: &str) -> Result<String> {
+    let hostname: String = name
+        .chars()
+        .map(|c| if c == '_' || c == '.' { '-' } else { c })
+        .collect();
+    let is_label = !hostname.is_empty()
+        && hostname.len() <= 63
+        && hostname
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !hostname.starts_with('-')
+        && !hostname.ends_with('-');
     if is_label {
-        Ok(())
+        Ok(hostname)
     } else {
         Err(EngineError::config(format!(
-            "machine name '{name}' is not a valid hostname: use 1-63 letters, digits \
-             and hyphens, not starting or ending with a hyphen"
+            "machine name '{name}' cannot be a hostname: use 1-63 letters, digits, \
+             hyphens, underscores and dots, not starting or ending with a separator"
         )))
     }
 }
@@ -495,7 +510,7 @@ impl MachineManager {
         // and user-driven, so the alternative (insert a `Creating` sentinel,
         // drop the lock for I/O, then finalize/rollback) is not worth its
         // orphan-state failure mode.
-        validate_machine_name(&config.name)?;
+        let hostname = machine_hostname(&config.name)?;
         let mut machines = self
             .machines
             .write()
@@ -589,9 +604,7 @@ impl MachineManager {
                 });
                 let cmdline = config.cmdline.clone().or_else(|| {
                     Some(match &rootfs.shim {
-                        Some(_) => {
-                            machine_shim_cmdline(&config.name, &rootfs.format, &config.mounts)
-                        }
+                        Some(_) => machine_shim_cmdline(&hostname, &rootfs.format, &config.mounts),
                         None => default_distro_cmdline(&rootfs.format),
                     })
                 });
@@ -1030,6 +1043,64 @@ impl MachineManager {
             Ok(Err(e)) => Err(e),
             Err(e) => Err(EngineError::Vm(format!("agent connect task panicked: {e}"))),
         }
+    }
+
+    /// Asks a running machine's agent for its addresses and records the
+    /// bridge NIC's on the machine, returning it.
+    ///
+    /// Distro machines record it in their own readiness probe; the System
+    /// VM's readiness lives in the lifecycle actor, which calls this once
+    /// the agent answers so `default.arcbox.local` can be published from
+    /// the same record as every other machine. Same transport dispatch as
+    /// [`Self::ping_agent`].
+    ///
+    /// # Errors
+    /// Returns an error if the machine is not running or the agent is
+    /// unreachable.
+    pub async fn record_bridge_address(
+        self: Arc<Self>,
+        machine_name: String,
+    ) -> Result<Option<String>> {
+        let manager = Arc::clone(&self);
+        let name = machine_name.clone();
+        let connected = tokio::task::spawn_blocking(move || manager.connect_agent(&name)).await;
+        let info = match connected {
+            Ok(Ok(mut agent)) => {
+                if agent.is_blocking() {
+                    tokio::task::spawn_blocking(move || agent.get_system_info_blocking())
+                        .await
+                        .unwrap_or_else(|e| {
+                            Err(EngineError::Vm(format!("system info task panicked: {e}")))
+                        })?
+                } else {
+                    agent.get_system_info().await?
+                }
+            }
+            Ok(Err(e)) => return Err(e),
+            Err(e) => {
+                return Err(EngineError::Vm(format!("agent connect task panicked: {e}")));
+            }
+        };
+        let bridge_ip = Some(info.bridge_ip_address).filter(|ip| !ip.is_empty());
+        {
+            let mut machines = self
+                .machines
+                .write()
+                .map_err(|_| EngineError::LockPoisoned)?;
+            if let Some(machine) = machines.get_mut(&machine_name) {
+                machine.bridge_ip_address.clone_from(&bridge_ip);
+            }
+        }
+        if let Err(e) = self.persistence.update(&machine_name, |m| {
+            m.bridge_ip_address.clone_from(&bridge_ip);
+        }) {
+            tracing::warn!(
+                "Failed to persist bridge address for machine '{}': {}",
+                machine_name,
+                e
+            );
+        }
+        Ok(bridge_ip)
     }
 
     /// Connects to the machine's agent and trims its data filesystems,

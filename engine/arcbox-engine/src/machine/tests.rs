@@ -565,22 +565,34 @@ fn a_settled_init_without_a_usable_address_is_still_not_ready() {
     assert_eq!(readiness_addresses(&info, "m", 1), None);
 }
 
-/// The name becomes the guest's hostname, so it has to be one: the shim
-/// reads it off the cmdline and the host publishes `<name>.arcbox.local`.
+/// The name becomes the guest's hostname and the label of its DNS record:
+/// `_` and `.` turn into `-`, and what is left has to be a DNS label.
 #[test]
-fn machine_names_must_be_hostnames() {
-    for ok in ["dev", "my-box-2", "A1", &"x".repeat(63)] {
-        assert!(validate_machine_name(ok).is_ok(), "{ok}");
+fn machine_names_become_hostnames() {
+    for (name, hostname) in [
+        ("dev", "dev"),
+        ("my-box-2", "my-box-2"),
+        ("A1", "A1"),
+        ("my_box.v2", "my-box-v2"),
+        ("a.b_c", "a-b-c"),
+    ] {
+        assert_eq!(
+            machine_hostname(name).ok().as_deref(),
+            Some(hostname),
+            "{name}"
+        );
     }
+    assert!(machine_hostname(&"x".repeat(63)).is_ok());
     for bad in [
         "",
         "-dev",
         "dev-",
-        "my_box",
-        "my.box",
+        "_dev",
+        "dev.",
         "a b",
+        "a/b",
         &"x".repeat(64),
     ] {
-        assert!(validate_machine_name(bad).is_err(), "{bad:?}");
+        assert!(machine_hostname(bad).is_err(), "{bad:?}");
     }
 }

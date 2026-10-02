@@ -1,14 +1,19 @@
-//! The host DNS name of a distro machine.
+//! The host DNS name of a machine.
 //!
-//! A running machine resolves as `<name>.<local domain>` at its bridge NIC
-//! address — the address the Mac reaches directly, unlike the uplink's
-//! `10.0.2.x` that every machine shares behind its own NAT. The entries go
-//! through the same ownership table as containers and sandboxes, under an
-//! owner key with its own prefix so the Docker host-networking reconciler,
-//! which treats every unprefixed owner as a container, never tears a machine
-//! down as a vanished container.
+//! A running machine resolves as `<hostname>.<local domain>` at its bridge
+//! NIC address — the address the Mac reaches directly, unlike the uplink's
+//! `10.0.2.x` that every machine shares behind its own NAT. The label is
+//! the machine's hostname ([`machine_hostname`]: the name with `_` and `.`
+//! turned into `-`), so the guest and the Mac call it the same thing; the
+//! System VM is `default`. The entries go through the same ownership table
+//! as containers and sandboxes, keyed by machine name under an owner prefix
+//! of their own so the Docker host-networking reconciler, which treats
+//! every unprefixed owner as a container, never tears a machine down as a
+//! vanished container.
 
 use std::net::IpAddr;
+
+use arcbox_engine::machine::machine_hostname;
 
 use super::Runtime;
 
@@ -16,9 +21,18 @@ use super::Runtime;
 pub(super) const MACHINE_DNS_OWNER_PREFIX: &str = "machine:";
 
 impl Runtime {
-    /// Publishes `machine` at `ip`, replacing any earlier address.
+    /// Publishes `machine` at `ip`, replacing any earlier address. A name
+    /// that cannot be a hostname (impossible for a created machine, which
+    /// `create` already refused) is logged and not published.
     pub async fn register_machine_dns(&self, machine: &str, ip: IpAddr) {
-        self.register_dns(&Self::machine_dns_owner(machine), &[machine.to_owned()], ip)
+        let hostname = match machine_hostname(machine) {
+            Ok(hostname) => hostname,
+            Err(e) => {
+                tracing::warn!(machine, error = %e, "machine has no publishable hostname");
+                return;
+            }
+        };
+        self.register_dns(&Self::machine_dns_owner(machine), &[hostname], ip)
             .await;
     }
 
@@ -40,12 +54,13 @@ impl Runtime {
     }
 
     /// The name `machine` is published under, or `None` when the daemon
-    /// serves no local domain.
+    /// serves no local domain or the name cannot be a hostname.
     #[must_use]
     pub fn machine_dns_name(&self, machine: &str) -> Option<String> {
+        let hostname = machine_hostname(machine).ok()?;
         self.network_manager
             .dns_domain()
-            .map(|domain| format!("{machine}.{domain}"))
+            .map(|domain| format!("{hostname}.{domain}"))
     }
 
     fn machine_dns_owner(machine: &str) -> String {

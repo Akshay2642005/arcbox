@@ -128,6 +128,7 @@ impl LifecycleShared {
         self.spawn_route_reconciler();
         self.wait_for_agent(timeout).await?;
         self.sync_guest_clock().await;
+        self.record_bridge_address().await;
         Ok(())
     }
 
@@ -193,6 +194,7 @@ impl LifecycleShared {
             "guest boot ready"
         );
         self.sync_guest_clock().await;
+        self.record_bridge_address().await;
 
         // Reset recovery counters on a fully successful boot.
         self.recovery.reset();
@@ -218,6 +220,22 @@ impl LifecycleShared {
         match result {
             Ok(()) => tracing::info!("guest wall clock synced from host"),
             Err(e) => tracing::warn!(error = %e, "guest clock sync ping failed"),
+        }
+    }
+
+    /// Records the guest's bridge NIC address on the machine record, which
+    /// is what publishes the System VM as `default.arcbox.local`. Runs
+    /// before the actor hears `AgentReady`, so the `MachineStarted` it then
+    /// publishes finds the address already on the record. Best effort: a
+    /// VM without a bridge NIC simply has no name on the Mac.
+    async fn record_bridge_address(&self) {
+        let result = Arc::clone(&self.machine_manager)
+            .record_bridge_address(self.machine_name.clone())
+            .await;
+        match result {
+            Ok(Some(ip)) => tracing::info!(bridge_ip = %ip, "guest bridge address recorded"),
+            Ok(None) => tracing::info!("guest reports no bridge address"),
+            Err(e) => tracing::warn!(error = %e, "could not read the guest's bridge address"),
         }
     }
 

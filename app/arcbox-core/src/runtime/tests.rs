@@ -652,20 +652,37 @@ async fn machine_dns_is_published_under_the_local_domain_and_owned_apart_from_co
 
     runtime.deregister_machine_dns("dev").await;
     assert!(hosts.read().unwrap().get("dev.arcbox.local").is_none());
-    assert!(runtime.registered_machine_dns_names().await.is_empty());
+    assert_eq!(
+        runtime.registered_machine_dns_names().await,
+        Vec::<String>::new()
+    );
 }
 
-/// The published name follows the daemon's DNS domain, not a literal.
+/// The published name follows the daemon's DNS domain, not a literal, and
+/// uses the machine's hostname: `_` and `.` in the name become `-`.
 #[tokio::test]
-async fn machine_dns_name_follows_the_configured_domain() {
+async fn machine_dns_name_follows_the_configured_domain_and_the_hostname() {
     let (runtime, _tmp) = networking_test_runtime();
     assert_eq!(
         runtime.machine_dns_name("dev").as_deref(),
         Some("dev.arcbox.local")
     );
+    assert_eq!(
+        runtime.machine_dns_name("my_box.v2").as_deref(),
+        Some("my-box-v2.arcbox.local")
+    );
     runtime.network_manager().set_dns_domain("test.local");
     assert_eq!(
         runtime.machine_dns_name("dev").as_deref(),
         Some("dev.test.local")
+    );
+
+    let ip: std::net::IpAddr = "192.168.64.5".parse().unwrap();
+    runtime.register_machine_dns("my_box.v2", ip).await;
+    let hosts = runtime.network_manager.local_hosts_table();
+    assert_eq!(hosts.read().unwrap().get("my-box-v2.test.local"), Some(&ip));
+    assert_eq!(
+        runtime.registered_machine_dns_names().await,
+        vec!["my_box.v2"]
     );
 }

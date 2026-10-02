@@ -493,7 +493,7 @@ fn nslookup_ported_preamble_address_is_not_an_answer() {
     // (`G.exitcode = EXIT_FAILURE` at `:1015`, returned at `:1430`).
     let out = "Server:\t\t10.0.2.1\nAddress:\t10.0.2.1:53\n\n\
                ** server can't find host.docker.internal: NXDOMAIN\n";
-    assert!(nslookup_answer_addrs(out).is_empty());
+    assert_eq!(nslookup_answer_addrs(out), Vec::<Ipv4Addr>::new());
 }
 
 #[test]

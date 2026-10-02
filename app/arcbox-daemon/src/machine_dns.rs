@@ -1,12 +1,16 @@
 //! Keeps `<machine>.arcbox.local` in step with the machines that run.
 //!
 //! A machine's name is published at its bridge NIC address when it reaches
-//! readiness and withdrawn when it stops or is removed. The loop follows the
-//! runtime's event bus and, on every machine event, re-derives the answer
-//! from the machine's current record rather than from the event's kind — so
-//! a missed event (a lagging receiver) is repaired by one pass over every
-//! machine, and an event for a machine without a bridge address (the System
-//! VM, a guest whose bridge NIC got no lease) withdraws rather than skips.
+//! readiness and withdrawn when it stops or is removed; the System VM is
+//! `default.arcbox.local`, its address recorded by the lifecycle's own
+//! readiness. The loop follows the runtime's event bus and, on every machine
+//! event, re-derives the answer from the machine's current record rather
+//! than from the event's kind — so a missed event (a lagging receiver) is
+//! repaired by one pass over every machine, and an event for a machine
+//! without a bridge address (a guest whose bridge NIC got no lease, a VM
+//! booted with the bridge NIC disabled) withdraws rather than skips. The
+//! same pass runs once at start: the System VM boots in `boot_runtime`,
+//! before this loop exists, so its `MachineStarted` is never received.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -35,6 +39,7 @@ async fn run(
     mut events: broadcast::Receiver<Event>,
     shutdown: CancellationToken,
 ) {
+    sync_all(runtime).await;
     loop {
         tokio::select! {
             () = shutdown.cancelled() => break,
@@ -127,9 +132,11 @@ mod tests {
         false
     }
 
-    /// The loop withdraws on the record, not on the event: a removed machine
-    /// loses its name, and a started machine without a bridge address (the
-    /// mock here, like the System VM) is not published.
+    /// The loop works from records, not events: a name published for a
+    /// machine that no longer exists is withdrawn by the initial pass before
+    /// any event arrives (the System VM's start predates the loop), and a
+    /// started machine without a bridge address (the mock here) is not
+    /// published.
     #[tokio::test]
     async fn the_loop_follows_machine_records_through_the_event_bus() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -141,6 +148,9 @@ mod tests {
             .expect("runtime"),
         );
         let bus: &EventBus = runtime.event_bus();
+        runtime
+            .register_machine_dns("gone", "192.168.64.9".parse().unwrap())
+            .await;
         let shutdown = CancellationToken::new();
         let task = {
             let runtime = Arc::clone(&runtime);
@@ -148,16 +158,9 @@ mod tests {
             let shutdown = shutdown.clone();
             tokio::spawn(async move { run(&runtime, events, shutdown).await })
         };
-
-        runtime
-            .register_machine_dns("gone", "192.168.64.9".parse().unwrap())
-            .await;
-        bus.publish(Event::MachineRemoved {
-            name: "gone".into(),
-        });
         assert!(
             wait_until(async || runtime.registered_machine_dns_names().await.is_empty()).await,
-            "a removed machine keeps its name"
+            "the initial pass keeps a name no machine owns"
         );
 
         runtime
@@ -168,7 +171,10 @@ mod tests {
             name: "no-bridge".into(),
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(runtime.registered_machine_dns_names().await.is_empty());
+        assert_eq!(
+            runtime.registered_machine_dns_names().await,
+            Vec::<String>::new()
+        );
 
         shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(1), task)
