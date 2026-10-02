@@ -104,21 +104,6 @@ impl ProcessSpec {
         })
     }
 
-    /// Puts `dir` last on the process's `PATH` — after the request's or the
-    /// login account's, else after the agent's own — so it only adds commands.
-    pub(super) fn append_path(&mut self, dir: &str) {
-        let current = match self.env.iter().position(|(k, _)| k == "PATH") {
-            Some(i) => Some(self.env.swap_remove(i).1),
-            None if self.clear_env => None,
-            None => std::env::var("PATH").ok(),
-        };
-        let path = match current {
-            Some(path) if !path.is_empty() => format!("{path}:{dir}"),
-            _ => dir.to_owned(),
-        };
-        self.env.push(("PATH".to_owned(), path));
-    }
-
     /// A command for this spec: program, arguments, environment and working
     /// directory.
     pub(super) fn command(&self) -> Command {
@@ -242,18 +227,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_appended_dir_goes_last_on_the_path_the_process_would_get() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let mut requested = rt.block_on(spec("", &[("PATH", "/opt/bin")]));
-        requested.append_path("/tools");
-        assert_eq!(path(&requested), Some("/opt/bin:/tools"));
+    /// A request's own `PATH` is used as is, and a container-debug exec sets
+    /// none, so it inherits the agent's: the machine's login `PATH` means
+    /// nothing inside the container's namespaces.
+    #[tokio::test]
+    async fn a_requested_path_wins_and_a_debug_exec_inherits_the_agents() {
+        let requested = spec("", &[("PATH", "/opt/bin")]).await;
+        assert_eq!(path(&requested), Some("/opt/bin"));
 
-        // A container-debug exec keeps the agent's PATH: the machine's
-        // login PATH means nothing inside the container's namespaces.
-        let mut inherited = rt.block_on(spec("some-container", &[]));
-        inherited.append_path("/tools");
-        let agent = std::env::var("PATH").unwrap();
-        assert_eq!(path(&inherited), Some(format!("{agent}:/tools").as_str()));
+        let debug = spec("some-container", &[]).await;
+        assert_eq!(path(&debug), None);
+        assert!(!debug.clear_env);
     }
 }
