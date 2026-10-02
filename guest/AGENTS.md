@@ -128,6 +128,27 @@ non-obvious invariants and failure signatures.
   every running machine hourly; the agent issues the ioctl
   (`agent/linux/disk.rs`) and runs no loop of its own. The rootfs ships no
   `fstrim` binary — never shell out to it.
+- **A distro machine's identity and second NIC are `machine-init`'s, set up
+  before the distro's init runs** (`init.rs`, `machine_identity.rs`,
+  `boot_done.rs`). The hostname arrives as `arcbox.machine_name=` on the
+  cmdline (the machine name with `_` and `.` turned into `-`, derived on the
+  host by `machine_hostname`) and lands in the kernel nodename,
+  `/etc/hostname` and a `127.0.1.1` line in `/etc/hosts`: every init in
+  scope re-reads `/etc/hostname`, so set it nowhere else. The bridge NIC is
+  declared unmanaged to systemd-networkd and NetworkManager by MAC before it
+  gets its address — arch's `eth.network` and rocky's NetworkManager
+  otherwise configure it and add a default route through it (measured
+  2026-09-27) — and then gets an address only. The agent's DHCP script tags
+  the default route it installs `proto 200` (`AGENT_DHCP_ROUTE_PROTO`); the
+  boot-done hook is one script, `/etc/arcbox/boot-done.sh`, that every init
+  adapter runs, and it removes that route only while a second default route
+  exists on the uplink (alpine's dhcpcd adds its own next to it; networkd
+  and dhclient replace the table), then writes the sentinel. A distro that
+  configured no network keeps the shim's route. `SystemInfo.bridge_ip_address`
+  reports the bridge NIC's IPv4 address from the same `getifaddrs` pass as
+  `ip_addresses`. Regression signatures: two default routes on alpine;
+  `networkctl list` showing eth1 `configured` on arch; `hostname` printing
+  `distrobuilder-<uuid>` on Debian or Devuan.
 - **Container domains ride nat PREROUTING, and bridged siblings reach them
   only through the kernel's built-in `br_netfilter`.** `domains/` DNATs
   `<ip>:80` to the container's HTTP port and REDIRECTs `<ip>:443` to the

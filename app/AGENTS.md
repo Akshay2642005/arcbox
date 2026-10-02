@@ -326,6 +326,24 @@ Covers `arcbox-daemon` (startup/shutdown), `arcbox-core` (`vm_lifecycle`),
   loop that found all of this: `ARCBOX_MACHINE_IMAGE_BASE=<dir>` pointing at
   a local `machine-images sync` output (the directory, not its `index.json`),
   and `abctl machine exec` into the machine while `start` is still waiting.
+- **A running machine is published as `<hostname>.arcbox.local` at its
+  bridge NIC address** (`arcbox-daemon/src/machine_dns.rs`,
+  `arcbox-core/src/runtime/machine_dns.rs`), the System VM as
+  `default.arcbox.local`. The hostname is `machine_hostname(name)` (`_` and
+  `.` become `-`; `create` refuses a name that cannot become a DNS label),
+  the same string the shim gets on the cmdline, so the guest and the Mac
+  agree. The loop follows machine events and re-derives the answer from
+  `MachineInfo.bridge_ip_address` each time: distro machines record it in
+  `wait_for_machine_ready`, the System VM in the lifecycle boot's
+  `record_bridge_address` (before the actor hears `AgentReady`, so the
+  `MachineStarted` it publishes finds the record filled); every stop path
+  clears it. The record, not the event, is the truth, which is also what
+  repairs a lagged receiver with one pass. Entries carry the `machine:`
+  owner prefix and `registered_container_ids` excludes it — without that
+  the Docker host reconciler tears every machine down as a vanished
+  container within one interval. Regression signature: `dig
+  <name>.arcbox.local` at the daemon's DNS port answers NXDOMAIN for a
+  running machine whose `inspect` shows a bridge address.
 - **`restart_generation` reports departures, not arrivals.** It is bumped on
   VM *stop* (`Effect::BumpGeneration`, fired from `stopping` on
   `VmEvent::Stopped`), so a task that waits for it to advance wakes at the
