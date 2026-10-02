@@ -314,7 +314,15 @@ async fn run(command: Command, config: AgentConfig) -> Result<Outcome> {
             // by the first Attach handshake once the agent attaches, so we
             // advertise what we know without probing the runtimes.
             let capabilities = host::capabilities(seed.runner_script.is_some(), &[], false, false);
-            let credential = match enroll::enroll(&config, token, capabilities, &seed.gateway).await
+            let host_facts = host::HostFacts::probe();
+            let credential = match enroll::enroll(
+                &config,
+                token,
+                capabilities,
+                &seed.gateway,
+                &host_facts,
+            )
+            .await
             {
                 Ok(credential) => credential,
                 Err(error) => {
@@ -344,6 +352,8 @@ async fn run(command: Command, config: AgentConfig) -> Result<Outcome> {
             Ok(Outcome::Exit)
         }
         Command::Quick(QuickCommand::Run) => {
+            // Started first so the volume walk overlaps the backend probes.
+            let host_facts = host::HostFacts::probe();
             let settings_store = SettingsStore::new(config.settings_path());
             let seed = load_or_seed_settings(&settings_store, &config)?;
             // `quick run` opens no control socket, so nothing ever subscribes to
@@ -389,6 +399,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<Outcome> {
                 shutdown,
                 agent_state,
                 Arc::clone(&handover),
+                host_facts,
             )
             .await?;
             Ok(handover.outcome())

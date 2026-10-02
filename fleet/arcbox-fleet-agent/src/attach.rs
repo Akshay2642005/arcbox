@@ -27,7 +27,7 @@ use crate::backends::Backends;
 use crate::config::AgentConfig;
 use crate::credentials::Credential;
 use crate::handover::{Handover, Reason};
-use crate::host;
+use crate::host::{self, HostFacts};
 use crate::joblog::JobLogs;
 use crate::runner::RunnerSupervisor;
 use crate::state::AgentState;
@@ -176,6 +176,7 @@ pub async fn run(
     shutdown: CancellationToken,
     state: AgentState,
     handover: Arc<Handover>,
+    facts: HostFacts,
 ) -> Result<()> {
     let mut backoff = INITIAL_BACKOFF;
     // Activation notifications; each connection marks the current value
@@ -207,6 +208,7 @@ pub async fn run(
             &shutdown,
             &state,
             &handover,
+            &facts,
         )
         .await;
         // A shutdown during the connection is a clean exit, not a failure to log
@@ -359,6 +361,7 @@ async fn connect_and_serve(
     shutdown: &CancellationToken,
     state: &AgentState,
     handover: &Arc<Handover>,
+    facts: &HostFacts,
 ) -> Result<StreamEnd> {
     // The desired (`target`) gateway, not `config.gateway` directly —
     // `AgentSupervisor` seeds it from config, and an `Enroll` gateway
@@ -389,11 +392,21 @@ async fn connect_and_serve(
     // the client say something, and if the client waits for the response
     // before sending anything the whole stream idle-times-out. The mpsc
     // buffer holds the message until tonic drains it once the stream opens.
+    //
+    // The host facts come from a probe on its own thread, waited for only
+    // briefly (`HostFacts::PROBE_WAIT`): a stalled volume on the host must
+    // neither block a runtime worker nor hold the handshake for its stall.
+    // Nor may that wait outlive a shutdown.
+    let host_info_json = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => return Ok(StreamEnd::Closed),
+        json = facts.json() => json,
+    };
     let attach_msg = AttachRequest {
         msg: Some(attach_request::Msg::Attach(Attach {
             agent_version: env!("CARGO_PKG_VERSION").to_owned(),
             capabilities,
-            host_info_json: host::host_info_json(),
+            host_info_json,
             host_os: host::host_os(),
             host_arch: host::host_arch(),
         })),
@@ -762,6 +775,7 @@ mod tests {
             shutdown.clone(),
             state.clone(),
             handover,
+            HostFacts::probe(),
         ));
 
         // The loop must reach the parked state rather than retry-looping.
@@ -908,6 +922,7 @@ mod tests {
                 &shutdown,
                 &state,
                 &handover,
+                &HostFacts::probe(),
             ),
         )
         .await
@@ -920,11 +935,11 @@ mod tests {
         );
     }
 
-    /// A gateway that accepts every `Attach`, records each handshake's
-    /// capability set, and holds the stream open (draining inbound so
-    /// heartbeats don't backpressure) until the client leaves.
+    /// A gateway that accepts every `Attach`, records each handshake, and
+    /// holds the stream open (draining inbound so heartbeats don't
+    /// backpressure) until the client leaves.
     struct RecordingGateway {
-        attaches: Arc<tokio::sync::Mutex<Vec<Vec<arcbox_fleet_proto::v1::Capability>>>>,
+        attaches: Arc<tokio::sync::Mutex<Vec<Attach>>>,
     }
 
     #[tonic::async_trait]
@@ -956,7 +971,7 @@ mod tests {
             let Some(attach_request::Msg::Attach(attach)) = first.msg else {
                 return Err(tonic::Status::internal("first message was not Attach"));
             };
-            self.attaches.lock().await.push(attach.capabilities);
+            self.attaches.lock().await.push(attach);
 
             let (tx, rx) = mpsc::channel(4);
             let _ = tx
@@ -986,12 +1001,20 @@ mod tests {
         }
     }
 
-    /// The re-attach contract end to end: a backend activating mid-stream
-    /// must make the attach loop leave its live stream and re-attach, with
-    /// the fresh handshake declaring the grown capability set — that
-    /// reconnect is what propagates a capability change to the gateway.
-    #[tokio::test]
-    async fn backend_activation_reattaches_with_fresh_capabilities() {
+    /// Waits until `gateway` has seen `n` Attach handshakes.
+    async fn wait_for_attaches(attaches: &tokio::sync::Mutex<Vec<Attach>>, n: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while attaches.lock().await.len() < n {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("gateway never saw {n} Attach handshakes"));
+    }
+
+    /// Serves a [`RecordingGateway`] on a loopback port; returns its URL
+    /// and the handshakes it records.
+    async fn recording_gateway() -> (String, Arc<tokio::sync::Mutex<Vec<Attach>>>) {
         use arcbox_fleet_proto::v1::fleet_gateway_service_server::FleetGatewayServiceServer;
 
         let attaches = Arc::new(tokio::sync::Mutex::new(Vec::new()));
@@ -1004,6 +1027,16 @@ mod tests {
                 }))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
         );
+        (gateway, attaches)
+    }
+
+    /// The re-attach contract end to end: a backend activating mid-stream
+    /// must make the attach loop leave its live stream and re-attach, with
+    /// the fresh handshake declaring the grown capability set — that
+    /// reconnect is what propagates a capability change to the gateway.
+    #[tokio::test]
+    async fn backend_activation_reattaches_with_fresh_capabilities() {
+        let (gateway, attaches) = recording_gateway().await;
 
         let state = AgentState::new(&PersistedSettings {
             gateway: gateway.clone(),
@@ -1031,24 +1064,13 @@ mod tests {
             shutdown.clone(),
             state,
             handover,
+            HostFacts::probe(),
         ));
-
-        async fn wait_for_attaches(
-            attaches: &tokio::sync::Mutex<Vec<Vec<arcbox_fleet_proto::v1::Capability>>>,
-            n: usize,
-        ) {
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while attaches.lock().await.len() < n {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .unwrap_or_else(|_| panic!("gateway never saw {n} Attach handshakes"));
-        }
 
         // First attach declares the empty startup set.
         wait_for_attaches(&attaches, 1).await;
-        assert!(attaches.lock().await[0].is_empty());
+        let first = attaches.lock().await[0].capabilities.clone();
+        assert_eq!(first, Vec::new());
 
         // Activate the VM backend mid-stream; the loop must re-attach and
         // declare it.
@@ -1059,12 +1081,66 @@ mod tests {
         backends.activate_vm(vm);
 
         wait_for_attaches(&attaches, 2).await;
-        let second = attaches.lock().await[1].clone();
+        let second = attaches.lock().await[1].capabilities.clone();
         assert_eq!(second.len(), 1);
         assert_eq!(
             second[0].backed_by,
             arcbox_fleet_proto::v1::Backend::Vm as i32
         );
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), run_task)
+            .await
+            .expect("attach loop exits on shutdown")
+            .expect("attach task must not panic")
+            .expect("clean exit");
+    }
+
+    /// The host facts probe walks every mounted volume, and a stalled one
+    /// holds it for as long as the stall. The handshake must not wait for
+    /// that: with a probe that never answers, `Attach` still goes out — with
+    /// the facts that answer at once and `disks` left null.
+    #[tokio::test]
+    async fn attach_does_not_wait_for_a_stalled_host_probe() {
+        let (gateway, attaches) = recording_gateway().await;
+
+        let state = AgentState::new(&PersistedSettings {
+            gateway: gateway.clone(),
+            ..seed()
+        });
+        let config = AgentConfig {
+            gateway,
+            ..config()
+        };
+        let backends = Backends::new(false, None, None, None, state.clone());
+        let handover = Handover::new(state.clone());
+        let (supervisor, egress_rx) = spawn_supervisor(
+            &config,
+            Arc::clone(&backends),
+            state.clone(),
+            Arc::clone(&handover),
+        );
+        let shutdown = CancellationToken::new();
+        // Never completed: the probe is stalled for the whole test.
+        let (_stalled, facts) = HostFacts::pending();
+        let run_task = tokio::spawn(run(
+            config,
+            credential(),
+            supervisor,
+            egress_rx,
+            backends,
+            shutdown.clone(),
+            state,
+            handover,
+            facts,
+        ));
+
+        wait_for_attaches(&attaches, 1).await;
+        let facts: serde_json::Value =
+            serde_json::from_str(&attaches.lock().await[0].host_info_json).unwrap();
+        assert!(facts["disks"].is_null(), "{facts}");
+        assert_eq!(facts["arch"], std::env::consts::ARCH);
+        assert_eq!(facts["agent_pid"], std::process::id());
 
         shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(5), run_task)
@@ -1154,6 +1230,8 @@ mod tests {
 
         let config = config();
         let credential = credential();
+        // A stalled probe must not delay the bail-out either.
+        let (_stalled, facts) = HostFacts::pending();
 
         let handover = Handover::new(state.clone());
         let result = tokio::time::timeout(
@@ -1170,6 +1248,7 @@ mod tests {
                 &shutdown,
                 &state,
                 &handover,
+                &facts,
             ),
         )
         .await
