@@ -567,6 +567,60 @@ async fn conflicting_sandbox_cleanup_does_not_remove_the_existing_listener() {
     runtime.stop_port_forwarding_by_id("sandbox:first").await;
 }
 
+/// A VM restart (resize, backend switch) hands the runtime a fresh listener
+/// manager. The previous incarnation's listeners must go with it: they
+/// inject into a datapath that is gone, and they hold the very host ports
+/// the same publishes rebind on the new VM.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_fresh_listener_manager_retires_the_previous_incarnations_listeners() {
+    use arcbox_net::darwin::inbound_relay::{InboundListenerManager, InboundProtocol};
+
+    let (runtime, _tmp) = networking_test_runtime();
+    let localhost = std::net::Ipv4Addr::LOCALHOST;
+
+    // The listener holds its port from here until the retirement, so no
+    // other test can slip onto it in between.
+    let (previous_tx, _previous_rx) = tokio::sync::mpsc::channel(4);
+    let mut previous = InboundListenerManager::new(previous_tx);
+    let host_port = previous
+        .add_rule(localhost, 0, 80, InboundProtocol::Tcp)
+        .await
+        .unwrap();
+    runtime
+        .adopt_inbound_listener_manager("test-machine", previous)
+        .await;
+    runtime.inbound_rules.write().await.insert(
+        "web".to_owned(),
+        (
+            "test-machine".to_owned(),
+            vec![(localhost, 0, InboundProtocol::Tcp)],
+        ),
+    );
+
+    // The VM comes back: its new VMM hands over a manager of its own.
+    let (fresh_tx, _fresh_rx) = tokio::sync::mpsc::channel(4);
+    runtime
+        .adopt_inbound_listener_manager("test-machine", InboundListenerManager::new(fresh_tx))
+        .await;
+
+    let released = std::net::TcpListener::bind((localhost, host_port))
+        .expect("the previous incarnation's listener must have released its port");
+    drop(released);
+    assert!(
+        runtime.inbound_rules.read().await.is_empty(),
+        "no ownership record may outlive the listeners it describes"
+    );
+
+    // And publishing binds again, on the new VM.
+    let publish = [("127.0.0.1".to_owned(), 0u16, 80, "tcp".to_owned())];
+    runtime
+        .start_port_forwarding_for("test-machine", "web", &publish)
+        .await
+        .expect("a publish binds on the new incarnation");
+    runtime.stop_port_forwarding_by_id("web").await;
+}
+
 #[test]
 fn test_runtime_new_propagates_config_vm_defaults() {
     let temp_dir = tempfile::tempdir().unwrap();

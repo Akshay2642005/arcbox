@@ -1290,6 +1290,34 @@ impl Runtime {
         }
     }
 
+    /// Installs the manager the machine's VMM created for the running VM.
+    ///
+    /// A manager already cached under the name belongs to the previous
+    /// incarnation of the VM: its listeners inject into a datapath that no
+    /// longer exists, and they hold the host ports the same publishes need
+    /// on the new VM. It is stopped, and the ownership records that pointed
+    /// at its listeners dropped, before the new manager takes its place.
+    #[cfg(target_os = "macos")]
+    async fn adopt_inbound_listener_manager(
+        &self,
+        machine_name: &str,
+        manager: InboundListenerManager,
+    ) {
+        // Ownership map before the listener map, the order every other
+        // path takes.
+        let mut rules = self.inbound_rules.write().await;
+        let mut listeners = self.inbound_listeners.write().await;
+        if let Some(mut stale) = listeners.insert(machine_name.to_owned(), manager) {
+            tracing::info!(
+                machine = machine_name,
+                listeners = stale.len(),
+                "retiring the previous VM incarnation's inbound listeners"
+            );
+            stale.stop_all().await;
+            rules.retain(|_, (machine, _)| machine != machine_name);
+        }
+    }
+
     /// macOS: add inbound rules via the machine's `InboundListenerManager`.
     #[cfg(target_os = "macos")]
     async fn start_port_forwarding_macos(
@@ -1298,20 +1326,24 @@ impl Runtime {
         container_id: &str,
         bindings: &[(String, u16, u16, String)],
     ) -> Result<()> {
-        // Keep the cached manager for this machine fresh across VM restarts.
+        // A manager the VMM still holds belongs to a VM booted since the
+        // last publish: adopt it, retiring the previous incarnation's.
+        if let Some(manager) = self
+            .machine_manager
+            .take_inbound_listener_manager(machine_name)
         {
-            let mut guard = self.inbound_listeners.write().await;
-            if let Some(manager) = self
-                .machine_manager
-                .take_inbound_listener_manager(machine_name)
-            {
-                guard.insert(machine_name.to_string(), manager);
-            }
-            if !guard.contains_key(machine_name) {
-                return Err(CoreError::Machine(format!(
-                    "inbound listener manager not available for machine '{machine_name}'",
-                )));
-            }
+            self.adopt_inbound_listener_manager(machine_name, manager)
+                .await;
+        }
+        if !self
+            .inbound_listeners
+            .read()
+            .await
+            .contains_key(machine_name)
+        {
+            return Err(CoreError::Machine(format!(
+                "inbound listener manager not available for machine '{machine_name}'",
+            )));
         }
 
         // Remove previously tracked listeners for this container before
