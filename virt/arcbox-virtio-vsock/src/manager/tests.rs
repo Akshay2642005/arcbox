@@ -79,7 +79,7 @@ fn connected_fds_only_returns_connected() {
     let (id1, _rx1) = mgr.allocate(1024, 3, internal1);
     let (_id2, _rx2) = mgr.allocate(1024, 3, internal2);
 
-    assert!(mgr.connected_fds().is_empty());
+    assert_eq!(mgr.connected_fds(), []);
 
     mgr.mark_connected(id1.guest_port, id1.host_port);
     let fds = mgr.connected_fds();

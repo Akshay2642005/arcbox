@@ -284,7 +284,7 @@ mod tests {
         assert_eq!(uart.output().len(), 2);
         // Newline flushes the buffer.
         uart.write(PL011_BASE + PL011_DR, 1, b'\n' as u64);
-        assert!(uart.output().is_empty());
+        assert_eq!(uart.output(), b"");
     }
 
     #[test]
@@ -304,7 +304,7 @@ mod tests {
         uart.write(PL011_BASE + PL011_DR, 1, b'X' as u64);
         assert_eq!(uart.output().len(), 1);
         uart.flush();
-        assert!(uart.output().is_empty());
+        assert_eq!(uart.output(), b"");
     }
 
     #[test]

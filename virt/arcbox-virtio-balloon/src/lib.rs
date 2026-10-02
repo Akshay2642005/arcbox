@@ -737,7 +737,7 @@ mod tests {
             gpa_base: 0,
         };
         let c = b.process_queue(QUEUE_INFLATE, &mut ram, &qc).unwrap();
-        assert!(c.is_empty());
+        assert_eq!(c, []);
     }
 
     #[test]
@@ -753,6 +753,6 @@ mod tests {
             gpa_base: 0,
         };
         let c = b.process_queue(42, &mut ram, &qc).unwrap();
-        assert!(c.is_empty());
+        assert_eq!(c, []);
     }
 }

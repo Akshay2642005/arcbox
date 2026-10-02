@@ -643,7 +643,7 @@ mod tests {
     fn test_dns_config_default() {
         let config = DnsConfig::default();
         assert_eq!(config.listen_addr.port(), DNS_PORT);
-        assert!(!config.upstream.is_empty());
+        assert_ne!(config.upstream, []);
     }
 
     #[test]

@@ -262,7 +262,7 @@ nameserver 10.0.0.2
     #[test]
     fn parse_returns_empty_when_only_fake_ip_is_listed() {
         let conf = "nameserver 198.18.0.2\nnameserver 198.19.1.1\n";
-        assert!(parse_resolv_conf_nameservers(conf).is_empty());
+        assert_eq!(parse_resolv_conf_nameservers(conf), []);
     }
 
     #[test]

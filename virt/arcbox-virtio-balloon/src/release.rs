@@ -198,7 +198,7 @@ mod tests {
             pfn_runs(&pfns),
             vec![2 * p..4 * p, 5 * p..8 * p, 9 * p..10 * p]
         );
-        assert!(pfn_runs(&[]).is_empty());
+        assert_eq!(pfn_runs(&[]), []);
     }
 
     /// Page-aligned scratch mapping standing in for guest RAM.

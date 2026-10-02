@@ -249,7 +249,7 @@ fn test_process_tx_queue_empty() {
 
     let mut memory = vec![0u8; 4096];
     let completions = vsock.process_tx_queue(&mut memory).unwrap();
-    assert!(completions.is_empty());
+    assert_eq!(completions, []);
 }
 
 #[test]
@@ -402,7 +402,7 @@ fn test_process_queue_dispatches_tx() {
     let mut memory = vec![0u8; 4096];
 
     let completions = vsock.process_queue(1, &mut memory).unwrap();
-    assert!(completions.is_empty());
+    assert_eq!(completions, []);
 }
 
 #[test]
@@ -412,11 +412,11 @@ fn test_process_queue_unknown_index() {
 
     let mut memory = vec![0u8; 1024];
     let completions = vsock.process_queue(0, &mut memory).unwrap();
-    assert!(completions.is_empty());
+    assert_eq!(completions, []);
     let completions = vsock.process_queue(2, &mut memory).unwrap();
-    assert!(completions.is_empty());
+    assert_eq!(completions, []);
     let completions = vsock.process_queue(99, &mut memory).unwrap();
-    assert!(completions.is_empty());
+    assert_eq!(completions, []);
 }
 
 #[test]
