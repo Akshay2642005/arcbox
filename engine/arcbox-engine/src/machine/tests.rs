@@ -929,3 +929,59 @@ async fn export_refuses_a_running_machine_and_stale_staging_is_swept() {
     assert!(!stale.exists());
     assert!(manager.get("dev").is_some());
 }
+
+#[tokio::test]
+async fn resize_applies_to_the_next_start_and_says_when_a_restart_is_needed() {
+    let temp_dir = tempdir().unwrap();
+    let manager = test_machine_manager(temp_dir.path());
+    let machine = create_shimmed(&manager, temp_dir.path(), "dev").await;
+
+    // Stopped: the new size is what the next start builds the VM from.
+    let resized = manager.set_resources("dev", Some(3), None).unwrap();
+    assert_eq!(
+        resized,
+        MachineResize {
+            cpus: 3,
+            memory_mb: 1536,
+            restart_required: false
+        }
+    );
+    let vm = manager.vm_manager.get(&machine.vm_id).unwrap();
+    assert_eq!((vm.cpus, vm.memory_mb), (3, 1536));
+    let persisted = manager.persistence.load("dev").unwrap();
+    assert_eq!((persisted.cpus, persisted.memory_mb), (3, 1536));
+    assert_eq!(manager.get("dev").unwrap().cpus, 3);
+
+    // Running: recorded for the next start, and the caller is told so.
+    manager
+        .machines
+        .write()
+        .unwrap()
+        .get_mut("dev")
+        .unwrap()
+        .state = MachineState::Running;
+    let resized = manager.set_resources("dev", None, Some(2048)).unwrap();
+    assert!(resized.restart_required);
+    assert_eq!((resized.cpus, resized.memory_mb), (3, 2048));
+    assert_eq!(manager.persistence.load("dev").unwrap().memory_mb, 2048);
+    // The same size again is a no-op, but a running machine still has to
+    // restart to pick up what was set before.
+    assert!(
+        manager
+            .set_resources("dev", Some(3), Some(2048))
+            .unwrap()
+            .restart_required
+    );
+
+    assert!(manager.set_resources("dev", Some(0), None).is_err());
+    assert!(manager.set_resources("nope", Some(1), None).is_err());
+    manager
+        .machines
+        .write()
+        .unwrap()
+        .get_mut("dev")
+        .unwrap()
+        .state = MachineState::Stopping;
+    let err = manager.set_resources("dev", Some(1), None).unwrap_err();
+    assert!(err.to_string().contains("Stopping"), "{err}");
+}

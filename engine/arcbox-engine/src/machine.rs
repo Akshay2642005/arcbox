@@ -99,6 +99,18 @@ pub struct MachineInfo {
     pub mounts: Vec<MachineMount>,
 }
 
+/// The outcome of [`MachineManager::set_resources`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MachineResize {
+    /// vCPUs the machine boots with from now on.
+    pub cpus: u32,
+    /// Memory the machine boots with from now on, in MiB.
+    pub memory_mb: u64,
+    /// The machine is running with its previous size; the new one applies
+    /// when it is next started.
+    pub restart_required: bool,
+}
+
 /// A pulled distro rootfs image a machine boots from.
 #[derive(Debug, Clone)]
 pub struct MachineRootfs {
@@ -1417,6 +1429,74 @@ impl MachineManager {
         self.vm_manager.reboot(&vm_id)?;
         tracing::info!("Rebooted machine '{}'", name);
         Ok(())
+    }
+
+    /// Sets the CPU and memory a machine boots with; `None` keeps the
+    /// current value.
+    ///
+    /// The new size is written to the VM config and the persisted record
+    /// right away. A stopped machine boots with it next; a running machine
+    /// keeps the size it booted with, and the result says a restart is
+    /// needed. Persisting before the restart is deliberate: a size the user
+    /// set and the daemon forgot on its next start would be worse than one
+    /// it refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the machine is not found, is starting or
+    /// stopping, a value is zero, or the record cannot be persisted.
+    pub fn set_resources(
+        &self,
+        name: &str,
+        cpus: Option<u32>,
+        memory_mb: Option<u64>,
+    ) -> Result<MachineResize> {
+        let mut machines = self
+            .machines
+            .write()
+            .map_err(|_| EngineError::LockPoisoned)?;
+        let machine = machines
+            .get_mut(name)
+            .ok_or_else(|| EngineError::not_found(name.to_string()))?;
+        if matches!(
+            machine.state,
+            MachineState::Starting | MachineState::Stopping
+        ) {
+            return Err(EngineError::invalid_state(format!(
+                "cannot resize machine '{name}' while it is {:?}",
+                machine.state
+            )));
+        }
+        let cpus = cpus.unwrap_or(machine.cpus);
+        let memory_mb = memory_mb.unwrap_or(machine.memory_mb);
+        if cpus == 0 || memory_mb == 0 {
+            return Err(EngineError::config(
+                "a machine needs at least one CPU and some memory",
+            ));
+        }
+        let restart_required = machine.state == MachineState::Running;
+        if (cpus, memory_mb) != (machine.cpus, machine.memory_mb) {
+            self.vm_manager
+                .set_resources(&machine.vm_id, cpus, memory_mb)?;
+            machine.cpus = cpus;
+            machine.memory_mb = memory_mb;
+            self.persistence.update(name, |m| {
+                m.cpus = cpus;
+                m.memory_mb = memory_mb;
+            })?;
+            tracing::info!(
+                machine = name,
+                cpus,
+                memory_mb,
+                restart_required,
+                "machine resized"
+            );
+        }
+        Ok(MachineResize {
+            cpus,
+            memory_mb,
+            restart_required,
+        })
     }
 
     /// Switches a stopped machine's hypervisor backend.
