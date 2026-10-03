@@ -5,8 +5,9 @@
 //! there, commits, and later reads the result back a piece at a time. The
 //! image of each such file lives here between those steps, keyed by the
 //! sidecar's handle. One with writes not yet applied to its target is
-//! *dirty*: the write side applies it on `COMMIT`, on a stable write, and
-//! when it is retired, once it parses as a whole and the target exists. A
+//! *dirty*: the write side applies it on `COMMIT`, once its writes pause,
+//! and when it is retired, once it parses as a whole and the target
+//! exists. A
 //! dirty image whose target is not there yet — `cp -R` of a volume with
 //! real `._` files writes the sidecar before the file it belongs to — waits
 //! for the target until [`PENDING_TTL`] passes. A clean image is a cache
