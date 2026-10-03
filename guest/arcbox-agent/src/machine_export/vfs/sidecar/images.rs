@@ -43,6 +43,13 @@ pub struct Image {
     /// Bumped by every write, so an apply that raced one does not mark
     /// the image clean.
     pub generation: u64,
+    /// The generation last applied to a target that was not there: no
+    /// use trying again until the Mac writes more.
+    pub tried: Option<u64>,
+    /// Born from a `CREATE`: the Mac believes the sidecar is new and
+    /// writes only what it is adding, so the image is merged into the
+    /// target's attributes rather than replacing them.
+    pub merge: bool,
     last_used: Instant,
 }
 
@@ -55,7 +62,8 @@ pub struct Facts {
 }
 
 impl Image {
-    /// An image of `bytes` as they stand on the target: clean.
+    /// An image of `bytes` as they stand on the target: clean, and the
+    /// whole truth, so a rewrite of it replaces the target's attributes.
     pub fn synthesized(bytes: Vec<u8>, modified: SystemTime, now: Instant) -> Self {
         Self {
             bytes,
@@ -63,12 +71,15 @@ impl Image {
             modified,
             dirty: false,
             generation: 0,
+            tried: None,
+            merge: false,
             last_used: now,
         }
     }
 
     /// An image not yet on its target: dirty, so that one never written
-    /// stays out of the target and one holding content reaches it.
+    /// stays out of the target and one holding content reaches it — merged
+    /// when it does, since the Mac never saw what the target has.
     pub fn pending(bytes: Vec<u8>, now: Instant) -> Self {
         Self {
             bytes,
@@ -76,6 +87,8 @@ impl Image {
             modified: SystemTime::now(),
             dirty: true,
             generation: 0,
+            tried: None,
+            merge: true,
             last_used: now,
         }
     }
@@ -134,6 +147,16 @@ impl Images {
         let image = self.by_id.get_mut(&id)?;
         image.last_used = now;
         Some(image)
+    }
+
+    /// The image under `id` without counting a use: for the write side's
+    /// own bookkeeping, which must not keep an image alive.
+    pub fn peek(&self, id: u64) -> Option<&Image> {
+        self.by_id.get(&id)
+    }
+
+    pub fn peek_mut(&mut self, id: u64) -> Option<&mut Image> {
+        self.by_id.get_mut(&id)
     }
 
     /// Puts `image` under `id`, replacing what was there, and makes room
@@ -198,6 +221,20 @@ impl Images {
         Ok(image)
     }
 
+    /// The dirty images with writes not yet tried against their targets
+    /// and no write for `idle`: due to be applied where they are.
+    pub fn due(&self, now: Instant, idle: Duration) -> Vec<u64> {
+        self.by_id
+            .iter()
+            .filter(|(_, image)| {
+                image.dirty
+                    && image.tried != Some(image.generation)
+                    && now.saturating_duration_since(image.last_used) >= idle
+            })
+            .map(|(&id, _)| id)
+            .collect()
+    }
+
     /// Takes out every image that is due at `now`, dirty ones included, so
     /// the caller can apply what it still can.
     pub fn retire(&mut self, now: Instant) -> Vec<(u64, Image)> {
@@ -207,10 +244,12 @@ impl Images {
             .filter(|(_, image)| image.expired(now))
             .map(|(&id, _)| id)
             .collect();
-        let mut retired: Vec<(u64, Image)> = due
-            .into_iter()
-            .filter_map(|id| self.remove(id).map(|image| (id, image)))
-            .collect();
+        let mut retired = Vec::with_capacity(due.len());
+        for id in due {
+            if let Some(image) = self.remove(id) {
+                retired.push((id, image));
+            }
+        }
         retired.extend(self.evict(now, None));
         retired
     }
@@ -296,9 +335,19 @@ mod tests {
             start,
         );
         images.insert(2, Image::fresh(start), start);
+        let second = Duration::from_secs(1);
+        assert!(images.due(start, second).is_empty());
+        assert_eq!(images.due(start + second, second), [2]);
+        images.get_mut(2, start).unwrap().tried = Some(0);
+        assert!(
+            images.due(start + second, second).is_empty(),
+            "tried at this generation"
+        );
+        images.write(2, 0, b"x", start).unwrap();
+        assert_eq!(images.due(start + second, second), [2]);
         assert!(
             images
-                .retire(start + CLEAN_TTL - Duration::from_millis(1))
+                .retire(start + (CLEAN_TTL - Duration::from_millis(1)))
                 .is_empty()
         );
         let retired = images.retire(start + CLEAN_TTL);
