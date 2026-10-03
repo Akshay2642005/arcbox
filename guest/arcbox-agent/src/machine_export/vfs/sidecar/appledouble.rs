@@ -326,3 +326,162 @@ fn parse_attrs(image: &[u8], finder_end: usize) -> Result<Vec<Attr>, ParseError>
     Ok(attrs)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `._x` as macOS 26 wrote it on a FAT volume after `xattr -w user.note
+    /// hi x` and a Finder tag: `com.apple.provenance` came for free.
+    const ATTRS_ONLY: &[u8] = include_bytes!("testdata/attrs-only.appledouble");
+    /// The same file after `xattr -wx com.apple.FinderInfo …` with the
+    /// custom-icon bit and `xattr -w com.apple.ResourceFork <1336 bytes>`.
+    const WITH_FORK: &[u8] = include_bytes!("testdata/with-fork.appledouble");
+
+    fn names(parsed: &AppleDouble) -> Vec<&str> {
+        parsed
+            .attrs
+            .iter()
+            .map(|attr| std::str::from_utf8(&attr.name).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn parses_what_the_mac_writes() {
+        let parsed = AppleDouble::parse(ATTRS_ONLY).unwrap();
+        assert_eq!(parsed.finder_info, None, "all-zero Finder Info is none");
+        assert_eq!(parsed.resource_fork, None, "the placeholder fork is none");
+        assert_eq!(
+            names(&parsed),
+            [
+                "com.apple.provenance",
+                "user.note",
+                "com.apple.metadata:_kMDItemUserTags"
+            ]
+        );
+        assert_eq!(parsed.attrs[0].value.len(), 11);
+        assert_eq!(parsed.attrs[1].value, b"hi");
+        assert!(parsed.attrs[2].value.starts_with(b"<plist"));
+    }
+
+    #[test]
+    fn parses_finder_info_and_a_resource_fork() {
+        let parsed = AppleDouble::parse(WITH_FORK).unwrap();
+        let info = parsed.finder_info.unwrap();
+        assert_eq!(&info[8..10], &[0x04, 0x00], "kHasCustomIcon");
+        assert_eq!(parsed.resource_fork.as_ref().unwrap().len(), 1336);
+        assert_eq!(names(&parsed).len(), 3);
+    }
+
+    #[test]
+    fn round_trips_through_its_own_layout() {
+        let mut info = [0u8; FINDER_INFO_LEN];
+        info[9] = 0x10;
+        let original = AppleDouble {
+            finder_info: Some(info),
+            resource_fork: Some(vec![7u8; 100_000]),
+            attrs: vec![
+                Attr {
+                    name: b"com.apple.provenance".to_vec(),
+                    value: vec![1, 2, 3],
+                },
+                Attr {
+                    name: b"user.note".to_vec(),
+                    value: b"hi".to_vec(),
+                },
+                Attr {
+                    name: b"empty".to_vec(),
+                    value: Vec::new(),
+                },
+            ],
+        };
+        let image = original.to_bytes();
+        assert_eq!(AppleDouble::parse(&image).unwrap(), original);
+
+        let empty = AppleDouble::default();
+        let image = empty.to_bytes();
+        assert_eq!(image.len(), ATTR_ENTRIES_OFFSET, "header only");
+        assert!(AppleDouble::parse(&image).unwrap().is_empty());
+
+        // What the Mac wrote survives a round trip through our layout.
+        let reparsed =
+            AppleDouble::parse(&AppleDouble::parse(WITH_FORK).unwrap().to_bytes()).unwrap();
+        assert_eq!(reparsed, AppleDouble::parse(WITH_FORK).unwrap());
+    }
+
+    #[test]
+    fn a_partial_image_is_incomplete_and_garbage_is_invalid() {
+        for cut in [0, 10, 25, 40, 83, 119, 300, 3809, 5000] {
+            assert_eq!(
+                AppleDouble::parse(&WITH_FORK[..cut]),
+                Err(ParseError::Incomplete),
+                "cut at {cut}"
+            );
+        }
+        assert_eq!(
+            AppleDouble::parse(WITH_FORK)
+                .unwrap()
+                .resource_fork
+                .map(|f| f.len()),
+            Some(1336)
+        );
+        assert!(matches!(
+            AppleDouble::parse(&[0xffu8; 200]),
+            Err(ParseError::Invalid(_))
+        ));
+        let mut wrong_version = ATTRS_ONLY.to_vec();
+        wrong_version[7] = 1;
+        assert!(matches!(
+            AppleDouble::parse(&wrong_version),
+            Err(ParseError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_tables_that_contradict_themselves() {
+        // The resource fork entry moved onto the Finder Info entry.
+        let mut overlapping = ATTRS_ONLY.to_vec();
+        overlapping[42..46].copy_from_slice(&50u32.to_be_bytes());
+        assert_eq!(
+            AppleDouble::parse(&overlapping),
+            Err(ParseError::Invalid("entries overlap"))
+        );
+        // No entries at all.
+        let mut none = ATTRS_ONLY.to_vec();
+        none[24..26].copy_from_slice(&0u16.to_be_bytes());
+        assert_eq!(
+            AppleDouble::parse(&none),
+            Err(ParseError::Invalid("entry count out of range"))
+        );
+        // An attribute value pointing past the data area.
+        let mut outside = ATTRS_ONLY.to_vec();
+        outside[120..124].copy_from_slice(&4000u32.to_be_bytes());
+        assert_eq!(
+            AppleDouble::parse(&outside),
+            Err(ParseError::Invalid("attribute value outside the data area"))
+        );
+        // A name whose NUL is missing.
+        let mut unterminated = ATTRS_ONLY.to_vec();
+        unterminated[120 + 11 + 20] = b'x';
+        assert!(matches!(
+            AppleDouble::parse(&unterminated),
+            Err(ParseError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn the_magic_is_recognised_from_its_first_bytes() {
+        assert!(AppleDouble::has_magic(b""));
+        assert!(AppleDouble::has_magic(&[0x00, 0x05]));
+        assert!(AppleDouble::has_magic(ATTRS_ONLY));
+        assert!(!AppleDouble::has_magic(b"just text\n"));
+        assert!(!AppleDouble::has_magic(&[0x00, 0x05, 0x16, 0x08]));
+    }
+
+    #[test]
+    fn entries_are_padded_to_four_bytes_like_xnu() {
+        assert_eq!(entry_len(21), 32, "com.apple.provenance");
+        assert_eq!(entry_len(10), 24, "user.note");
+        assert_eq!(entry_len(36), 48, "com.apple.metadata:_kMDItemUserTags");
+        assert_eq!(ATTR_ENTRIES_OFFSET, 120);
+    }
+}
