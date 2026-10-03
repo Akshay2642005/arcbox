@@ -128,6 +128,15 @@ non-obvious invariants and failure signatures.
   every running machine hourly; the agent issues the ioctl
   (`agent/linux/disk.rs`) and runs no loop of its own. The rootfs ships no
   `fstrim` binary — never shell out to it.
+  The one service a distro machine's agent does run is its root export,
+  and only on request: `EnsureMachineExport` starts an `nfs3_server` on
+  `127.0.0.1:0` and a relay on `<bridge ip>:0` that admits the host
+  addresses named in the request and drops every other peer
+  (`machine_export/server.rs`). It takes no well-known port and no file a
+  distro service may want (the kernel's nfsd would claim 2049 and
+  `/etc/exports`); the System VM answers the RPC with `EINVAL`, and a
+  machine whose bridge NIC has no address yet answers `EAGAIN` so the host
+  retries.
 - **A distro machine's identity and second NIC are `machine-init`'s, set up
   before the distro's init runs** (`init.rs`, `machine_identity.rs`,
   `boot_done.rs`). The hostname arrives as `arcbox.machine_name=` on the

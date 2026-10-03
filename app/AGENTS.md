@@ -207,13 +207,49 @@ Covers `arcbox-daemon` (startup/shutdown), `arcbox-core` (`vm_lifecycle`),
   `.git/HEAD`, so a rebuild that changes no package source file reuses the
   cached SHA — a new commit alone logs a STALE sha (the build.rs comment
   claiming it stays "fresh" holds only when a package file also changed).
-- Daemon logs "ArcBox daemon stopped" but the process never exits, typically
-  after a VM restart (resize, backend switch). First: look for a `mount_nfs`
-  child of the daemon. Likely cause: the `~/ArcBox` remount
-  (`nfs_mount::run_mount`) runs `mount_nfs` in `spawn_blocking` with no
-  per-attempt timeout (`MOUNT_TIMEOUT` bounds only the retries between
-  attempts), so a hung `mount_nfs` holds a blocking thread the runtime waits
-  for at exit; killing the child lets the daemon exit (open).
+- Daemon logs "ArcBox daemon stopped" but the process never exits. First:
+  look for a `mount_nfs` or `umount` child of the daemon. Likely cause: a
+  new call site runs one of them outside `host_mount`. Both the `~/ArcBox`
+  export and the machine mounts go through `host_mount`, where each is a
+  tokio child bounded by `MOUNT_ATTEMPT_TIMEOUT` (20 s per attempt) or
+  `UNMOUNT_TIMEOUT` (5 s) with `kill_on_drop`; the old `spawn_blocking`
+  remount with no per-attempt bound was this signature (fixed 2026-10-03).
+- Daemon never logs "ArcBox daemon stopped" after the VM stopped. First:
+  sample the daemon for a thread inside `stat`/`getattrlist`. Likely cause:
+  something `stat`'d an NFS mount point whose server is gone
+  (`canonicalize`, `metadata`, `exists` on `~/ArcBox` or a machine mount),
+  which blocks until the mount's `deadtimeout`. Resolve a mount point with
+  `host_mount::current_mount_info`, which reads the mount table and never
+  touches the point, and escalate to `umount -f` when a plain `umount` is
+  refused (`3044b3f7`, 2026-10-03).
+
+## Machine root mounts
+
+- **A running distro machine's `/` is mounted read-write on the host**, at
+  `~/ArcBoxMachines/<name>` (`ARCBOX_MACHINE_MOUNT_DIR` moves the root; the
+  e2e harness and the dev daemons point it into their data dir), by
+  `arcbox-daemon/src/machine_mount`. The agent serves NFSv3 from an
+  `nfs3_server` in its own process and the host's NFS client reaches it
+  over the bridge NIC, not a vsock relay (ADR 0002). `mount_machine` and
+  `unmount_machine` are the only entry points and both are idempotent; the
+  loop follows the event bus the way `machine_dns` does and re-derives the
+  mount set from the machine records, so one pass repairs a lagged receiver.
+- `Event::MachineStopping { name }` is internal: `stop`, `graceful_stop`
+  and `remove` publish it before the VM goes down so the unmount still
+  reaches a live server, and it is not mapped onto the public event stream.
+  Daemon shutdown unmounts everything before it stops the machines for the
+  same reason. A release can fail (the client still has requests in flight,
+  seen 2026-10-04); the entry then stays in the registry and a background
+  task retries past the mount's `deadtimeout` (60 s). Entries carry a
+  generation so a retry never unmounts a newer incarnation of the name.
+- The export hides `/arcbox` (ArcBox's own VirtioFS shares) and keeps the
+  Mac's AppleDouble `._` sidecars out of the machine
+  (`guest/arcbox-agent/src/machine_export/vfs/sidecar.rs`): macOS cannot
+  store an xattr on NFSv3 and stamps `com.apple.provenance` on every file a
+  downloaded app writes, so without that every host write littered the
+  machine with `._*` files and git took a `._pack-*.idx` for a pack index.
+  Regression signature: `ls -a` inside the machine shows `._` files next to
+  files the Mac wrote.
 
 ## Backend transport & agent
 
@@ -422,6 +458,30 @@ Covers `arcbox-daemon` (startup/shutdown), `arcbox-core` (`vm_lifecycle`),
   `handle_watch_readiness`) emits `RuntimeFailed` at exactly its own
   deadline, which equals the host's recv deadline, so the host can drop the
   stream before the failure detail lands (ABX-414).
+- **Clone, export and import act on a stopped machine's `data.img` and
+  nothing else** (`engine/arcbox-engine/src/machine/{clone,transfer}.rs`,
+  `machine/archive/`). The rootfs is a shared read-only image, so a clone
+  is one `clonefile(2)`; export snapshots the disk the same way under the
+  registry lock and writes the archive from the snapshot without it; import
+  restores into `machines/.import-*` and moves the disk into place under
+  the lock like `create` (`.export-*`/`.import-*` leftovers are swept when
+  the manager starts). A running machine is refused: its btrfs volume has
+  dirty pages the host cannot see and no quiesce path through the agent.
+  The archive is a `.tar.zst` with `manifest.json` first (the settings plus
+  the `MachineImageManifest` of the image it boots) and `data.img` as a
+  hand-written GNU sparse 1.0 entry, so a mostly-empty disk costs its
+  extents, not its size. Import needs the same image (distro, version,
+  rootfs digest, this host's arch) in the local image registry and never
+  pulls. A clone or an import gets its own `arcbox.machine_name=` on the
+  cmdline, which the guest applies on every boot (`machine_identity`), so
+  the source's name never leaks through the overlay's `/etc/hostname`.
+- `MachineManager::set_resources` writes the new CPU/memory to the VM config
+  and the persisted record at once; a stopped machine boots with it next, a
+  running one keeps its size and the result says `restart_required`. It
+  restarts nothing. The default machine is `[machine] default_machine` in
+  the user's `config.toml` (`config::persist::set_default_machine`, in
+  place via `toml_edit`), and the CLI's optional `[NAME]` resolves to it
+  (`arcbox-cli/src/commands/machine/target.rs`).
 
 ## Docker proxy ↔ lifecycle contract (cross-crate)
 

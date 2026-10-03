@@ -136,12 +136,17 @@ run fails, and which paths must change together.
 - Guest cannot reach docker.io -> point `ARCBOX_E2E_IMAGE` at a reachable
   mirror instead of weakening the test.
 - The test body passes, then the process hangs in `TempDir::drop`
-  (`remove_dir_all` → `openat` under `<data_dir>/ArcBox`) -> the `~/ArcBox`
-  NFS view outlived its daemon. For a data dir under `/var/folders`,
-  `nfs_mount::current_mount_info` compares the requested path with the
-  kernel's `/private/var/folders/...` mountpoint, never matches, and the
-  daemon never unmounts it (open). `KEEP_TEST_DIR=1` sidesteps the removal;
-  the run's `metrics.json` lives in that data dir, so a killed run loses it.
+  (`remove_dir_all` → `openat` under `<data_dir>/ArcBox` or
+  `<data_dir>/ArcBoxMachines/<name>`) -> an NFS view outlived its daemon.
+  Fixed 2026-10-03 (`3044b3f7`): the daemon resolves a mount point with
+  `host_mount::current_mount_info`, which reads the mount table instead of
+  `stat`'ing the point (the old path compared the requested
+  `/var/folders/...` path with the kernel's `/private/var/folders/...`
+  mountpoint and never matched), and escalates to `umount -f` when the
+  plain unmount is refused. The `machine` e2e asserts the machine's mount
+  point is gone after stop; a recurrence is a new unmount path that bypasses
+  `host_mount`. `KEEP_TEST_DIR=1` still sidesteps the removal; the run's
+  `metrics.json` lives in that data dir, so a killed run loses it.
 - A unit test that writes more than 512 bytes into a pipe before anything
   reads it can hang forever on a loaded host: XNU shrinks new pipe buffers
   under pipe-memory pressure (512 bytes measured 2026-09-29 with ~4300
