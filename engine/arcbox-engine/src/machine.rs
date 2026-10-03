@@ -39,10 +39,13 @@ pub enum MachineState {
     Stopped,
 }
 
+mod clone;
 #[cfg(target_os = "macos")]
 mod serial;
 #[cfg(test)]
 mod tests;
+
+pub use clone::clone_file;
 
 /// Machine information.
 #[derive(Debug, Clone)]

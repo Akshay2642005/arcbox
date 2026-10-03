@@ -635,3 +635,162 @@ async fn a_name_whose_hostname_another_machine_has_is_refused() {
         .await
         .unwrap();
 }
+
+/// A shim-booted distro machine with a data disk that holds some data, the
+/// shape clone and export act on.
+async fn create_shimmed(
+    manager: &MachineManager,
+    dir: &std::path::Path,
+    name: &str,
+) -> MachineInfo {
+    let rootfs_img = dir.join("rootfs.squashfs");
+    std::fs::write(&rootfs_img, b"squash").unwrap();
+    manager
+        .create(MachineConfig {
+            name: name.to_string(),
+            cpus: 2,
+            memory_mb: 1536,
+            disk_gb: 1,
+            distro: Some("alpine".to_string()),
+            distro_version: Some("3.24".to_string()),
+            rootfs: Some(MachineRootfs {
+                path: rootfs_img,
+                format: "squashfs".to_string(),
+                shim: Some(BootShim {
+                    kernel: dir.join("kernel"),
+                    rootfs: dir.join("shim.erofs"),
+                }),
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let machine = manager.get(name).unwrap();
+    // Some blocks in the middle of the sparse disk, like a guest would leave.
+    let disk = std::fs::OpenOptions::new()
+        .write(true)
+        .open(machine.disk_path.as_ref().unwrap())
+        .unwrap();
+    std::os::unix::fs::FileExt::write_all_at(&disk, &[0xAB; 8192], 4 * 1024 * 1024).unwrap();
+    machine
+}
+
+#[tokio::test]
+async fn a_clone_gets_its_own_identity_and_the_sources_data() {
+    let temp_dir = tempdir().unwrap();
+    let manager = test_machine_manager(temp_dir.path());
+    let source = create_shimmed(&manager, temp_dir.path(), "src_box").await;
+
+    assert_eq!(manager.clone_machine("src_box", "copy").unwrap(), "copy");
+    let clone = manager.get("copy").unwrap();
+
+    assert_eq!(clone.state, MachineState::Created);
+    assert_ne!(clone.vm_id, source.vm_id, "a clone is its own VM");
+    assert_eq!((clone.cpus, clone.memory_mb, clone.disk_gb), (2, 1536, 1));
+    assert_eq!(clone.distro.as_deref(), Some("alpine"));
+    assert_eq!(clone.kernel, source.kernel);
+
+    // Its own data disk, holding the source's blocks, in its own directory.
+    let disk = clone.disk_path.clone().unwrap();
+    assert_eq!(disk, temp_dir.path().join("machines/copy/data.img"));
+    assert_eq!(
+        std::fs::read(&disk).unwrap(),
+        std::fs::read(source.disk_path.as_ref().unwrap()).unwrap()
+    );
+    assert_eq!(clone.block_devices.len(), 3);
+    assert_eq!(clone.block_devices[2].path, disk.to_string_lossy());
+    assert_eq!(clone.block_devices[1].path, source.block_devices[1].path);
+
+    // The guest is told the clone's name, not the source's.
+    let cmdline = clone.cmdline.as_deref().unwrap();
+    let name_token = format!("{}copy", arcbox_constants::cmdline::MACHINE_NAME_KEY);
+    assert!(
+        cmdline.split_whitespace().any(|t| t == name_token),
+        "{cmdline}"
+    );
+    assert!(!cmdline.contains("src-box"), "{cmdline}");
+
+    // Persisted, so it survives a daemon restart.
+    let persisted = manager.persistence.load("copy").unwrap();
+    assert_eq!(
+        persisted.disk_path.as_deref(),
+        Some(&*disk.to_string_lossy())
+    );
+    assert_eq!(persisted.cmdline.as_deref(), Some(cmdline));
+}
+
+#[tokio::test]
+async fn clone_refuses_running_sources_taken_names_and_plain_vms() {
+    let temp_dir = tempdir().unwrap();
+    let manager = test_machine_manager(temp_dir.path());
+    create_shimmed(&manager, temp_dir.path(), "src").await;
+    manager
+        .create(MachineConfig {
+            name: "pl_ain".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let taken = manager.clone_machine("src", "pl_ain").unwrap_err();
+    assert!(matches!(taken, EngineError::Common(ref c) if c.is_already_exists()));
+    let same_hostname = manager.clone_machine("src", "pl.ain").unwrap_err();
+    assert!(
+        same_hostname.to_string().contains("hostname"),
+        "{same_hostname}"
+    );
+
+    let missing = manager.clone_machine("nope", "copy").unwrap_err();
+    assert!(matches!(missing, EngineError::Common(ref c) if c.is_not_found()));
+
+    let no_disk = manager.clone_machine("pl_ain", "copy").unwrap_err();
+    assert!(no_disk.to_string().contains("data disk"), "{no_disk}");
+
+    manager
+        .machines
+        .write()
+        .unwrap()
+        .get_mut("src")
+        .unwrap()
+        .state = MachineState::Running;
+    let running = manager.clone_machine("src", "copy").unwrap_err();
+    assert!(running.to_string().contains("stop it first"), "{running}");
+    assert!(manager.get("copy").is_none());
+    assert!(!temp_dir.path().join("machines/copy").exists());
+}
+
+#[test]
+fn cmdline_with_hostname_replaces_the_name_token_or_adds_one() {
+    let key = arcbox_constants::cmdline::MACHINE_NAME_KEY;
+    assert_eq!(
+        clone::cmdline_with_hostname(&format!("console=hvc0 {key}old quiet"), "new"),
+        format!("console=hvc0 {key}new quiet")
+    );
+    assert_eq!(
+        clone::cmdline_with_hostname("console=hvc0 quiet", "new"),
+        format!("console=hvc0 quiet {key}new")
+    );
+}
+
+#[test]
+fn clone_file_keeps_the_image_sparse() {
+    let temp_dir = tempdir().unwrap();
+    let src = temp_dir.path().join("data.img");
+    let dst = temp_dir.path().join("copy.img");
+    let file = std::fs::File::create(&src).unwrap();
+    file.set_len(256 * 1024 * 1024).unwrap();
+    std::os::unix::fs::FileExt::write_all_at(&file, &vec![7u8; 1 << 20], 100 << 20).unwrap();
+    drop(file);
+
+    clone_file(&src, &dst).unwrap();
+    assert_eq!(std::fs::read(&src).unwrap(), std::fs::read(&dst).unwrap());
+    // A clone of a sparse image shares its blocks; the destination's
+    // allocation is far from its 256 MiB logical size.
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let allocated = std::fs::metadata(&dst).unwrap().blocks() * 512;
+        assert!(allocated < 4 << 20, "{allocated} bytes allocated");
+    }
+    assert!(clone_file(&src, &dst).is_err(), "the destination exists");
+}
