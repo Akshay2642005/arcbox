@@ -108,6 +108,39 @@ fn test_register_mock_machine_idempotent() {
     assert_eq!(machine.cid, Some(10));
 }
 
+/// A force stop publishes `MachineStopping`, then waits for the host to
+/// release what it holds of the machine before it touches the VM: the hold
+/// here is dropped by another thread after a delay, and `stop` returns no
+/// earlier. The mock machine has no VM, so the stop itself then fails —
+/// that failure is the VM's, after the wait, and not what is under test.
+#[test]
+fn a_force_stop_waits_for_the_host_to_release_the_machine() {
+    use crate::event::{Event, EventBus};
+
+    let temp_dir = tempdir().unwrap();
+    let bus = EventBus::new();
+    let mut events = bus.subscribe();
+    let manager = Arc::new(test_machine_manager_with_bus(temp_dir.path(), bus));
+    manager.register_mock_machine("held", 7).unwrap();
+
+    let hold = manager.host_hold("held");
+    let release_after = Duration::from_millis(300);
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(release_after);
+        drop(hold);
+    });
+
+    let started = std::time::Instant::now();
+    let _ = manager.stop("held");
+    let waited = started.elapsed();
+    assert!(waited >= release_after, "stop returned after {waited:?}");
+    assert!(
+        matches!(events.try_recv(), Ok(Event::MachineStopping { name }) if name == "held"),
+        "the holder learns of the stop before the wait"
+    );
+    releaser.join().unwrap();
+}
+
 #[tokio::test]
 async fn connect_agent_distinguishes_missing_and_stopped_machines() {
     let temp_dir = tempdir().unwrap();

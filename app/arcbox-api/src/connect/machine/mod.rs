@@ -207,10 +207,14 @@ impl pb::MachineService for MachineServiceImpl {
     ) -> ServiceResult<pb::Empty> {
         let req = request.to_owned_message();
         let runtime = self.runtime.ready()?;
+        let manager = std::sync::Arc::clone(runtime.machine_manager());
 
-        runtime
-            .machine_manager()
-            .remove(&req.id, req.force)
+        // A forced removal stops a running machine first: a synchronous VM
+        // call, preceded by a wait for the host to release the machine's
+        // root mount. Keep both off the async workers.
+        tokio::task::spawn_blocking(move || manager.remove(&req.id, req.force))
+            .await
+            .map_err(|e| ConnectError::internal(format!("remove task panicked: {e}")))?
             .map_err(ApiError::from)?;
 
         Response::ok(pb::Empty::default())

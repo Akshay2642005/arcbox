@@ -41,6 +41,7 @@ pub enum MachineState {
 
 pub mod archive;
 mod clone;
+mod host_hold;
 #[cfg(target_os = "macos")]
 mod serial;
 #[cfg(test)]
@@ -48,7 +49,14 @@ mod tests;
 mod transfer;
 
 pub use clone::clone_file;
+pub use host_hold::HostHold;
 use transfer::DataDisk;
+
+/// How long a force stop waits for the host to release what it holds of
+/// the machine before killing the VM. The release takes well under a
+/// second while the machine still answers; the bound covers a holder that
+/// is busy with another machine.
+const HOST_RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Machine information.
 #[derive(Debug, Clone)]
@@ -431,6 +439,9 @@ pub struct MachineManager {
     /// so watchers (`MachineService.Events`) see them; the default System VM's
     /// events are published by its own lifecycle actor instead.
     event_bus: crate::event::EventBus,
+    /// What the host holds of each running machine; a force stop waits for
+    /// these to clear before it kills the VM (see [`HostHold`]).
+    host_holds: host_hold::HostHolds,
     /// The serial drain of every running machine, by name (see [`serial`]).
     /// Dropping an entry stops its drain.
     #[cfg(target_os = "macos")]
@@ -527,8 +538,29 @@ impl MachineManager {
             machines_dir,
             host_network,
             event_bus,
+            host_holds: host_hold::HostHolds::default(),
             #[cfg(target_os = "macos")]
             serial_drains: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Registers a host-side dependency on machine `name` — a mount served
+    /// by the machine, say — that a force stop waits for before it kills
+    /// the VM. Release it, by dropping the hold, on `MachineStopping`.
+    #[must_use]
+    pub fn host_hold(&self, name: &str) -> HostHold {
+        self.host_holds.hold(name)
+    }
+
+    /// Waits for the host to release what it holds of `name`, within
+    /// [`HOST_RELEASE_TIMEOUT`]; a hold that outlives the wait is logged
+    /// and the stop goes ahead.
+    fn await_host_release(&self, name: &str) {
+        if !self.host_holds.wait_released(name, HOST_RELEASE_TIMEOUT) {
+            tracing::warn!(
+                machine = name,
+                "the host did not release the machine within {HOST_RELEASE_TIMEOUT:?}; stopping it anyway"
+            );
         }
     }
 
@@ -1335,28 +1367,29 @@ impl MachineManager {
     ///
     /// Accepts `Stopping` as well as `Running` so a force stop can preempt
     /// an in-flight graceful stop instead of erroring for up to the whole
-    /// graceful-shutdown window.
+    /// graceful-shutdown window. The VM dies the moment it is stopped, so
+    /// `MachineStopping` goes out first and the host gets
+    /// [`HOST_RELEASE_TIMEOUT`] to release what it holds of the machine.
     ///
     /// # Errors
     ///
     /// Returns an error if the machine cannot be stopped.
     pub fn stop(&self, name: &str) -> Result<()> {
-        let mut machines = self
-            .machines
-            .write()
-            .map_err(|_| EngineError::LockPoisoned)?;
-
-        let machine = machines
-            .get_mut(name)
-            .ok_or_else(|| EngineError::not_found(name.to_string()))?;
-
-        if !matches!(
-            machine.state,
-            MachineState::Running | MachineState::Stopping
-        ) {
-            return Err(EngineError::invalid_state(format!(
-                "machine '{name}' is not running"
-            )));
+        let stoppable =
+            |state: MachineState| matches!(state, MachineState::Running | MachineState::Stopping);
+        {
+            let machines = self
+                .machines
+                .read()
+                .map_err(|_| EngineError::LockPoisoned)?;
+            let machine = machines
+                .get(name)
+                .ok_or_else(|| EngineError::not_found(name.to_string()))?;
+            if !stoppable(machine.state) {
+                return Err(EngineError::invalid_state(format!(
+                    "machine '{name}' is not running"
+                )));
+            }
         }
 
         self.publish_event(
@@ -1365,6 +1398,22 @@ impl MachineManager {
                 name: name.to_string(),
             },
         );
+        // Not under the registry lock: the holders read the registry too.
+        self.await_host_release(name);
+
+        let mut machines = self
+            .machines
+            .write()
+            .map_err(|_| EngineError::LockPoisoned)?;
+        let machine = machines
+            .get_mut(name)
+            .ok_or_else(|| EngineError::not_found(name.to_string()))?;
+        // A concurrent stop may have finished during the wait.
+        if !stoppable(machine.state) {
+            return Err(EngineError::invalid_state(format!(
+                "machine '{name}' is not running"
+            )));
+        }
 
         // Stop underlying VM
         #[cfg(target_os = "macos")]
@@ -1704,6 +1753,9 @@ impl MachineManager {
                     name: name.to_string(),
                 },
             );
+            // The VM dies below; what the host holds of the machine (its
+            // root mount) must be released while the machine still answers.
+            self.await_host_release(name);
             self.vm_manager.stop(&vm_id)?;
             self.stop_serial_drain(name);
             machines = self

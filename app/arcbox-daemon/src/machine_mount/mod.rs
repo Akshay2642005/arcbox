@@ -44,7 +44,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use self::export::{host_addresses_on_link, release};
-use self::registry::{Entry, Mounts};
+use self::registry::Mounts;
 use crate::context::DaemonContext;
 use crate::host_mount;
 
@@ -77,11 +77,11 @@ pub fn spawn(ctx: &DaemonContext, runtime: &Arc<Runtime>) {
 /// for a mount that raced the first pass or whose release failed.
 pub async fn cleanup() {
     let entries = mounted().entries();
-    for (name, entry) in entries {
-        if unmount_path(&name, &entry.path).await {
-            mounted().forget(&name, entry.generation);
+    for (name, path, generation) in entries {
+        if unmount_path(&name, &path).await {
+            mounted().forget(&name, generation);
         } else {
-            mounted().mark_stale(&name, entry.generation);
+            mounted().mark_stale(&name, generation);
         }
     }
 }
@@ -218,7 +218,10 @@ pub async fn mount_machine(
     let port = u16::try_from(endpoint.port).context("export port out of range")?;
     export::mount(&endpoint.address, port, &mount_path).await?;
 
-    mounted().record(&machine.name, mount_path.clone());
+    // Held from here until the mount is released, so a force stop lets the
+    // release reach a live server instead of leaving a dead mount behind.
+    let hold = runtime.machine_manager().host_hold(&machine.name);
+    mounted().record(&machine.name, mount_path.clone(), hold);
     info!(
         machine = %machine.name,
         path = %mount_path.display(),
@@ -233,9 +236,9 @@ pub async fn mount_machine(
 /// mount point. A machine that was never mounted is a no-op; a release that
 /// fails is retried in the background (see the module docs).
 pub async fn unmount_machine(name: &str) {
-    let Some(Entry {
-        path, generation, ..
-    }) = mounted().get(name).cloned()
+    let Some((path, generation)) = mounted()
+        .get(name)
+        .map(|entry| (entry.path.clone(), entry.generation))
     else {
         return;
     };

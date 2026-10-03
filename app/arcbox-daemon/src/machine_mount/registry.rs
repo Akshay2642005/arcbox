@@ -5,12 +5,20 @@
 //! the retries after it — so shutdown and a lagged receiver still find it.
 //! A generation tells a retry whether the name was remounted in between:
 //! the retry must not unmount a newer machine's root at the same path.
+//!
+//! Each entry carries the machine's [`HostHold`], which keeps a force stop
+//! from killing the VM while the mount is up. The hold goes with the first
+//! release attempt, successful or not: a release that failed is retried
+//! against a server that may already be gone, and holding the VM for it
+//! would only delay the stop.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use arcbox_core::machine::HostHold;
+
 /// One mount this daemon made.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub(super) struct Entry {
     /// The mount point.
     pub path: PathBuf,
@@ -19,6 +27,8 @@ pub(super) struct Entry {
     /// A release failed and a retry is pending; a machine starting under
     /// the name replaces the mount rather than reusing it.
     pub stale: bool,
+    /// Held until the first release attempt; see the module docs.
+    hold: Option<HostHold>,
 }
 
 /// The table of mounts, keyed by machine name.
@@ -37,7 +47,7 @@ impl Mounts {
 
     /// Records a mount just made for `name`, replacing any earlier entry,
     /// and returns its generation.
-    pub fn record(&mut self, name: &str, path: PathBuf) -> u64 {
+    pub fn record(&mut self, name: &str, path: PathBuf, hold: HostHold) -> u64 {
         self.generation += 1;
         self.entries.insert(
             name.to_owned(),
@@ -45,6 +55,7 @@ impl Mounts {
                 path,
                 generation: self.generation,
                 stale: false,
+                hold: Some(hold),
             },
         );
         self.generation
@@ -61,12 +72,14 @@ impl Mounts {
             .is_some_and(|entry| entry.generation == generation)
     }
 
-    /// Marks `generation` as a mount whose release failed.
+    /// Marks `generation` as a mount whose release failed, and lets the
+    /// machine go: the retries do not need its VM.
     pub fn mark_stale(&mut self, name: &str, generation: u64) {
         if let Some(entry) = self.entries.get_mut(name)
             && entry.generation == generation
         {
             entry.stale = true;
+            entry.hold = None;
         }
     }
 
@@ -82,23 +95,41 @@ impl Mounts {
         self.entries.keys().cloned().collect()
     }
 
-    /// Every mount, for shutdown.
-    pub fn entries(&self) -> Vec<(String, Entry)> {
+    /// Every mount as `(name, mount point, generation)`, for shutdown.
+    pub fn entries(&self) -> Vec<(String, PathBuf, u64)> {
         self.entries
             .iter()
-            .map(|(name, entry)| (name.clone(), entry.clone()))
+            .map(|(name, entry)| (name.clone(), entry.path.clone(), entry.generation))
             .collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use arcbox_core::event::EventBus;
+    use arcbox_core::machine::MachineManager;
+    use arcbox_core::vm::{HostNetwork, VmManager};
+
     use super::*;
+
+    /// A machine manager with no machines, as the source of holds.
+    fn machine_manager(dir: &std::path::Path) -> MachineManager {
+        MachineManager::new(
+            Arc::new(VmManager::new(dir.join("snapshots"))),
+            dir.to_path_buf(),
+            HostNetwork::default(),
+            EventBus::new(),
+        )
+    }
 
     #[test]
     fn a_remount_outdates_the_generation_a_retry_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = machine_manager(dir.path());
         let mut mounts = Mounts::new();
-        let first = mounts.record("dev", PathBuf::from("/m/dev"));
+        let first = mounts.record("dev", PathBuf::from("/m/dev"), manager.host_hold("dev"));
         assert!(mounts.is_current("dev", first));
 
         // The release failed; the entry stays, marked stale.
@@ -108,7 +139,7 @@ mod tests {
 
         // The machine started again and was mounted anew: the pending retry
         // no longer owns the path, and forgetting its generation is a no-op.
-        let second = mounts.record("dev", PathBuf::from("/m/dev"));
+        let second = mounts.record("dev", PathBuf::from("/m/dev"), manager.host_hold("dev"));
         assert!(!mounts.is_current("dev", first));
         assert!(mounts.is_current("dev", second));
         assert!(mounts.get("dev").is_some_and(|entry| !entry.stale));
@@ -122,11 +153,13 @@ mod tests {
 
     #[test]
     fn marking_or_forgetting_an_unknown_generation_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = machine_manager(dir.path());
         let mut mounts = Mounts::new();
         mounts.mark_stale("dev", 7);
         mounts.forget("dev", 7);
         assert!(mounts.get("dev").is_none());
-        let generation = mounts.record("dev", PathBuf::from("/m/dev"));
+        let generation = mounts.record("dev", PathBuf::from("/m/dev"), manager.host_hold("dev"));
         mounts.mark_stale("dev", generation + 1);
         assert!(mounts.get("dev").is_some_and(|entry| !entry.stale));
     }
