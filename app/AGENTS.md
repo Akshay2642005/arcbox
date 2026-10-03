@@ -209,26 +209,33 @@ Covers `arcbox-daemon` (startup/shutdown), `arcbox-core` (`vm_lifecycle`),
   claiming it stays "fresh" holds only when a package file also changed).
 - Daemon logs "ArcBox daemon stopped" but the process never exits. First:
   look for a `mount_nfs` or `umount` child of the daemon. Likely cause: a
-  new call site runs one of them outside `host_mount`. Both the `~/ArcBox`
-  export and the machine mounts go through `host_mount`, where each is a
-  tokio child bounded by `MOUNT_ATTEMPT_TIMEOUT` (20 s per attempt) or
-  `UNMOUNT_TIMEOUT` (5 s) with `kill_on_drop`; the old `spawn_blocking`
-  remount with no per-attempt bound was this signature (fixed 2026-10-03).
+  new call site runs one of them outside `host_mount`. Both the
+  `~/ArcBox/docker` export and the machine mounts go through `host_mount`,
+  where each is a tokio child bounded by `MOUNT_ATTEMPT_TIMEOUT` (20 s per
+  attempt) or `UNMOUNT_TIMEOUT` (5 s) with `kill_on_drop`; the old
+  `spawn_blocking` remount with no per-attempt bound was this signature
+  (fixed 2026-10-03).
 - Daemon never logs "ArcBox daemon stopped" after the VM stopped. First:
   sample the daemon for a thread inside `stat`/`getattrlist`. Likely cause:
   something `stat`'d an NFS mount point whose server is gone
-  (`canonicalize`, `metadata`, `exists` on `~/ArcBox` or a machine mount),
-  which blocks until the mount's `deadtimeout`. Resolve a mount point with
-  `host_mount::current_mount_info`, which reads the mount table and never
-  touches the point, and escalate to `umount -f` when a plain `umount` is
-  refused (`3044b3f7`, 2026-10-03).
+  (`canonicalize`, `metadata`, `exists` on `~/ArcBox/docker` or a machine
+  mount), which blocks until the mount's `deadtimeout`. Resolve a mount
+  point with `host_mount::current_mount_info` — a wrapper over
+  `arcbox_core::host_mount::MountTable`, which `abctl uninstall` reads too —
+  which reads the mount table and never touches the point, and escalate to
+  `umount -f` when a plain `umount` is refused (`3044b3f7`, 2026-10-03).
 
 ## Machine root mounts
 
 - **A running distro machine's `/` is mounted read-write on the host**, at
-  `~/ArcBoxMachines/<name>` (`ARCBOX_MACHINE_MOUNT_DIR` moves the root; the
-  e2e harness and the dev daemons point it into their data dir), by
-  `arcbox-daemon/src/machine_mount`. The agent serves NFSv3 from an
+  `~/ArcBox/machines/<name>`, under the one host mount root `~/ArcBox` that
+  also holds the docker export at `docker/` (`ARCBOX_HOST_MOUNT_DIR` moves
+  the root; the e2e harness and the dev daemons point it into their data
+  dir; ADR 0003), by `arcbox-daemon/src/machine_mount`. The
+  `startup::host_mounts` step of `release_stale_resources` first releases
+  whatever a previous daemon left under the root — and the pre-0003 layout,
+  `~/ArcBox` itself and `~/ArcBoxMachines/<name>` — reading the mount table
+  rather than `stat`'ing dead mount points. The agent serves NFSv3 from an
   `nfs3_server` in its own process and the host's NFS client reaches it
   over the bridge NIC, not a vsock relay (ADR 0002). `mount_machine` and
   `unmount_machine` are the only entry points and both are idempotent; the
@@ -445,7 +452,7 @@ Covers `arcbox-daemon` (startup/shutdown), `arcbox-core` (`vm_lifecycle`),
   must act when the VM comes *up* watches
   `VmLifecycleManager::subscribe_state` (`Runtime::subscribe_system_vm_state`)
   instead: wait for `VmLifecycleState::is_ready`, do the work, then wait for
-  it to clear. Reference consumer: the `~/ArcBox` export reconcile
+  it to clear. Reference consumer: the `~/ArcBox/docker` export reconcile
   (`arcbox-daemon/src/nfs_mount.rs`), whose per-incarnation supervisor loop
   also carries the companion rule — one pass's failure must be retried, not
   propagated out of the loop, or every later incarnation inherits the broken

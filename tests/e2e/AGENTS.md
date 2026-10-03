@@ -136,8 +136,8 @@ run fails, and which paths must change together.
 - Guest cannot reach docker.io -> point `ARCBOX_E2E_IMAGE` at a reachable
   mirror instead of weakening the test.
 - The test body passes, then the process hangs in `TempDir::drop`
-  (`remove_dir_all` → `openat` under `<data_dir>/ArcBox` or
-  `<data_dir>/ArcBoxMachines/<name>`) -> an NFS view outlived its daemon.
+  (`remove_dir_all` → `openat` under `<data_dir>/ArcBox/docker` or
+  `<data_dir>/ArcBox/machines/<name>`) -> an NFS view outlived its daemon.
   Fixed 2026-10-03 (`3044b3f7`): the daemon resolves a mount point with
   `host_mount::current_mount_info`, which reads the mount table instead of
   `stat`'ing the point (the old path compared the requested
