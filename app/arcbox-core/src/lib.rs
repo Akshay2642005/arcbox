@@ -33,6 +33,7 @@ pub mod bridge_discovery;
 pub mod config;
 pub mod container_backend;
 pub mod error;
+pub mod host_mount;
 #[cfg(target_os = "macos")]
 pub mod macos;
 pub mod migration;
