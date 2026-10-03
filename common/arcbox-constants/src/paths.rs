@@ -469,6 +469,93 @@ pub fn default_data_dir() -> std::path::PathBuf {
     ArcboxProfile::Production.default_data_dir()
 }
 
+/// Names under the host mount root, the one folder in which the daemon
+/// shows the user guest filesystems (ADR 0003).
+pub mod host_mount {
+    /// The root's name under the home directory: `~/ArcBox`.
+    pub const ROOT: &str = "ArcBox";
+    /// `<root>/docker`: the System VM's docker data, read-only. Its
+    /// containerd data is the NFSv4 child export at `docker/containerd`.
+    pub const DOCKER: &str = "docker";
+    /// `<root>/machines/<name>`: a running machine's root, read-write.
+    pub const MACHINES: &str = "machines";
+    /// Before the single root, machine roots were mounted under a sibling
+    /// of the root named `<root>Machines` (`~/ArcBoxMachines`); the daemon
+    /// removes what one left behind.
+    pub const LEGACY_MACHINES_SUFFIX: &str = "Machines";
+}
+
+/// The host mount root and the mount points under it.
+///
+/// `~/ArcBox` unless `ARCBOX_HOST_MOUNT_DIR` moves it; `docker/` and
+/// `machines/<name>` derive from the root. The daemon creates the root and
+/// the mounts; `abctl uninstall` removes them; both derive the paths here.
+#[cfg(feature = "std")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostMountLayout {
+    root: std::path::PathBuf,
+}
+
+#[cfg(feature = "std")]
+impl HostMountLayout {
+    /// A layout rooted at `root`.
+    #[must_use]
+    pub const fn new(root: std::path::PathBuf) -> Self {
+        Self { root }
+    }
+
+    /// The default layout for a home directory: `<home>/ArcBox`.
+    #[must_use]
+    pub fn under_home(home: &std::path::Path) -> Self {
+        Self::new(home.join(host_mount::ROOT))
+    }
+
+    /// The layout `ARCBOX_HOST_MOUNT_DIR` names, else the one under the
+    /// home directory; `None` when neither can be resolved.
+    #[must_use]
+    pub fn from_env_or_home() -> Option<Self> {
+        if let Some(root) = std::env::var_os(crate::env::HOST_MOUNT_DIR)
+            && !root.is_empty()
+        {
+            return Some(Self::new(std::path::PathBuf::from(root)));
+        }
+        dirs::home_dir().map(|home| Self::under_home(&home))
+    }
+
+    /// The root directory, a plain directory the daemon creates.
+    #[must_use]
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
+    /// Mount point of the docker data export.
+    #[must_use]
+    pub fn docker(&self) -> std::path::PathBuf {
+        self.root.join(host_mount::DOCKER)
+    }
+
+    /// The directory the machine roots are mounted under.
+    #[must_use]
+    pub fn machines(&self) -> std::path::PathBuf {
+        self.root.join(host_mount::MACHINES)
+    }
+
+    /// Mount point of machine `name`'s root.
+    #[must_use]
+    pub fn machine(&self, name: &str) -> std::path::PathBuf {
+        self.machines().join(name)
+    }
+
+    /// Where a daemon from before the single root mounted machine roots:
+    /// the root's sibling `<root>Machines`.
+    #[must_use]
+    pub fn legacy_machines_root(&self) -> std::path::PathBuf {
+        let mut name = self.root.file_name().unwrap_or_default().to_os_string();
+        name.push(host_mount::LEGACY_MACHINES_SUFFIX);
+        self.root.with_file_name(name)
+    }
+}
+
 /// Privileged log directory (root-owned, for arcbox-helper).
 pub mod privileged_log {
     /// Directory for helper logs (root-writable).
@@ -546,6 +633,35 @@ mod tests {
         assert_eq!(
             layout.daemon_log,
             PathBuf::from("/tmp/arcbox/log/daemon.log")
+        );
+    }
+
+    #[test]
+    fn host_mount_layout_derives_the_mounts_from_one_root() {
+        let layout = HostMountLayout::under_home(std::path::Path::new("/Users/tester"));
+        assert_eq!(layout.root(), std::path::Path::new("/Users/tester/ArcBox"));
+        assert_eq!(
+            layout.docker(),
+            PathBuf::from("/Users/tester/ArcBox/docker")
+        );
+        assert_eq!(
+            layout.machines(),
+            PathBuf::from("/Users/tester/ArcBox/machines")
+        );
+        assert_eq!(
+            layout.machine("ubuntu"),
+            PathBuf::from("/Users/tester/ArcBox/machines/ubuntu")
+        );
+        // The pre-single-root machine mount root, for the migration.
+        assert_eq!(
+            layout.legacy_machines_root(),
+            PathBuf::from("/Users/tester/ArcBoxMachines")
+        );
+        // A relocated root (test daemons) keeps the same shape beside it.
+        let relocated = HostMountLayout::new(PathBuf::from("/tmp/e2e/ArcBox"));
+        assert_eq!(
+            relocated.legacy_machines_root(),
+            PathBuf::from("/tmp/e2e/ArcBoxMachines")
         );
     }
 

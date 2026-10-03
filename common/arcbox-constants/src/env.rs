@@ -7,6 +7,13 @@ pub const PROFILE: &str = "ARCBOX_PROFILE";
 /// Environment variable for overriding the host data directory.
 pub const DATA_DIR: &str = "ARCBOX_DATA_DIR";
 
+/// Environment variable for overriding the host mount root (`~/ArcBox`).
+///
+/// The daemon mounts the guest's docker data and every running machine's
+/// root under it. Test daemons point it into their data directory to stay
+/// off the user's.
+pub const HOST_MOUNT_DIR: &str = "ARCBOX_HOST_MOUNT_DIR";
+
 /// Environment variable for selecting an instance-owned Docker context.
 pub const DOCKER_CONTEXT: &str = "ARCBOX_DOCKER_CONTEXT";
 
