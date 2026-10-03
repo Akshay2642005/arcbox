@@ -62,6 +62,14 @@ impl IdTable {
         Some(path)
     }
 
+    /// Where `id` sits: its directory and its name there. The root has
+    /// neither.
+    pub fn entry(&self, id: u64) -> Option<(u64, &OsStr)> {
+        self.entries
+            .get(&id)
+            .map(|entry| (entry.parent, entry.name.as_os_str()))
+    }
+
     /// The directory holding `id`; the root is its own parent.
     pub fn parent(&self, id: u64) -> Option<u64> {
         if id == ROOT {
@@ -171,6 +179,8 @@ mod tests {
         );
         assert_eq!(table.path(Path::new("/"), ROOT), Some(PathBuf::from("/")));
         assert_eq!(table.parent(hosts), Some(etc));
+        assert_eq!(table.entry(hosts), Some((etc, name("hosts"))));
+        assert_eq!(table.entry(ROOT), None);
         assert_eq!(table.parent(ROOT), Some(ROOT));
         assert_eq!(table.path(Path::new("/"), 99), None, "never issued");
     }

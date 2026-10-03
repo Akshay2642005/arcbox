@@ -34,7 +34,9 @@ pub struct Endpoint {
 /// on `bridge`. Both listeners live for the rest of the agent's life, like
 /// the machine they export.
 pub async fn serve(root: PathBuf, bridge: Ipv4Addr, config: ExportConfig) -> io::Result<Endpoint> {
-    let nfs = NFSTcpListener::bind("127.0.0.1:0", MachineRoot::new(root, config.ids)).await?;
+    let fs = MachineRoot::new(root, config.ids);
+    tokio::spawn(fs.retire_sidecars_forever());
+    let nfs = NFSTcpListener::bind("127.0.0.1:0", fs).await?;
     let nfs_port = nfs.get_listen_port();
     tokio::spawn(async move {
         if let Err(e) = nfs.handle_forever().await {

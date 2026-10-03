@@ -4,7 +4,11 @@
 //! the request names one; `MKDIR` carries no attributes through this server,
 //! so a new directory gets `DEFAULT_DIR_MODE`. Writes honour the stability
 //! the client asked for and report it back, so an `UNSTABLE` write costs no
-//! `fsync` and the `COMMIT` that follows is the one that does.
+//! `fsync` and the `COMMIT` that follows is the one that does. Every
+//! operation first asks whether its name or handle is a sidecar — the Mac's
+//! `._x` for a plain `x` — and hands those to `sidecar`; the rest touch the
+//! disk, then tell `sidecar` what changed so a target's attributes, side
+//! entry and pending image keep together.
 
 use std::ffi::OsStr;
 use std::fs::{DirBuilder, OpenOptions, Permissions};
@@ -19,7 +23,7 @@ use nfs3_server::nfs3_types::nfs3::{
 use nfs3_server::vfs::NfsFileSystem;
 
 use super::super::attr::{apply_sattr, fattr3_from_metadata, new_object_owner};
-use super::{MachineRoot, blocking, component};
+use super::{MachineRoot, blocking, component, reserved, sidecar};
 
 /// Mode of a file the host creates without asking for one.
 pub(super) const DEFAULT_FILE_MODE: u32 = 0o644;
@@ -29,8 +33,8 @@ const DEFAULT_DIR_MODE: u32 = 0o755;
 impl NfsFileSystem for MachineRoot {
     async fn setattr(&self, id: &Self::Handle, setattr: sattr3) -> Result<fattr3, nfsstat3> {
         let id = id.as_u64();
-        if let Some(attr) = self.setattr_sidecar(id, &setattr) {
-            return Ok(attr);
+        if let Some(sidecar) = self.sidecar_of(id).await? {
+            return self.setattr_sidecar(&sidecar, &setattr).await;
         }
         let path = self.path_of(id)?;
         let map = self.map;
@@ -50,8 +54,8 @@ impl NfsFileSystem for MachineRoot {
         stable: stable_how,
     ) -> Result<(fattr3, stable_how), nfsstat3> {
         let id = id.as_u64();
-        if let Some(attr) = self.write_sidecar(id, offset, data) {
-            return Ok((attr, stable_how::FILE_SYNC));
+        if let Some(sidecar) = self.sidecar_of(id).await? {
+            return self.write_sidecar(&sidecar, offset, data, stable).await;
         }
         let path = self.path_of(id)?;
         let map = self.map;
@@ -78,9 +82,10 @@ impl NfsFileSystem for MachineRoot {
     ) -> Result<(Self::Handle, fattr3), nfsstat3> {
         let dirid = dirid.as_u64();
         let name = component(filename)?;
+        reserved(&name)?;
         let path = self.child_path(dirid, &name)?;
-        if self.shadows(&name, &path).await? {
-            return self.create_sidecar(dirid, &name, &attr, false);
+        if let Some(sidecar) = self.sidecar_at(dirid, &name, &path).await? {
+            return self.create_sidecar(sidecar, &attr, false).await;
         }
         let map = self.map;
         let created = path.clone();
@@ -102,6 +107,7 @@ impl NfsFileSystem for MachineRoot {
             apply_sattr(&created, &attr, map)
         })
         .await?;
+        self.target_created(dirid, &name, &path).await;
         self.created(dirid, name, path).await
     }
 
@@ -113,23 +119,27 @@ impl NfsFileSystem for MachineRoot {
     ) -> Result<Self::Handle, nfsstat3> {
         let dirid = dirid.as_u64();
         let name = component(filename)?;
+        reserved(&name)?;
         let path = self.child_path(dirid, &name)?;
-        if self.shadows(&name, &path).await? {
+        if let Some(sidecar) = self.sidecar_at(dirid, &name, &path).await? {
             return self
-                .create_sidecar(dirid, &name, &sattr3::default(), true)
+                .create_sidecar(sidecar, &sattr3::default(), true)
+                .await
                 .map(|(handle, _)| handle);
         }
         let (uid, gid) = self.map.guest_owner();
+        let created = path.clone();
         blocking(move || {
             OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .mode(DEFAULT_FILE_MODE)
-                .open(&path)?;
-            std::os::unix::fs::lchown(&path, Some(uid), Some(gid))?;
-            std::fs::set_permissions(&path, Permissions::from_mode(DEFAULT_FILE_MODE))
+                .open(&created)?;
+            std::os::unix::fs::lchown(&created, Some(uid), Some(gid))?;
+            std::fs::set_permissions(&created, Permissions::from_mode(DEFAULT_FILE_MODE))
         })
         .await?;
+        self.target_created(dirid, &name, &path).await;
         Ok(self.handle_for(dirid, &name))
     }
 
@@ -140,6 +150,7 @@ impl NfsFileSystem for MachineRoot {
     ) -> Result<(Self::Handle, fattr3), nfsstat3> {
         let dirid = dirid.as_u64();
         let name = component(dirname)?;
+        reserved(&name)?;
         let path = self.child_path(dirid, &name)?;
         let (uid, gid) = self.map.guest_owner();
         let created = path.clone();
@@ -149,6 +160,7 @@ impl NfsFileSystem for MachineRoot {
             std::fs::set_permissions(&created, Permissions::from_mode(DEFAULT_DIR_MODE))
         })
         .await?;
+        self.target_created(dirid, &name, &path).await;
         self.created(dirid, name, path).await
     }
 
@@ -156,18 +168,19 @@ impl NfsFileSystem for MachineRoot {
         let dirid = dirid.as_u64();
         let name = component(filename)?;
         let path = self.child_path(dirid, &name)?;
-        if self.remove_sidecar(dirid, &name) {
-            return Ok(());
+        if let Some(sidecar) = self.sidecar_at(dirid, &name, &path).await? {
+            return self.remove_sidecar(sidecar).await;
         }
+        let removed = path.clone();
         blocking(move || {
-            if std::fs::symlink_metadata(&path)?.is_dir() {
-                std::fs::remove_dir(&path)
+            if std::fs::symlink_metadata(&removed)?.is_dir() {
+                sidecar::remove_dir(&removed)
             } else {
-                std::fs::remove_file(&path)
+                std::fs::remove_file(&removed)
             }
         })
         .await?;
-        self.drop_sidecars_in(dirid, &name);
+        self.target_removed(dirid, &name, &path).await;
         self.ids().forget(dirid, &name);
         Ok(())
     }
@@ -182,14 +195,17 @@ impl NfsFileSystem for MachineRoot {
         let (from_dirid, to_dirid) = (from_dirid.as_u64(), to_dirid.as_u64());
         let from_name = component(from_filename)?;
         let to_name = component(to_filename)?;
+        reserved(&to_name)?;
         let from = self.child_path(from_dirid, &from_name)?;
         let to = self.child_path(to_dirid, &to_name)?;
-        if let Some(moved) = self.rename_sidecar(from_dirid, &from_name, to_dirid, &to_name) {
-            return moved;
+        if let Some(sidecar) = self.sidecar_at(from_dirid, &from_name, &from).await? {
+            return self.rename_sidecar(sidecar, to_dirid, &to_name, &to).await;
         }
-        blocking(move || std::fs::rename(&from, &to)).await?;
-        // A sidecar the rename wrote over.
-        self.remove_sidecar(to_dirid, &to_name);
+        self.target_renaming(from_dirid, &from_name, &from).await;
+        let (moved_from, moved_to) = (from.clone(), to.clone());
+        blocking(move || std::fs::rename(&moved_from, &moved_to)).await?;
+        self.target_renamed((from_dirid, &from_name, &from), (to_dirid, &to_name, &to))
+            .await;
         self.ids()
             .rename(from_dirid, &from_name, to_dirid, &to_name);
         Ok(())
@@ -204,6 +220,7 @@ impl NfsFileSystem for MachineRoot {
     ) -> Result<(Self::Handle, fattr3), nfsstat3> {
         let dirid = dirid.as_u64();
         let name = component(linkname)?;
+        reserved(&name)?;
         let path = self.child_path(dirid, &name)?;
         let target = OsStr::from_bytes(symlink.as_ref()).to_owned();
         let (uid, gid) = new_object_owner(attr, self.map);
@@ -213,13 +230,14 @@ impl NfsFileSystem for MachineRoot {
             std::os::unix::fs::lchown(&created, Some(uid), Some(gid))
         })
         .await?;
+        self.target_created(dirid, &name, &path).await;
         self.created(dirid, name, path).await
     }
 
     async fn commit(&self, id: &Self::Handle, _offset: u64, _count: u32) -> Result<(), nfsstat3> {
         let id = id.as_u64();
-        if self.is_sidecar(id) {
-            return Ok(());
+        if let Some(sidecar) = self.sidecar_of(id).await? {
+            return self.commit_sidecar(&sidecar).await;
         }
         let path = self.path_of(id)?;
         blocking(move || std::fs::File::open(&path)?.sync_data()).await

@@ -123,7 +123,7 @@ fn rdev(_dev: u64) -> specdata3 {
 
 /// An `nfstime3` from `stat` fields; the protocol's seconds are unsigned
 /// 32-bit, so times before 1970 clamp to the epoch.
-fn nfstime(seconds: i64, nanoseconds: i64) -> nfstime3 {
+pub fn nfstime(seconds: i64, nanoseconds: i64) -> nfstime3 {
     nfstime3 {
         seconds: u32::try_from(seconds.clamp(0, i64::from(u32::MAX))).unwrap_or(u32::MAX),
         nseconds: u32::try_from(nanoseconds.clamp(0, 999_999_999)).unwrap_or(0),

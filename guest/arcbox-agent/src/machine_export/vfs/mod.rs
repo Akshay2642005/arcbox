@@ -7,49 +7,75 @@
 //! machine is the host's. Ownership on the wire goes through the
 //! [`IdMap`]; see `attr`.
 //!
-//! The one thing the export hides is `/arcbox`, ArcBox's own VirtioFS
-//! share of the host's data directory: exporting it would hand the host
-//! its own disk images back through two filesystems, and Finder or `du`
-//! would happily read them. The one thing it keeps out is the Mac's
-//! AppleDouble `._` files; see `sidecar`.
+//! Two things the export hides: `/arcbox`, ArcBox's own VirtioFS share of
+//! the host's data directory — exporting it would hand the host its own
+//! disk images back through two filesystems, and Finder or `du` would
+//! happily read them — and `.arcbox-xattrs`, the side store of attributes
+//! too big for an inode, in any directory. The one thing it keeps out is
+//! the Mac's AppleDouble `._` files; see `sidecar`.
 
 mod sidecar;
 mod write;
 
 use std::ffi::{OsStr, OsString};
 use std::io;
+use std::ops::Deref;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::FileExt as _;
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use nfs3_server::nfs3_types::nfs3::{fattr3, filename3, nfspath3, nfsstat3};
 use nfs3_server::vfs::{
     DirEntryPlus, FileHandleU64, NextResult, NfsReadFileSystem, ReadDirPlusIterator,
 };
 
-use self::sidecar::{Sidecars, is_sidecar_name};
+use self::sidecar::{Images, SIDE_STORE_DIR, Store, is_sidecar_name};
 use super::attr::{IdMap, fattr3_from_metadata, nfs_error};
 use super::ids::{IdTable, ROOT};
 
 /// Root entries the export does not show; see the module docs.
 const HIDDEN_ROOT_ENTRIES: &[&str] = &["arcbox"];
 
-/// The machine root served over NFS.
+/// The machine root served over NFS: a handle on shared state, so the
+/// sidecar retirement task holds one next to the server's.
+#[derive(Clone)]
 pub struct MachineRoot {
+    state: Arc<State>,
+}
+
+pub struct State {
     root: PathBuf,
     ids: Mutex<IdTable>,
-    sidecars: Mutex<Sidecars>,
+    images: Mutex<Images>,
     map: IdMap,
+    store: Store,
+}
+
+impl Deref for MachineRoot {
+    type Target = State;
+
+    fn deref(&self) -> &State {
+        &self.state
+    }
 }
 
 impl MachineRoot {
     pub fn new(root: PathBuf, map: IdMap) -> Self {
+        Self::with_store(root, map, Store::BTRFS)
+    }
+
+    /// With the attribute store's split chosen, for a filesystem that is
+    /// not a machine's btrfs.
+    fn with_store(root: PathBuf, map: IdMap, store: Store) -> Self {
         Self {
-            root,
-            ids: Mutex::new(IdTable::new()),
-            sidecars: Mutex::new(Sidecars::default()),
-            map,
+            state: Arc::new(State {
+                root,
+                ids: Mutex::new(IdTable::new()),
+                images: Mutex::new(Images::default()),
+                map,
+                store,
+            }),
         }
     }
 
@@ -67,8 +93,8 @@ impl MachineRoot {
             .ok_or(nfsstat3::NFS3ERR_STALE)
     }
 
-    /// The path of `name` inside directory `dirid`; a hidden root entry
-    /// does not exist as far as the host can tell.
+    /// The path of `name` inside directory `dirid`; a hidden entry does
+    /// not exist as far as the host can tell.
     fn child_path(&self, dirid: u64, name: &OsStr) -> Result<PathBuf, nfsstat3> {
         if is_hidden(dirid, name) {
             return Err(nfsstat3::NFS3ERR_NOENT);
@@ -95,10 +121,19 @@ impl MachineRoot {
 }
 
 fn is_hidden(dirid: u64, name: &OsStr) -> bool {
-    dirid == ROOT
-        && HIDDEN_ROOT_ENTRIES
-            .iter()
-            .any(|hidden| OsStr::new(hidden) == name)
+    name == SIDE_STORE_DIR
+        || (dirid == ROOT
+            && HIDDEN_ROOT_ENTRIES
+                .iter()
+                .any(|hidden| OsStr::new(hidden) == name))
+}
+
+/// A name nothing may be created under: the side store is the export's.
+fn reserved(name: &OsStr) -> Result<(), nfsstat3> {
+    if name == SIDE_STORE_DIR {
+        return Err(nfsstat3::NFS3ERR_ACCES);
+    }
+    Ok(())
 }
 
 /// A filename the host sent, as a path component: one component, so no
@@ -188,8 +223,8 @@ impl NfsReadFileSystem for MachineRoot {
 
     async fn getattr(&self, id: &Self::Handle) -> Result<fattr3, nfsstat3> {
         let id = id.as_u64();
-        if let Some(attr) = self.sidecar_attr(id) {
-            return Ok(attr);
+        if let Some(sidecar) = self.sidecar_of(id).await? {
+            return self.sidecar_attr(&sidecar).await;
         }
         let path = self.path_of(id)?;
         let map = self.map;
@@ -204,8 +239,8 @@ impl NfsReadFileSystem for MachineRoot {
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
         let id = id.as_u64();
-        if let Some(read) = self.read_sidecar(id, offset, count) {
-            return Ok(read);
+        if let Some(sidecar) = self.sidecar_of(id).await? {
+            return self.read_sidecar(&sidecar, offset, count).await;
         }
         let path = self.path_of(id)?;
         blocking(move || {
@@ -276,7 +311,7 @@ impl NfsReadFileSystem for MachineRoot {
 
     async fn readlink(&self, id: &Self::Handle) -> Result<nfspath3<'_>, nfsstat3> {
         let id = id.as_u64();
-        if self.is_sidecar(id) {
+        if self.sidecar_of(id).await?.is_some() {
             return Err(nfsstat3::NFS3ERR_INVAL);
         }
         let path = self.path_of(id)?;
@@ -304,10 +339,16 @@ mod tests {
     }
 
     #[test]
-    fn only_the_root_hides_arcbox() {
+    fn the_root_hides_arcbox_and_every_directory_its_side_store() {
         assert!(is_hidden(ROOT, OsStr::new("arcbox")));
         assert!(!is_hidden(ROOT, OsStr::new("etc")));
         assert!(!is_hidden(ROOT + 1, OsStr::new("arcbox")));
+        assert!(is_hidden(ROOT + 1, OsStr::new(SIDE_STORE_DIR)));
+        assert_eq!(
+            reserved(OsStr::new(SIDE_STORE_DIR)),
+            Err(nfsstat3::NFS3ERR_ACCES)
+        );
+        assert_eq!(reserved(OsStr::new("arcbox")), Ok(()));
     }
 
     #[tokio::test]
