@@ -57,11 +57,14 @@ pub mod common {
 /// Re-exports all machine-related types for backward compatibility.
 pub mod machine {
     pub use super::v1::{
-        CreateMachineRequest, CreateMachineResponse, DirectoryMount, InspectMachineRequest,
-        ListMachinesRequest, ListMachinesResponse, MachineEvent, MachineEventsRequest,
-        MachineExecOutput, MachineExecRequest, MachineHardware, MachineInfo, MachineNetwork,
-        MachineOs, MachineStorage, MachineSummary, RemoveMachineRequest, SshInfoRequest,
-        SshInfoResponse, StartMachineRequest, StopMachineRequest,
+        CloneMachineRequest, CloneMachineResponse, CreateMachineRequest, CreateMachineResponse,
+        DirectoryMount, ExportMachineRequest, ExportMachineResponse, ImportMachineRequest,
+        ImportMachineResponse, InspectMachineRequest, ListMachinesRequest, ListMachinesResponse,
+        MachineEvent, MachineEventsRequest, MachineExecOutput, MachineExecRequest, MachineHardware,
+        MachineInfo, MachineNetwork, MachineOs, MachineStorage, MachineSummary,
+        RemoveMachineRequest, SetDefaultMachineRequest, SetMachineResourcesRequest,
+        SetMachineResourcesResponse, SshInfoRequest, SshInfoResponse, StartMachineRequest,
+        StopMachineRequest,
     };
 }
 
