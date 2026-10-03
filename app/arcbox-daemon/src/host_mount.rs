@@ -29,22 +29,49 @@ pub struct MountInfo {
     pub fstype: String,
 }
 
-/// The mount whose mount point is exactly `path`, if any.
+/// Symlinks followed at most while resolving a mount point.
+const MAX_SYMLINK_HOPS: usize = 16;
+
+/// The mount whose mount point is `path`, if any.
 ///
-/// The path is canonicalized before the comparison. The kernel names a
-/// mount point by its resolved path — `/private/var/folders/...` for a data
-/// dir under `/var/folders` — so a literal comparison never matched one,
-/// and a daemon whose mount point sat behind a symlink neither recognized
-/// its own stale mount nor unmounted it at shutdown (the e2e harness then
-/// hung in `TempDir::drop` on the orphaned mount). A path that does not
-/// exist has nothing mounted at it.
+/// The kernel names a mount point by its resolved path — `/private/var/
+/// folders/...` for a data dir under `/var/folders` — so a literal
+/// comparison never matched one, and a daemon whose mount point sat behind
+/// a symlink neither recognized its own stale mount nor unmounted it at
+/// shutdown (the e2e harness then hung in `TempDir::drop` on the orphaned
+/// mount). But the path is never resolved by a `stat` of the mount point
+/// itself: that `stat` is answered by the filesystem mounted there, and
+/// hangs when its server is gone — the `~/ArcBox` export once the VM has
+/// stopped. So only the parent is canonicalized, the final component is
+/// looked up in the mount table as is, and `lstat`'d — local for anything
+/// but a mount point — only when the table has no entry, in case it is a
+/// symlink to the real mount point. A path that does not exist has nothing
+/// mounted at it.
 pub fn current_mount_info(path: &Path) -> Option<MountInfo> {
-    let target = std::fs::canonicalize(path).ok()?;
     let output = Command::new("/sbin/mount").output().ok()?;
     if !output.status.success() {
         return None;
     }
-    find_mount(&String::from_utf8_lossy(&output.stdout), &target)
+    resolve_mount(&String::from_utf8_lossy(&output.stdout), path)
+}
+
+/// [`current_mount_info`] against a `/sbin/mount` listing.
+fn resolve_mount(mount_output: &str, path: &Path) -> Option<MountInfo> {
+    let mut path = path.to_path_buf();
+    for _ in 0..MAX_SYMLINK_HOPS {
+        let parent = std::fs::canonicalize(path.parent()?).ok()?;
+        let candidate = parent.join(path.file_name()?);
+        if let Some(info) = find_mount(mount_output, &candidate) {
+            return Some(info);
+        }
+        // Not a mount point, so this `lstat` is answered locally.
+        let meta = std::fs::symlink_metadata(&candidate).ok()?;
+        if !meta.file_type().is_symlink() {
+            return None;
+        }
+        path = parent.join(std::fs::read_link(&candidate).ok()?);
+    }
+    None
 }
 
 /// Finds the mount whose mount point is `target` (already canonical) in
@@ -138,7 +165,35 @@ async fn run_umount(path: &Path, flags: &[&str]) -> Result<()> {
 mod tests {
     use std::path::Path;
 
-    use super::{MountInfo, find_mount, parse_mount_line};
+    use super::{MountInfo, find_mount, parse_mount_line, resolve_mount};
+
+    /// The mount point is found through `/var` → `/private/var` and
+    /// through a symlink at the final component, without the mount point
+    /// itself ever being `stat`'d: nothing is mounted at it here, yet the
+    /// table entry built from its parent's canonical path matches.
+    #[test]
+    fn a_mount_point_resolves_through_symlinks_above_and_at_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("real")).unwrap();
+        std::os::unix::fs::symlink("real", dir.path().join("link")).unwrap();
+        let canonical = std::fs::canonicalize(dir.path()).unwrap().join("real");
+        let table = format!(
+            "/dev/disk3s1 on / (apfs, local, journaled)\n\
+             192.168.64.3:/ on {} (nfs, nodev, nosuid, mounted by Xuan)\n",
+            canonical.display()
+        );
+        let info = MountInfo {
+            source: "192.168.64.3:/".into(),
+            fstype: "nfs".into(),
+        };
+        assert_eq!(
+            resolve_mount(&table, &dir.path().join("real")),
+            Some(info.clone())
+        );
+        assert_eq!(resolve_mount(&table, &dir.path().join("link")), Some(info));
+        assert_eq!(resolve_mount(&table, &dir.path().join("missing")), None);
+        assert_eq!(resolve_mount(&table, dir.path()), None, "a plain directory");
+    }
 
     #[test]
     fn parse_mount_line_extracts_source_and_fstype() {

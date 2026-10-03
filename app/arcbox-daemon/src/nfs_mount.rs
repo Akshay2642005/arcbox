@@ -29,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::context::DaemonContext;
-use crate::host_mount::{MountInfo, current_mount_info, unmount};
+use crate::host_mount::{MountInfo, current_mount_info, unmount, unmount_force};
 
 const MOUNT_TIMEOUT: Duration = Duration::from_secs(30);
 const MOUNT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
@@ -78,11 +78,26 @@ pub async fn cleanup(ctx: &DaemonContext) {
 
     // Re-check the shape in case the user replaced the mount since.
     match current_mount_info(mount_path) {
-        Some(info) if is_arcbox_nfs_mount(&info) => match unmount(mount_path).await {
+        Some(info) if is_arcbox_nfs_mount(&info) => match release(mount_path).await {
             Ok(()) => info!(path = %mount_path.display(), "unmounted ~/ArcBox host NFS mount"),
             Err(e) => warn!(path = %mount_path.display(), error = %e, "failed to unmount ~/ArcBox"),
         },
         _ => {}
+    }
+}
+
+/// Unmounts the export, by force if `umount` finds it busy. Its server is
+/// this daemon's and goes with it: a mount that outlived the daemon would
+/// be a dead NFS mount, which hangs every process that touches it — the
+/// daemon's own shutdown included, when it looks at the mount again after
+/// the VM has stopped.
+async fn release(mount_path: &Path) -> Result<()> {
+    match unmount(mount_path).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            warn!(path = %mount_path.display(), error = %e, "umount of ~/ArcBox failed; forcing");
+            unmount_force(mount_path).await
+        }
     }
 }
 
