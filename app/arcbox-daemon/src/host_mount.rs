@@ -81,6 +81,30 @@ pub fn current_mount_info(path: &Path) -> Option<MountInfo> {
     resolve_mount(&mount_table()?, path)
 }
 
+/// The mounts below `root` — never `root` itself — deepest first, so a
+/// caller releasing them never meets a mount still covered by a child.
+/// `root` is resolved like a mount point in [`current_mount_info`]: its
+/// parent canonicalized, itself never `stat`'d, so a root that is a dead
+/// mount is safe to ask about.
+pub fn mounts_under(root: &Path) -> Vec<(PathBuf, MountInfo)> {
+    let Some(root) = canonical_mount_point(root) else {
+        return Vec::new();
+    };
+    mount_table().map_or_else(Vec::new, |table| mounts_under_in(&table, &root))
+}
+
+/// [`mounts_under`] against a `/sbin/mount` listing; `root` is canonical.
+fn mounts_under_in(mount_output: &str, root: &Path) -> Vec<(PathBuf, MountInfo)> {
+    let mut mounts: Vec<(PathBuf, MountInfo)> = mount_output
+        .lines()
+        .filter_map(parse_mount_line)
+        .map(|(mountpoint, info)| (PathBuf::from(mountpoint), info))
+        .filter(|(mountpoint, _)| mountpoint.starts_with(root) && mountpoint != root)
+        .collect();
+    mounts.sort_by_key(|(mountpoint, _)| std::cmp::Reverse(mountpoint.components().count()));
+    mounts
+}
+
 /// The `/sbin/mount` listing, or `None` when it cannot be read.
 fn mount_table() -> Option<String> {
     let output = Command::new("/sbin/mount").output().ok()?;
@@ -206,9 +230,9 @@ async fn run_umount(path: &Path, flags: &[&str]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
-    use super::{MountInfo, find_mount, parse_mount_line, resolve_mount};
+    use super::{MountInfo, find_mount, mounts_under_in, parse_mount_line, resolve_mount};
 
     fn nfs(source: &str) -> MountInfo {
         MountInfo {
@@ -277,6 +301,47 @@ mod tests {
         assert_eq!(resolve_mount(&table, &dir.path().join("link")), Some(info));
         assert_eq!(resolve_mount(&table, &dir.path().join("missing")), None);
         assert_eq!(resolve_mount(&table, dir.path()), None, "a plain directory");
+    }
+
+    /// Everything below the root, deepest first, so the containerd child
+    /// is released before the export it hangs under; the root itself and a
+    /// sibling whose name merely extends the root's are not below it.
+    #[test]
+    fn mounts_under_lists_the_descendants_deepest_first() {
+        let table = "/dev/disk3s1 on / (apfs, local, journaled)\n\
+                     ArcBox:/ on /Users/t/ArcBox (nfs, nodev, read-only)\n\
+                     ArcBox:/ on /Users/t/ArcBox/docker (nfs, nodev, read-only)\n\
+                     192.168.64.7:/ on /Users/t/ArcBox/machines/ubuntu (nfs, nodev)\n\
+                     ArcBox:/containerd on /Users/t/ArcBox/docker/containerd (nfs, automounted)\n\
+                     192.168.64.8:/ on /Users/t/ArcBoxMachines/alpine (nfs, nodev)\n";
+        let under: Vec<PathBuf> = mounts_under_in(table, Path::new("/Users/t/ArcBox"))
+            .into_iter()
+            .map(|(mountpoint, _)| mountpoint)
+            .collect();
+        let position = |path: &str| {
+            under
+                .iter()
+                .position(|mountpoint| mountpoint == Path::new(path))
+                .unwrap_or_else(|| panic!("{path} is under the root: {under:?}"))
+        };
+        assert_eq!(under.len(), 3, "{under:?}");
+        assert!(
+            position("/Users/t/ArcBox/docker/containerd") < position("/Users/t/ArcBox/docker"),
+            "a child is released before the mount it hangs under: {under:?}"
+        );
+        position("/Users/t/ArcBox/machines/ubuntu");
+        assert_eq!(
+            mounts_under_in(table, Path::new("/Users/t/ArcBoxMachines"))
+                .into_iter()
+                .map(|(_, info)| info.source)
+                .collect::<Vec<_>>(),
+            ["192.168.64.8:/"]
+        );
+        assert_eq!(
+            mounts_under_in(table, Path::new("/Users/t/Other")).len(),
+            0,
+            "a root nothing is mounted under"
+        );
     }
 
     #[test]

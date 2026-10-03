@@ -3,6 +3,7 @@
 mod assets;
 mod cleanup;
 mod container_network_lease;
+mod host_mounts;
 mod lock;
 mod pipeline;
 mod resource_cleanup;

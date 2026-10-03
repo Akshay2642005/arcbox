@@ -16,7 +16,9 @@ use tracing::{info, warn};
 use crate::context::{ControlPlane, DaemonContext, EarlyContext, ServiceHandles, StartupHandles};
 use crate::{DaemonArgs, recovery, services};
 
-use super::{acquire_lock, assets, init_early, init_runtime, prepare_assets, wait_for_resources};
+use super::{
+    acquire_lock, assets, host_mounts, init_early, init_runtime, prepare_assets, wait_for_resources,
+};
 
 /// Entry point for the daemon startup lifecycle.
 pub struct Startup {
@@ -87,9 +89,14 @@ pub struct ControlPlaneStarted {
 }
 
 impl ControlPlaneStarted {
-    /// Waits for stale resource holders from a previous daemon to release.
+    /// Waits for stale resource holders from a previous daemon to release,
+    /// and releases what one left under the host mount root.
     pub async fn release_stale_resources(self) -> Result<ResourcesReleased> {
-        record_startup_phase("release_stale_resources", wait_for_resources(&self.ctx)).await?;
+        record_startup_phase("release_stale_resources", async {
+            wait_for_resources(&self.ctx).await?;
+            host_mounts::prepare(&self.ctx).await
+        })
+        .await?;
         Ok(ResourcesReleased {
             ctx: self.ctx,
             control_plane: self.control_plane,
