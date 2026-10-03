@@ -21,6 +21,9 @@ start_control_plane      Bind arcbox.sock, SystemService up;     ~instant
     │
 release_stale_resources  Wait for disk-image holders to release  0–10 s
     │                    Reported as CLEANING_UP via gRPC.
+    │                    Then release the mounts a previous daemon
+    │                    left under ~/ArcBox (forced; the servers
+    │                    died with it) and create its directories.
     │
 prepare_assets           Seed/download boot assets               variable
     │                    Reported as DOWNLOADING_ASSETS →
@@ -211,6 +214,7 @@ When the daemon is killed without graceful shutdown:
 | `docker.sock` | **stale** | `DockerApiServer::bind` removes before bind |
 | `arcbox.sock` | **stale** | `start_grpc` removes before bind |
 | disk images | **possibly held by XPC helpers** | `wait_for_resources` waits up to 10 s |
+| `~/ArcBox/docker`, `~/ArcBox/machines/<name>` | **dead NFS mounts** (their servers died with the daemon) | `startup::host_mounts::prepare` force-unmounts them, and the pre-ADR-0003 layout (`~/ArcBox` itself, `~/ArcBoxMachines/<name>`) |
 | VM | non-graceful termination | Virtualization.framework cleans up |
 | Route | **stale** | `recovery::run()` rebuilds |
 
@@ -229,11 +233,13 @@ When a new daemon starts while an old one is still running:
 6. Falls back to SIGKILL if unresponsive.
 7. Acquires the lock once released.
 8. `start_grpc` removes any stale sockets before binding.
-9. `wait_for_resources` waits for disk-image holders to release.
+9. `wait_for_resources` waits for disk-image holders to release, then
+   `host_mounts::prepare` releases whatever the old daemon left mounted
+   under `~/ArcBox`.
 
-The old daemon's graceful shutdown runs its full sequence (drain, VM stop,
-socket cleanup). The new daemon only needs to handle the disk-image
-holdover case.
+The old daemon's graceful shutdown runs its full sequence (drain, unmount,
+VM stop, socket cleanup). The new daemon only needs to handle the
+disk-image holdover case and a mount the old one could not release.
 
 ## Socket Lifecycle
 

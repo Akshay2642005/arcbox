@@ -126,29 +126,31 @@ curl http://localhost:8080/
 
 ### Container files in Finder
 
-The guest's Docker data is mounted read-only on the host at `~/ArcBox`, served
-over NFSv4 through a vsock relay. Named volumes, container state, and image
-layers are browsable in Finder and readable by any host tool — no `docker cp`.
+The guest's Docker data is mounted read-only on the host at `~/ArcBox/docker`,
+served over NFSv4 through a vsock relay. Named volumes, container state, and
+image layers are browsable in Finder and readable by any host tool — no
+`docker cp`.
 
 ```bash
-open ~/ArcBox
-grep -r "panic" ~/ArcBox/volumes/my-app-data/_data
+open ~/ArcBox/docker
+grep -r "panic" ~/ArcBox/docker/volumes/my-app-data/_data
 ```
 
 ### Machine files in Finder
 
 A running Linux machine's root filesystem is mounted read-write at
-`~/ArcBoxMachines/<name>`, served over NFSv3 by the machine itself on its
+`~/ArcBox/machines/<name>`, served over NFSv3 by the machine itself on its
 bridge NIC. Edit a machine's files with any Mac editor; the mount appears
 when the machine starts and goes away when it stops.
 
 ```bash
 abctl machine start ubuntu
-code ~/ArcBoxMachines/ubuntu/root/project
+code ~/ArcBox/machines/ubuntu/root/project
 ```
 
 Files the Mac creates belong to root inside the machine, and root's files
 show as yours on the Mac; every other owner keeps its numeric id.
+`~/ArcBox` itself is a plain folder; `ARCBOX_HOST_MOUNT_DIR` moves it.
 
 ### Live resource usage
 

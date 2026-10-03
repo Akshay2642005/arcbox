@@ -218,9 +218,10 @@ Not files under a fixed directory, but state ArcBox leaves on the Mac.
 
 | State | Created by | Removed by |
 |-------|-----------|------------|
-| `/etc/hosts` line `127.0.0.1 ArcBox # managed by arcbox-helper` | helper (`hosts_alias_install`), so the `~/ArcBox` mount shows `ArcBox` as its source | `abctl uninstall` |
-| `~/ArcBox` NFS mount of the guest's Docker data, and the mount point | daemon (`nfs_mount`) | daemon on shutdown; `abctl uninstall` when a daemon left it |
-| `~/ArcBoxMachines/<name>`: read-write NFSv3 mount of a running machine's root filesystem, served by the machine's agent on its bridge NIC; the mount point exists only while the machine runs. `ARCBOX_MACHINE_MOUNT_DIR` moves the root (test daemons keep it in their data dir) | daemon (`machine_mount`) | daemon when the machine stops or is removed and on shutdown; `abctl uninstall` when a daemon left one |
+| `/etc/hosts` line `127.0.0.1 ArcBox # managed by arcbox-helper` | helper (`hosts_alias_install`), so the `~/ArcBox/docker` mount shows `ArcBox` as its source | `abctl uninstall` |
+| `~/ArcBox/`: the host mount root, a plain directory holding every guest filesystem the daemon shows the user (ADR 0003). `ARCBOX_HOST_MOUNT_DIR` moves it (test daemons keep it in their data dir). At startup the daemon force-unmounts whatever a previous daemon left under it — their servers died with it — and the pre-ADR-0003 layout (section 10) | daemon (`startup::host_mounts`) | `abctl uninstall`, when nothing but the daemon's directories is left in it |
+| `~/ArcBox/docker`: read-only NFSv4 mount of the guest's Docker data; the containerd data root is the child export at `docker/containerd`, mounted by the NFS client on its own | daemon (`nfs_mount`) | daemon on shutdown; `abctl uninstall` when a daemon left it |
+| `~/ArcBox/machines/<name>`: read-write NFSv3 mount of a running machine's root filesystem, served by the machine's agent on its bridge NIC; the mount point exists only while the machine runs | daemon (`machine_mount`) | daemon when the machine stops or is removed and on shutdown; `abctl uninstall` when a daemon left one |
 | Login keychain: the `ArcBox Local CA` certificate and its TLS trust | user (`abctl tls trust`) | `abctl tls untrust`, `abctl uninstall` |
 | `~/.kube/config`: the `arcbox` context, cluster and user; `~/.arcbox/kube/` | user (`abctl k8s enable`) | `abctl k8s disable`, `abctl uninstall` |
 | Login Items entry for the daemon (BTM database) | desktop (SMAppService) | the Desktop app when it quits |
@@ -397,6 +398,8 @@ older installations. They can be safely deleted.
 | `~/.arcbox/log/daemon.stdout.log` | Old CLI `daemon start` stdout | Legacy |
 | `~/.arcbox/log/daemon.stderr.log` | Old CLI `daemon start` stderr | Legacy |
 | `~/.arcbox/log/daemon.err` | Old `arcbox install` plist stderr | Legacy |
+| `~/ArcBox` as an NFS mount | The guest's Docker data, mounted at the root itself before ADR 0003 (2026-10-04) | Legacy — the daemon force-unmounts it at startup and mounts at `~/ArcBox/docker` |
+| `~/ArcBoxMachines/<name>` | Machine root mounts before ADR 0003 | Legacy — the daemon unmounts them and removes the empty directory at startup; `abctl uninstall` does the same |
 
 ---
 
@@ -427,9 +430,12 @@ What the command does, in order:
    Login Items entry), then stops the daemon: through `launchctl bootout` when
    launchd manages it, otherwise through the PID in `~/.arcbox/run/daemon.lock`.
    The daemon stops its own System VM; no other process is killed by name.
-2. Unregisters the helper LaunchDaemon, unmounts `~/ArcBox` if the daemon
-   left the mount behind, and unmounts and removes the machine mount points
-   under `~/ArcBoxMachines`.
+2. Unregisters the helper LaunchDaemon, then unmounts whatever a daemon
+   left under `~/ArcBox` — the Docker export at `docker/`, machine roots
+   under `machines/`, or the export an older daemon mounted at `~/ArcBox`
+   itself — and under `~/ArcBoxMachines`, removing the directories that
+   are then empty. The daemon is already stopped, so the unmounts are
+   forced; a mount of another shape or a directory with your files stays.
 3. Removes the Docker context (restoring the previous current context), the
    shell integration (section 1.6, 1.7, 1.8, 7, and the Docker CLI plugin
    registration in section 5), the kubectl integration, the `~/.ssh/config`
@@ -457,7 +463,7 @@ writes goes into both.
 
 | Component | Paths Managed |
 |-----------|--------------|
-| **daemon** | `~/.arcbox/{run,log,data,boot,runtime,ssh}/`, sockets, PID, boot asset download, bundle seeding |
+| **daemon** | `~/.arcbox/{run,log,data,boot,runtime,ssh}/`, sockets, PID, boot asset download, bundle seeding, `~/ArcBox/` and the mounts under it |
 | **cli** (`abctl`) | `~/.arcbox/{bin,shell,completions}/`, Docker context, LaunchAgent registration, shell profile injection, the opt-in `~/.ssh/config` Include |
 | **helper** (root) | `/etc/resolver/`, `/usr/local/bin/` symlinks, `/var/run/docker.sock` symlink |
 | **desktop** | SMAppService LaunchAgent registration, `~/.arcbox/run/` directory creation, helper install trigger |

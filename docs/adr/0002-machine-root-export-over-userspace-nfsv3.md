@@ -1,6 +1,6 @@
 # ADR 0002: A distro machine's root is served to the host by a userspace NFSv3 server in its agent, mounted over the bridge NIC
 
-- Status: accepted (2026-10-03)
+- Status: accepted (2026-10-03); decisions 4 and 5 superseded by [ADR 0003](0003-single-host-mount-root.md) (2026-10-04): the mount root is `~/ArcBox/machines/<name>` under one host mount root, relocated by `ARCBOX_HOST_MOUNT_DIR`
 - Deciders: Xuan
 - Commits: the `feat/machine-file-sharing` series (protocol `EnsureMachineExport`, `guest/arcbox-agent/src/machine_export/`, `app/arcbox-daemon/src/machine_mount/`)
 - Evidence: `docs/experiments/2026-10-03-machine-root-export.md`
