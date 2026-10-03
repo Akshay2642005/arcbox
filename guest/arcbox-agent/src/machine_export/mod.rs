@@ -20,6 +20,7 @@
 
 mod attr;
 mod ids;
+mod vfs;
 
 use std::net::IpAddr;
 
