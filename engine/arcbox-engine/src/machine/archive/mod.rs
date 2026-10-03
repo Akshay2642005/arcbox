@@ -9,8 +9,12 @@
 //! not in the archive: it is the published image the manifest names, which
 //! import requires to be in the local registry.
 //!
-//! [`write`](write::write) builds an archive.
+//! [`write`](write::write) builds an archive, [`read_manifest`] and
+//! [`extract_data_disk`] read one back.
 
+mod read;
+#[cfg(test)]
+mod tests;
 mod write;
 
 use arcbox_image::machine_image::MachineImageManifest;
@@ -19,6 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use super::MachineMount;
 
+pub use read::{extract_data_disk, read_manifest};
 pub use write::write;
 
 /// The archive format this build writes, and the only one it reads.
