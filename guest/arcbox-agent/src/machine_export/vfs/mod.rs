@@ -12,6 +12,8 @@
 //! its own disk images back through two filesystems, and Finder or `du`
 //! would happily read them.
 
+mod write;
+
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
