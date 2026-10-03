@@ -248,6 +248,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "wait-timeout",
+ "xattr",
 ]
 
 [[package]]
