@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use arcbox_api::SetupPhase;
-use arcbox_constants::paths::{ArcboxProfile, HostLayout};
+use arcbox_constants::paths::{ArcboxProfile, HostLayout, HostMountLayout};
 use arcbox_core::{Config, InitProgress, Runtime};
 use arcbox_helper::validate::Domain;
 use macos_resolver::to_env_prefix;
@@ -68,6 +68,12 @@ async fn init_early(args: DaemonArgs, handles: StartupHandles) -> Result<EarlyCo
 
     let dns_port = dns_port(args.dns_port);
     let kubernetes_context = kubernetes_context(profile, args.kubernetes_context)?;
+    let host_mounts = HostMountLayout::from_env_or_home().with_context(|| {
+        format!(
+            "could not determine the host mount root: set {} or HOME",
+            arcbox_constants::env::HOST_MOUNT_DIR
+        )
+    })?;
 
     Ok(EarlyContext {
         profile,
@@ -86,6 +92,7 @@ async fn init_early(args: DaemonArgs, handles: StartupHandles) -> Result<EarlyCo
         ssh_port: args.ssh_port,
         docker_integration: args.docker_integration,
         mount_nfs: !args.no_mount_nfs,
+        host_mounts,
         vm_args: VmArgs {
             guest_docker_vsock_port: args.guest_docker_vsock_port,
             container_cidr: args.container_cidr,
@@ -145,6 +152,7 @@ async fn acquire_lock(early: EarlyContext) -> Result<DaemonContext> {
         ssh_port: early.ssh_port,
         docker_integration: early.docker_integration,
         mount_nfs: early.mount_nfs,
+        host_mounts: early.host_mounts,
         vm_args: early.vm_args,
     })
 }

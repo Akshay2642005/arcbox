@@ -1,13 +1,17 @@
-//! Host-side NFSv4 mount of the guest docker data export at `~/ArcBox`.
+//! Host-side NFSv4 mount of the guest docker data export at `~/ArcBox/docker`.
 //!
 //! The guest agent exports `/var/lib/docker` read-only over NFSv4, which serves
 //! everything on the single well-known port 2049 (no MOUNT protocol). This
 //! module runs one localhost TCP proxy and bridges it to the guest over vsock:
 //!
 //! ```text
-//! mount_nfs -o vers=4,port=<nfsd> 127.0.0.1:/ ~/ArcBox
+//! mount_nfs -o vers=4,port=<nfsd> 127.0.0.1:/ ~/ArcBox/docker
 //!   └─ 127.0.0.1:<nfsd> → vsock NFS_NFSD_RELAY_PORT (HalfCloseStream-framed) → guest 127.0.0.1:2049
 //! ```
+//!
+//! The mount point is `docker/` under the host mount root (`DaemonContext::
+//! host_mounts`, ADR 0003); the containerd data root is an NFSv4 child export
+//! the client mounts on its own at `docker/containerd`.
 //!
 //! Readiness needs no separate probe: the reconcile simply retries `mount_nfs`
 //! until the guest server answers, so the mount is its own liveness check and
@@ -29,7 +33,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::context::DaemonContext;
-use crate::host_mount::{MountInfo, current_mount_info, unmount, unmount_force};
+use crate::host_mount::{current_mount_info, unmount, unmount_force};
 
 const MOUNT_TIMEOUT: Duration = Duration::from_secs(30);
 const MOUNT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
@@ -39,10 +43,10 @@ const RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Path this daemon successfully mounted, set once by the reconcile task.
 /// [`cleanup`] only unmounts what this process created — a daemon that never
-/// completed its mount must not unmount whatever else sits at `~/ArcBox`.
+/// completed its mount must not unmount whatever else sits at `~/ArcBox/docker`.
 static MOUNTED_PATH: OnceLock<PathBuf> = OnceLock::new();
 
-/// Spawns the background task that mounts the guest export at `~/ArcBox`.
+/// Spawns the background task that mounts the guest export at `~/ArcBox/docker`.
 pub fn spawn(ctx: &DaemonContext, runtime: &Arc<Runtime>) {
     if !ctx.mount_nfs {
         return;
@@ -57,14 +61,15 @@ pub fn spawn(ctx: &DaemonContext, runtime: &Arc<Runtime>) {
 
     let runtime = Arc::clone(runtime);
     let shutdown = ctx.shutdown.clone();
+    let mount_path = ctx.host_mounts.docker();
     tokio::spawn(async move {
-        if let Err(e) = reconcile(runtime, shutdown, expect_hosts_alias).await {
-            warn!(error = %e, "failed to establish host NFS mount at ~/ArcBox");
+        if let Err(e) = reconcile(runtime, shutdown, expect_hosts_alias, mount_path).await {
+            warn!(error = %e, "failed to establish host NFS mount at ~/ArcBox/docker");
         }
     });
 }
 
-/// Unmounts `~/ArcBox` on shutdown, but only the mount this daemon created.
+/// Unmounts `~/ArcBox/docker` on shutdown, but only the mount this daemon created.
 pub async fn cleanup(ctx: &DaemonContext) {
     if !ctx.mount_nfs {
         return;
@@ -78,9 +83,11 @@ pub async fn cleanup(ctx: &DaemonContext) {
 
     // Re-check the shape in case the user replaced the mount since.
     match current_mount_info(mount_path) {
-        Some(info) if is_arcbox_nfs_mount(&info) => match release(mount_path).await {
-            Ok(()) => info!(path = %mount_path.display(), "unmounted ~/ArcBox host NFS mount"),
-            Err(e) => warn!(path = %mount_path.display(), error = %e, "failed to unmount ~/ArcBox"),
+        Some(info) if info.is_docker_export() => match release(mount_path).await {
+            Ok(()) => info!(path = %mount_path.display(), "unmounted the docker export"),
+            Err(e) => {
+                warn!(path = %mount_path.display(), error = %e, "failed to unmount the docker export");
+            }
         },
         _ => {}
     }
@@ -95,7 +102,7 @@ async fn release(mount_path: &Path) -> Result<()> {
     match unmount(mount_path).await {
         Ok(()) => Ok(()),
         Err(e) => {
-            warn!(path = %mount_path.display(), error = %e, "umount of ~/ArcBox failed; forcing");
+            warn!(path = %mount_path.display(), error = %e, "umount of ~/ArcBox/docker failed; forcing");
             unmount_force(mount_path).await
         }
     }
@@ -105,11 +112,8 @@ async fn reconcile(
     runtime: Arc<Runtime>,
     shutdown: CancellationToken,
     expect_hosts_alias: bool,
+    mount_path: PathBuf,
 ) -> Result<()> {
-    let Some(mount_path) = resolve_mount_path() else {
-        bail!("could not determine home directory for ~/ArcBox mount");
-    };
-
     // One localhost TCP proxy to the guest nfsd, bridged over vsock. It outlives
     // VM restarts: each connection dials `connect_vsock_port` against whatever
     // guest is current, so the same local port keeps working across reboots.
@@ -146,7 +150,7 @@ async fn reconcile(
             if shutdown.is_cancelled() {
                 break;
             }
-            warn!(error = %e, "could not establish the ~/ArcBox export; retrying");
+            warn!(error = %e, "could not establish the ~/ArcBox/docker export; retrying");
             if !sleep_unless_shutdown(RETRY_BACKOFF, &shutdown).await {
                 break;
             }
@@ -158,7 +162,7 @@ async fn reconcile(
         if !wait_for_state(&mut state, &shutdown, |s| !s.is_ready()).await {
             break;
         }
-        info!("system VM stopped; the ~/ArcBox export will be rebuilt when it returns");
+        info!("system VM stopped; the ~/ArcBox/docker export will be rebuilt when it returns");
     }
     Ok(())
 }
@@ -176,7 +180,7 @@ async fn establish(
     shutdown: &CancellationToken,
 ) -> Result<()> {
     if occupancy == MountPoint::Stale {
-        info!(path = %mount_path.display(), "replacing stale ~/ArcBox NFS mount");
+        info!(path = %mount_path.display(), "replacing stale ~/ArcBox/docker NFS mount");
         unmount(mount_path).await?;
     }
     std::fs::create_dir_all(mount_path)?;
@@ -405,7 +409,7 @@ async fn mount_with_retry(
 
     loop {
         if shutdown.is_cancelled() {
-            bail!("daemon shutdown before ~/ArcBox mount completed");
+            bail!("daemon shutdown before ~/ArcBox/docker mount completed");
         }
 
         // Re-evaluated each attempt: on a fresh install the self-setup task
@@ -419,7 +423,7 @@ async fn mount_with_retry(
                 info!(
                     path = %mount_path.display(),
                     nfsd_port,
-                    "mounted guest docker data at ~/ArcBox (NFSv4, read-only)"
+                    "mounted guest docker data at ~/ArcBox/docker (NFSv4, read-only)"
                 );
                 return Ok(());
             }
@@ -478,19 +482,6 @@ fn render_mount_opts(nfsd_port: u16) -> String {
     format!("ro,noowners,vers=4,rdirplus,actimeo=10,deadtimeout=60,port={nfsd_port}")
 }
 
-/// Host mount point: `$ARCBOX_HOST_MOUNT_DIR` when set (so a test daemon stays
-/// off the shared `~/ArcBox`), otherwise `~/ArcBox`.
-fn resolve_mount_path() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("ARCBOX_HOST_MOUNT_DIR") {
-        return Some(PathBuf::from(dir));
-    }
-    dirs::home_dir().map(|home| resolve_mount_path_from_home(&home))
-}
-
-fn resolve_mount_path_from_home(home: &Path) -> PathBuf {
-    home.join("ArcBox")
-}
-
 /// What currently holds the mount point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MountPoint {
@@ -510,9 +501,9 @@ enum MountPoint {
 fn classify_mount_point(mount_path: &Path) -> Result<MountPoint> {
     match current_mount_info(mount_path) {
         None => Ok(MountPoint::Free),
-        Some(info) if is_arcbox_nfs_mount(&info) => Ok(MountPoint::Stale),
+        Some(info) if info.is_docker_export() => Ok(MountPoint::Stale),
         Some(info) => bail!(
-            "~/ArcBox path {} already occupied by {} ({})",
+            "the docker export mount point {} is already occupied by {} ({})",
             mount_path.display(),
             info.source,
             info.fstype
@@ -520,58 +511,11 @@ fn classify_mount_point(mount_path: &Path) -> Result<MountPoint> {
     }
 }
 
-/// True when the mount at the path has exactly the shape this daemon creates:
-/// NFS from the v4 pseudo-root of the localhost proxy, under either source
-/// spelling (the loopback literal, or the `ArcBox` hosts alias) — a stale
-/// mount must be reclaimable regardless of which name it was created with.
-fn is_arcbox_nfs_mount(info: &MountInfo) -> bool {
-    info.fstype == "nfs"
-        && (info.source == mount_source_for(false) || info.source == mount_source_for(true))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        MountInfo, VmLifecycleState, is_arcbox_nfs_mount, mount_source_for, render_mount_opts,
-        resolve_mount_path_from_home, wait_for_state,
-    };
-    use std::path::{Path, PathBuf};
+    use super::{VmLifecycleState, mount_source_for, render_mount_opts, wait_for_state};
     use tokio::sync::watch;
     use tokio_util::sync::CancellationToken;
-
-    #[test]
-    fn only_our_exact_mount_shape_is_reclaimed() {
-        // Both source spellings are ours — loopback (no hosts alias) and
-        // the branded alias name.
-        for source in ["127.0.0.1:/", "ArcBox:/"] {
-            let ours = MountInfo {
-                source: source.to_string(),
-                fstype: "nfs".to_string(),
-            };
-            assert!(is_arcbox_nfs_mount(&ours), "{source} should be reclaimed");
-        }
-
-        // A user's own NFS mount at ~/ArcBox must never be unmounted.
-        let foreign_nfs = MountInfo {
-            source: "fileserver:/export/home".to_string(),
-            fstype: "nfs".to_string(),
-        };
-        assert!(!is_arcbox_nfs_mount(&foreign_nfs));
-
-        let smb = MountInfo {
-            source: "//user@server/share".to_string(),
-            fstype: "smbfs".to_string(),
-        };
-        assert!(!is_arcbox_nfs_mount(&smb));
-    }
-
-    #[test]
-    fn mount_path_is_arcbox_under_home() {
-        assert_eq!(
-            resolve_mount_path_from_home(Path::new("/Users/tester")),
-            PathBuf::from("/Users/tester/ArcBox")
-        );
-    }
 
     #[test]
     fn mount_opts_are_readonly_v4_with_nfsd_port_pinned() {

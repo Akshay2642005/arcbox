@@ -2,12 +2,13 @@
 //!
 //! A machine that reaches readiness is asked (`EnsureMachineExport`) to
 //! serve its root over NFSv3 on its bridge NIC, and the endpoint is mounted
-//! read-write at `<root>/<name>`: `~/ArcBoxMachines/<name>` unless
-//! `ARCBOX_MACHINE_MOUNT_DIR` moves the root, which the e2e harness and the
-//! dev daemons do to stay inside their data dir. The mount is released when
-//! the machine begins to stop, so the unmount still reaches a live server,
-//! and swept again once it has stopped or been removed; daemon shutdown
-//! unmounts everything before it stops the machines, for the same reason.
+//! read-write at `machines/<name>` under the host mount root —
+//! `~/ArcBox/machines/<name>` unless `ARCBOX_HOST_MOUNT_DIR` moves the root,
+//! which the e2e harness and the dev daemons do to stay inside their data
+//! dir (ADR 0003). The mount is released when the machine begins to stop,
+//! so the unmount still reaches a live server, and swept again once it has
+//! stopped or been removed; daemon shutdown unmounts everything before it
+//! stops the machines, for the same reason.
 //!
 //! The loop follows the runtime's event bus the way `machine_dns` does and
 //! re-derives what should be mounted from each machine's record, so a
@@ -23,12 +24,6 @@
 //! gone, so the mount point disappears with the machine rather than
 //! lingering, empty, after the NFS client gives the dead server up on its
 //! own (`deadtimeout`).
-//!
-//! Why not `~/ArcBox/machines/<name>`: `~/ArcBox` is itself the read-only
-//! NFS mount of the System VM's docker data, so nothing can be created
-//! inside it. Moving that export to `~/ArcBox/docker` would free the name,
-//! but the desktop app maps guest paths onto `~/ArcBox/<rest>` and would
-//! have to move with it; that layout change is a decision of its own.
 
 mod export;
 mod registry;
@@ -48,15 +43,11 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use self::export::{host_addresses_on_link, is_machine_export, release};
+use self::export::{host_addresses_on_link, release};
 use self::registry::{Entry, Mounts};
 use crate::context::DaemonContext;
 use crate::host_mount;
 
-/// Names the directory the machine mounts live under.
-const MOUNT_ROOT_ENV: &str = "ARCBOX_MACHINE_MOUNT_DIR";
-/// The directory under the home directory they live under by default.
-const DEFAULT_MOUNT_ROOT: &str = "ArcBoxMachines";
 /// The guest account the host user stands in for. Machines have no default
 /// user yet — `abctl machine exec` and `ssh <machine>@arcbox` run as root —
 /// so files the host creates belong to root, like everything else it does
@@ -75,8 +66,9 @@ pub fn spawn(ctx: &DaemonContext, runtime: &Arc<Runtime>) {
     let events = runtime.event_bus().subscribe();
     let shutdown = ctx.shutdown.clone();
     let runtime = Arc::clone(runtime);
+    let root = ctx.host_mounts.machines();
     drop(tokio::spawn(async move {
-        run(&runtime, events, shutdown).await;
+        run(&runtime, &root, events, shutdown).await;
     }));
 }
 
@@ -96,22 +88,23 @@ pub async fn cleanup() {
 
 async fn run(
     runtime: &Arc<Runtime>,
+    root: &Path,
     mut events: broadcast::Receiver<Event>,
     shutdown: CancellationToken,
 ) {
-    sync_all(runtime).await;
+    sync_all(runtime, root).await;
     loop {
         tokio::select! {
             () = shutdown.cancelled() => break,
             event = events.recv() => match event {
-                Ok(Event::MachineStarted { name }) => sync(runtime, &name).await,
+                Ok(Event::MachineStarted { name }) => sync(runtime, root, &name).await,
                 Ok(
                     Event::MachineStopping { name }
                     | Event::MachineStopped { name }
                     | Event::MachineRemoved { name },
                 ) => unmount_machine(&name).await,
                 Ok(_) => {}
-                Err(RecvError::Lagged(_)) => sync_all(runtime).await,
+                Err(RecvError::Lagged(_)) => sync_all(runtime, root).await,
                 Err(RecvError::Closed) => break,
             },
         }
@@ -120,10 +113,10 @@ async fn run(
 
 /// Brings `name`'s mount in line with its record: present while the machine
 /// runs with a bridge address, absent otherwise.
-async fn sync(runtime: &Arc<Runtime>, name: &str) {
+async fn sync(runtime: &Arc<Runtime>, root: &Path, name: &str) {
     match runtime.machine_manager().get(name) {
         Some(machine) if exports_its_root(&machine) => {
-            if let Err(e) = mount_machine(runtime, &machine).await {
+            if let Err(e) = mount_machine(runtime, root, &machine).await {
                 warn!(machine = name, error = %e, "could not mount the machine's root on the host");
             }
         }
@@ -133,7 +126,7 @@ async fn sync(runtime: &Arc<Runtime>, name: &str) {
 
 /// Every machine the daemon knows or still has mounted, for the lagged
 /// case: a machine removed during the lag is only in the second set.
-async fn sync_all(runtime: &Arc<Runtime>) {
+async fn sync_all(runtime: &Arc<Runtime>, root: &Path) {
     let mut names: Vec<String> = runtime
         .machine_manager()
         .list()
@@ -144,12 +137,12 @@ async fn sync_all(runtime: &Arc<Runtime>) {
     names.sort_unstable();
     names.dedup();
     for name in names {
-        sync(runtime, &name).await;
+        sync(runtime, root, &name).await;
     }
 }
 
 /// Whether a machine's root is mounted while it runs: it is a distro
-/// machine (the System VM's data is the `~/ArcBox` export) with a bridge
+/// machine (the System VM's data is the docker export) with a bridge
 /// address the host can reach.
 fn exports_its_root(machine: &MachineInfo) -> bool {
     machine.state == MachineState::Running
@@ -157,7 +150,7 @@ fn exports_its_root(machine: &MachineInfo) -> bool {
         && machine.bridge_ip_address.is_some()
 }
 
-/// Mounts a running machine's root at its mount point and records it.
+/// Mounts a running machine's root at `<root>/<name>` and records it.
 /// Idempotent: a machine this daemon already mounted is left as it is.
 ///
 /// # Errors
@@ -165,13 +158,17 @@ fn exports_its_root(machine: &MachineInfo) -> bool {
 /// Returns an error when the host has no address on the machine's bridge
 /// network, the mount point is held by a mount this daemon did not create,
 /// the agent refuses the export, or `mount_nfs` keeps failing.
-pub async fn mount_machine(runtime: &Arc<Runtime>, machine: &MachineInfo) -> Result<PathBuf> {
-    let mount_path = mount_root()?.join(&machine.name);
+pub async fn mount_machine(
+    runtime: &Arc<Runtime>,
+    root: &Path,
+    machine: &MachineInfo,
+) -> Result<PathBuf> {
+    let mount_path = root.join(&machine.name);
     let already = mounted()
         .get(&machine.name)
         .is_some_and(|entry| entry.path == mount_path && !entry.stale);
     if already
-        && host_mount::current_mount_info(&mount_path).is_some_and(|info| is_machine_export(&info))
+        && host_mount::current_mount_info(&mount_path).is_some_and(|info| info.is_machine_export())
     {
         return Ok(mount_path);
     }
@@ -191,7 +188,7 @@ pub async fn mount_machine(runtime: &Arc<Runtime>, machine: &MachineInfo) -> Res
 
     match host_mount::current_mount_info(&mount_path) {
         None => {}
-        Some(info) if is_machine_export(&info) => {
+        Some(info) if info.is_machine_export() => {
             info!(path = %mount_path.display(), source = %info.source, "replacing a stale machine mount");
             release(&mount_path).await?;
         }
@@ -282,7 +279,7 @@ async fn retry_unmount(name: String, path: PathBuf, generation: u64) {
 async fn unmount_path(name: &str, path: &Path) -> bool {
     match host_mount::current_mount_info(path) {
         None => {}
-        Some(info) if is_machine_export(&info) => match release(path).await {
+        Some(info) if info.is_machine_export() => match release(path).await {
             Ok(()) => info!(machine = name, path = %path.display(), "unmounted the machine's root"),
             Err(e) => {
                 warn!(machine = name, path = %path.display(), error = %e, "failed to unmount the machine's root");
@@ -301,16 +298,6 @@ async fn unmount_path(name: &str, path: &Path) -> bool {
         debug!(path = %path.display(), error = %e, "mount point not removed");
     }
     true
-}
-
-/// The directory the machine mounts live under.
-fn mount_root() -> Result<PathBuf> {
-    if let Some(dir) = std::env::var_os(MOUNT_ROOT_ENV) {
-        return Ok(PathBuf::from(dir));
-    }
-    dirs::home_dir()
-        .map(|home| home.join(DEFAULT_MOUNT_ROOT))
-        .context("could not determine the home directory for the machine mounts")
 }
 
 fn mounted() -> std::sync::MutexGuard<'static, Mounts> {

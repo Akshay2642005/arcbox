@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use arcbox_api::{SetupState, SharedRuntime};
 use arcbox_constants::container_network::ContainerNetwork;
-use arcbox_constants::paths::{ArcboxProfile, HostLayout};
+use arcbox_constants::paths::{ArcboxProfile, HostLayout, HostMountLayout};
 use tokio_util::sync::CancellationToken;
 
 use crate::dns_service::DnsService;
@@ -104,8 +104,10 @@ pub struct EarlyContext {
     /// `None` preserves the canonical best-effort 16022 listener.
     pub ssh_port: Option<u16>,
     pub docker_integration: bool,
-    /// Mount the guest Docker data export at the configured host directory once ready.
+    /// Mount the guest Docker data export under the host mount root once ready.
     pub mount_nfs: bool,
+    /// The host mount root (`~/ArcBox`) and the mount points under it.
+    pub host_mounts: HostMountLayout,
     pub vm_args: VmArgs,
 }
 
@@ -142,8 +144,10 @@ pub struct DaemonContext {
     /// Explicit SSH server port; `None` uses best-effort port 16022.
     pub ssh_port: Option<u16>,
     pub docker_integration: bool,
-    /// Mount the guest Docker data export at the configured host directory once ready.
+    /// Mount the guest Docker data export under the host mount root once ready.
     pub mount_nfs: bool,
+    /// The host mount root (`~/ArcBox`) and the mount points under it.
+    pub host_mounts: HostMountLayout,
     pub vm_args: VmArgs,
 }
 

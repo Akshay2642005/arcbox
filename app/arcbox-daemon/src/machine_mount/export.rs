@@ -1,6 +1,6 @@
-//! How a machine export is mounted and unmounted: the NFSv3 options, the
-//! shape such a mount has in the mount table, and the host addresses the
-//! export must admit.
+//! How a machine export is mounted and unmounted: the NFSv3 options and
+//! the host addresses the export must admit. The shape such a mount has
+//! in the mount table is `MountInfo::is_machine_export`.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use tracing::{debug, warn};
 
-use crate::host_mount::{self, MountInfo};
+use crate::host_mount;
 
 /// Budget for mounting one machine. The export answers before the RPC
 /// returns, so the retries only cover the NFS client's first connection.
@@ -77,20 +77,6 @@ fn render_mount_opts(port: u16) -> String {
     )
 }
 
-/// The shape of a machine export mount: NFS from the root of a server
-/// named by a non-loopback IPv4 address — a machine's bridge address, never
-/// the loopback proxy the docker export mounts through. Checked only under
-/// the mount root, which is this daemon's, so it cannot mistake a user's
-/// mount for its own.
-pub(super) fn is_machine_export(info: &MountInfo) -> bool {
-    info.fstype == "nfs"
-        && info
-            .source
-            .strip_suffix(":/")
-            .and_then(|host| host.parse::<Ipv4Addr>().ok())
-            .is_some_and(|host| !host.is_loopback())
-}
-
 /// The host's own IPv4 addresses on the network `bridge` belongs to: the
 /// addresses the machine will see connections from, and so the only peers
 /// its export admits.
@@ -132,28 +118,6 @@ mod tests {
         assert!(!opts.contains("nolocks"));
         // Guest uids are mapped, not hidden.
         assert!(!opts.contains("noowners"));
-    }
-
-    #[test]
-    fn only_an_nfs_root_from_an_address_is_a_machine_export() {
-        let ours = MountInfo {
-            source: "192.168.64.7:/".to_string(),
-            fstype: "nfs".to_string(),
-        };
-        assert!(is_machine_export(&ours));
-        for (source, fstype) in [
-            ("ArcBox:/", "nfs"),
-            ("127.0.0.1:/", "nfs"),
-            ("fileserver:/export", "nfs"),
-            ("192.168.64.7:/srv", "nfs"),
-            ("//user@server/share", "smbfs"),
-        ] {
-            let other = MountInfo {
-                source: source.to_string(),
-                fstype: fstype.to_string(),
-            };
-            assert!(!is_machine_export(&other), "{source} ({fstype})");
-        }
     }
 
     #[test]

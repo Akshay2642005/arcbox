@@ -1,13 +1,15 @@
 //! The host side of an NFS mount: what sits at a mount point, and how to
 //! mount or unmount it without waiting forever.
 //!
-//! Shared by the `~/ArcBox` docker-data mount (`nfs_mount`) and the
-//! per-machine root mounts (`machine_mount`). Every external command here is
+//! Shared by the docker-data mount (`nfs_mount`), the per-machine root
+//! mounts (`machine_mount`) and the startup release of what a previous
+//! daemon left (`startup::host_mounts`). Every external command here is
 //! bounded: `mount_nfs` and `umount` both block inside the kernel while an
 //! NFS server is unresponsive, and an unbounded wait on either keeps the
 //! daemon alive after it has logged "ArcBox daemon stopped".
 
-use std::path::Path;
+use std::net::Ipv4Addr;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -29,6 +31,34 @@ pub struct MountInfo {
     pub fstype: String,
 }
 
+impl MountInfo {
+    /// The shape of the docker data export: NFS from the loopback proxy,
+    /// named by address or by the `ArcBox` hosts alias, at the v4
+    /// pseudo-root or below it — the containerd child export the client
+    /// mounts on its own under the root has the same host. A stale export
+    /// must be reclaimable under either source spelling.
+    pub fn is_docker_export(&self) -> bool {
+        self.fstype == "nfs"
+            && self.source.split_once(":/").is_some_and(|(host, _)| {
+                host == "127.0.0.1" || host == arcbox_helper::HOSTS_ALIAS_NAME
+            })
+    }
+
+    /// The shape of a machine root export: NFS from the root of a server
+    /// named by a non-loopback IPv4 address — a machine's bridge address,
+    /// never the loopback proxy the docker export mounts through. Checked
+    /// only under the host mount root, which is this daemon's, so it cannot
+    /// mistake a user's mount for its own.
+    pub fn is_machine_export(&self) -> bool {
+        self.fstype == "nfs"
+            && self
+                .source
+                .strip_suffix(":/")
+                .and_then(|host| host.parse::<Ipv4Addr>().ok())
+                .is_some_and(|host| !host.is_loopback())
+    }
+}
+
 /// Symlinks followed at most while resolving a mount point.
 const MAX_SYMLINK_HOPS: usize = 16;
 
@@ -41,26 +71,37 @@ const MAX_SYMLINK_HOPS: usize = 16;
 /// shutdown (the e2e harness then hung in `TempDir::drop` on the orphaned
 /// mount). But the path is never resolved by a `stat` of the mount point
 /// itself: that `stat` is answered by the filesystem mounted there, and
-/// hangs when its server is gone — the `~/ArcBox` export once the VM has
+/// hangs when its server is gone — the docker export once the VM has
 /// stopped. So only the parent is canonicalized, the final component is
 /// looked up in the mount table as is, and `lstat`'d — local for anything
 /// but a mount point — only when the table has no entry, in case it is a
 /// symlink to the real mount point. A path that does not exist has nothing
 /// mounted at it.
 pub fn current_mount_info(path: &Path) -> Option<MountInfo> {
+    resolve_mount(&mount_table()?, path)
+}
+
+/// The `/sbin/mount` listing, or `None` when it cannot be read.
+fn mount_table() -> Option<String> {
     let output = Command::new("/sbin/mount").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    resolve_mount(&String::from_utf8_lossy(&output.stdout), path)
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// `path` as the mount table would name it: its parent canonicalized and
+/// its final component as given, which is never `stat`'d.
+fn canonical_mount_point(path: &Path) -> Option<PathBuf> {
+    let parent = std::fs::canonicalize(path.parent()?).ok()?;
+    Some(parent.join(path.file_name()?))
 }
 
 /// [`current_mount_info`] against a `/sbin/mount` listing.
 fn resolve_mount(mount_output: &str, path: &Path) -> Option<MountInfo> {
     let mut path = path.to_path_buf();
     for _ in 0..MAX_SYMLINK_HOPS {
-        let parent = std::fs::canonicalize(path.parent()?).ok()?;
-        let candidate = parent.join(path.file_name()?);
+        let candidate = canonical_mount_point(&path)?;
         if let Some(info) = find_mount(mount_output, &candidate) {
             return Some(info);
         }
@@ -69,7 +110,9 @@ fn resolve_mount(mount_output: &str, path: &Path) -> Option<MountInfo> {
         if !meta.file_type().is_symlink() {
             return None;
         }
-        path = parent.join(std::fs::read_link(&candidate).ok()?);
+        path = candidate
+            .parent()?
+            .join(std::fs::read_link(&candidate).ok()?);
     }
     None
 }
@@ -167,6 +210,50 @@ mod tests {
 
     use super::{MountInfo, find_mount, parse_mount_line, resolve_mount};
 
+    fn nfs(source: &str) -> MountInfo {
+        MountInfo {
+            source: source.to_string(),
+            fstype: "nfs".to_string(),
+        }
+    }
+
+    /// Both source spellings are ours — loopback (no hosts alias) and the
+    /// branded alias — at the pseudo-root and at the containerd child the
+    /// client mounts beneath it; a user's own mounts are not.
+    #[test]
+    fn the_docker_export_is_known_by_its_loopback_or_alias_source() {
+        for source in [
+            "127.0.0.1:/",
+            "ArcBox:/",
+            "ArcBox:/containerd",
+            "127.0.0.1:/containerd",
+        ] {
+            assert!(nfs(source).is_docker_export(), "{source}");
+            assert!(!nfs(source).is_machine_export(), "{source}");
+        }
+        assert!(!nfs("fileserver:/export/home").is_docker_export());
+        assert!(!nfs("192.168.64.7:/").is_docker_export());
+        let smb = MountInfo {
+            source: "//user@server/share".to_string(),
+            fstype: "smbfs".to_string(),
+        };
+        assert!(!smb.is_docker_export());
+        assert!(!smb.is_machine_export());
+    }
+
+    #[test]
+    fn only_an_nfs_root_from_an_address_is_a_machine_export() {
+        assert!(nfs("192.168.64.7:/").is_machine_export());
+        for source in [
+            "ArcBox:/",
+            "127.0.0.1:/",
+            "fileserver:/export",
+            "192.168.64.7:/srv",
+        ] {
+            assert!(!nfs(source).is_machine_export(), "{source}");
+        }
+    }
+
     /// The mount point is found through `/var` → `/private/var` and
     /// through a symlink at the final component, without the mount point
     /// itself ever being `stat`'d: nothing is mounted at it here, yet the
@@ -182,10 +269,7 @@ mod tests {
              192.168.64.3:/ on {} (nfs, nodev, nosuid, mounted by Xuan)\n",
             canonical.display()
         );
-        let info = MountInfo {
-            source: "192.168.64.3:/".into(),
-            fstype: "nfs".into(),
-        };
+        let info = nfs("192.168.64.3:/");
         assert_eq!(
             resolve_mount(&table, &dir.path().join("real")),
             Some(info.clone())

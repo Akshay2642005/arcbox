@@ -106,7 +106,7 @@ pub struct DaemonArgs {
     #[arg(long)]
     pub guest_docker_vsock_port: Option<u32>,
 
-    /// Do not mount the guest docker data export at ~/ArcBox.
+    /// Do not mount the guest docker data export at ~/ArcBox/docker.
     #[arg(long)]
     pub no_mount_nfs: bool,
 }
