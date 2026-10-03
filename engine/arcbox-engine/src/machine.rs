@@ -6,6 +6,7 @@
 use crate::error::{EngineError, Result};
 use crate::persistence::MachinePersistence;
 use crate::vm::{HostNetwork, SharedDirConfig, VmConfig, VmId, VmManager};
+use arcbox_connect::v1::{EnsureMachineExportRequest, EnsureMachineExportResponse};
 // Only the macOS `connect_agent` dials the agent port — the vsock helper it
 // rides is macOS-only.
 #[cfg(target_os = "macos")]
@@ -1117,6 +1118,43 @@ impl MachineManager {
         Ok(bridge_ip)
     }
 
+    /// Asks a running distro machine's agent to serve the machine's root
+    /// filesystem to the host and returns the endpoint to mount; see
+    /// `EnsureMachineExportRequest` for what the request carries. Same
+    /// transport dispatch as [`Self::ping_agent`].
+    ///
+    /// # Errors
+    /// Returns an error if the machine is not running, the agent is
+    /// unreachable, or the agent refused the export.
+    pub async fn ensure_export(
+        self: Arc<Self>,
+        machine_name: String,
+        request: EnsureMachineExportRequest,
+    ) -> Result<EnsureMachineExportResponse> {
+        let manager = Arc::clone(&self);
+        let name = machine_name.clone();
+        let connected = tokio::task::spawn_blocking(move || manager.connect_agent(&name)).await;
+        match connected {
+            Ok(Ok(mut agent)) => {
+                if agent.is_blocking() {
+                    tokio::task::spawn_blocking(move || {
+                        agent.ensure_machine_export_blocking(&request)
+                    })
+                    .await
+                    .unwrap_or_else(|e| {
+                        Err(EngineError::Vm(format!(
+                            "machine export task panicked: {e}"
+                        )))
+                    })
+                } else {
+                    agent.ensure_machine_export(&request).await
+                }
+            }
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(EngineError::Vm(format!("agent connect task panicked: {e}"))),
+        }
+    }
+
     /// Connects to the machine's agent and trims its data filesystems,
     /// returning the bytes the guest reported trimmed. Same transport
     /// dispatch as [`Self::ping_agent`]: the HV socketpair is blocking, VZ
@@ -1283,6 +1321,13 @@ impl MachineManager {
             )));
         }
 
+        self.publish_event(
+            name,
+            crate::event::Event::MachineStopping {
+                name: name.to_string(),
+            },
+        );
+
         // Stop underlying VM
         #[cfg(target_os = "macos")]
         self.vm_manager
@@ -1426,6 +1471,12 @@ impl MachineManager {
             machine.state = MachineState::Stopping;
             machine.vm_id.clone()
         };
+        self.publish_event(
+            name,
+            crate::event::Event::MachineStopping {
+                name: name.to_string(),
+            },
+        );
 
         match self.vm_manager.graceful_stop(&vm_id, timeout) {
             Ok(true) => {
@@ -1541,6 +1592,12 @@ impl MachineManager {
         if machine.state == MachineState::Running {
             let vm_id = machine.vm_id.clone();
             drop(machines); // Release lock before stopping
+            self.publish_event(
+                name,
+                crate::event::Event::MachineStopping {
+                    name: name.to_string(),
+                },
+            );
             self.vm_manager.stop(&vm_id)?;
             self.stop_serial_drain(name);
             machines = self

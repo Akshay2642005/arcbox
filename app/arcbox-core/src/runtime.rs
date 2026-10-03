@@ -26,9 +26,9 @@ use crate::vm_lifecycle::{
     DEFAULT_MACHINE_NAME, VmLifecycleConfig, VmLifecycleManager, VmLifecycleState,
 };
 use arcbox_connect::v1::{
-    ContainerFsPathsResponse, ImageFsPathsResponse, KubernetesDeleteResponse,
-    KubernetesKubeconfigResponse, KubernetesStartResponse, KubernetesStatusResponse,
-    KubernetesStopResponse, ServiceStatus,
+    ContainerFsPathsResponse, EnsureMachineExportRequest, EnsureMachineExportResponse,
+    ImageFsPathsResponse, KubernetesDeleteResponse, KubernetesKubeconfigResponse,
+    KubernetesStartResponse, KubernetesStatusResponse, KubernetesStopResponse, ServiceStatus,
 };
 use arcbox_net::NetworkManager;
 #[cfg(target_os = "macos")]
@@ -747,6 +747,23 @@ impl Runtime {
     pub async fn trim_machine_disk(&self, machine_name: &str) -> Result<u64> {
         Arc::clone(&self.machine_manager)
             .trim_disk(machine_name.to_owned())
+            .await
+            .map_err(CoreError::from)
+    }
+
+    /// Asks a running distro machine to serve its root filesystem to the
+    /// host over NFSv3 and returns the endpoint to mount.
+    ///
+    /// # Errors
+    /// Returns an error if the machine is not running, its agent is
+    /// unreachable, or the agent refused the export.
+    pub async fn ensure_machine_export(
+        &self,
+        machine_name: &str,
+        request: EnsureMachineExportRequest,
+    ) -> Result<EnsureMachineExportResponse> {
+        Arc::clone(&self.machine_manager)
+            .ensure_export(machine_name.to_owned(), request)
             .await
             .map_err(CoreError::from)
     }
