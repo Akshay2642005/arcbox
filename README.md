@@ -313,7 +313,7 @@ Most of ArcBox's performance-critical code is custom rather than vendored:
   Mac's proxy settings by default; `proxy = "none"` or a proxy URL under
   `[network]` in `~/.config/arcbox/config.toml` overrides that, with
   `proxy_exclude` for hosts that stay direct.
-- **VirtioFS/FUSE filesystem sharing**, an NFSv4 export for `~/ArcBox`, and a
+- **VirtioFS/FUSE filesystem sharing**, an NFSv4 export for `~/ArcBox/docker`, and a
   vsock guest agent that speaks protobuf.
 - **x86 translation through FEX**, so `linux/amd64` images run on Apple Silicon.
 - A privileged helper with code-signature-based peer authentication for the few
