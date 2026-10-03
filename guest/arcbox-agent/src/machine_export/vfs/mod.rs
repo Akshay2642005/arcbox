@@ -12,6 +12,7 @@
 //! its own disk images back through two filesystems, and Finder or `du`
 //! would happily read them.
 
+mod sidecar;
 mod write;
 
 use std::ffi::{OsStr, OsString};

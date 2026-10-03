@@ -22,7 +22,7 @@ use super::super::attr::{apply_sattr, fattr3_from_metadata, new_object_owner};
 use super::{MachineRoot, blocking, component};
 
 /// Mode of a file the host creates without asking for one.
-const DEFAULT_FILE_MODE: u32 = 0o644;
+pub(super) const DEFAULT_FILE_MODE: u32 = 0o644;
 /// Mode of a directory the host creates.
 const DEFAULT_DIR_MODE: u32 = 0o755;
 
