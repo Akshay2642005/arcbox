@@ -18,10 +18,13 @@
 //! neither empty nor the placeholder XNU writes for "no fork". An image
 //! that ends before a region its tables declare is *incomplete* rather
 //! than invalid: the Mac writes a sidecar in pieces, and the whole only
-//! exists once the last piece lands. Serialization produces the layout
-//! `copyfile(3)` produces — header, Finder Info, `ATTR` header and
-//! entries, attribute data, resource fork — without the 4 KiB of slack
-//! XNU reserves for growth, so an image is exactly as long as its content.
+//! exists once the last piece lands. Serialization produces the shape
+//! XNU's `create_xattrfile` produces — header, Finder Info, `ATTR` header
+//! and entries, attribute data, slack up to a 4 KiB boundary less the
+//! 286-byte placeholder fork, then the resource fork or that placeholder —
+//! because the Mac grows a sidecar in place and needs the room it would
+//! have left itself: an image laid out tight reads fine but refuses the
+//! next `setxattr`.
 
 use std::fmt;
 
@@ -53,6 +56,13 @@ const ATTR_ENTRY_FIXED_LEN: usize = 11;
 /// What XNU writes 16 bytes into a resource fork it had to create empty.
 const EMPTY_FORK_TAG: &[u8; 47] = b"This resource fork intentionally left blank   \0";
 const EMPTY_FORK_TAG_OFFSET: usize = 16;
+/// The size of a fresh sidecar and the step the attribute area grows by.
+const ATTR_BUF_SIZE: usize = 4096;
+/// The placeholder resource fork: an empty fork's header, tagged.
+const EMPTY_FORK_LEN: usize = 286;
+/// Where the fork begins in a fresh sidecar: the attribute area fills the
+/// first 4 KiB less the placeholder.
+const FIRST_FORK_OFFSET: usize = ATTR_BUF_SIZE - EMPTY_FORK_LEN;
 
 /// One ordinary extended attribute: the name without its NUL, and the value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,7 +213,7 @@ impl AppleDouble {
         Ok(parsed)
     }
 
-    /// The image in Apple's layout.
+    /// The image in XNU's layout.
     ///
     /// The caller keeps the content within the format's limits: at most
     /// [`MAX_ATTRS`] attributes, names of at most [`MAX_NAME_LEN`] bytes,
@@ -219,8 +229,14 @@ impl AppleDouble {
             .sum();
         let data_start = ATTR_ENTRIES_OFFSET + entries_len;
         let data_length: usize = self.attrs.iter().map(|attr| attr.value.len()).sum();
-        let fork_offset = data_start + data_length;
-        let fork = self.resource_fork.as_deref().unwrap_or_default();
+        // The fork sits where XNU would have put it: after the first 4 KiB
+        // area, or after as many more as the attributes need.
+        let mut fork_offset = FIRST_FORK_OFFSET;
+        while fork_offset < data_start + data_length {
+            fork_offset += ATTR_BUF_SIZE;
+        }
+        let placeholder = empty_fork();
+        let fork = self.resource_fork.as_deref().unwrap_or(&placeholder);
 
         let mut out = Vec::with_capacity(fork_offset + fork.len());
         out.extend_from_slice(&MAGIC.to_be_bytes());
@@ -266,9 +282,32 @@ impl AppleDouble {
         for attr in &self.attrs {
             out.extend_from_slice(&attr.value);
         }
+        out.resize(fork_offset, 0);
         out.extend_from_slice(fork);
         out
     }
+}
+
+/// The resource fork XNU's `init_empty_resource_fork` writes: a fork
+/// header with no resources, carrying the tag the reader recognises.
+fn empty_fork() -> [u8; EMPTY_FORK_LEN] {
+    const FIRST_RESOURCE: u32 = 256;
+    const NULL_MAP_LENGTH: u32 = 30;
+    let mut fork = [0u8; EMPTY_FORK_LEN];
+    fork[0..4].copy_from_slice(&FIRST_RESOURCE.to_be_bytes());
+    fork[4..8].copy_from_slice(&FIRST_RESOURCE.to_be_bytes());
+    fork[12..16].copy_from_slice(&NULL_MAP_LENGTH.to_be_bytes());
+    fork[EMPTY_FORK_TAG_OFFSET..EMPTY_FORK_TAG_OFFSET + EMPTY_FORK_TAG.len()]
+        .copy_from_slice(EMPTY_FORK_TAG);
+    // The map header at 256: data and map offsets, map length, the types
+    // and names offsets, and a type count of -1.
+    fork[256..260].copy_from_slice(&FIRST_RESOURCE.to_be_bytes());
+    fork[260..264].copy_from_slice(&FIRST_RESOURCE.to_be_bytes());
+    fork[268..272].copy_from_slice(&NULL_MAP_LENGTH.to_be_bytes());
+    fork[280..282].copy_from_slice(&((NULL_MAP_LENGTH - 2) as u16).to_be_bytes());
+    fork[282..284].copy_from_slice(&(NULL_MAP_LENGTH as u16).to_be_bytes());
+    fork[284..286].copy_from_slice(&u16::MAX.to_be_bytes());
+    fork
 }
 
 /// The attribute entries behind an `ATTR` header whose Finder Info entry
@@ -397,10 +436,28 @@ mod tests {
         let image = original.to_bytes();
         assert_eq!(AppleDouble::parse(&image).unwrap(), original);
 
+        // Empty content is still the 4 KiB file XNU would create, with the
+        // placeholder fork at 3 810; the Mac's own fixture has the same
+        // entry table.
         let empty = AppleDouble::default();
         let image = empty.to_bytes();
-        assert_eq!(image.len(), ATTR_ENTRIES_OFFSET, "header only");
+        assert_eq!(image.len(), ATTR_BUF_SIZE);
+        assert_eq!(&image[..50], &ATTRS_ONLY[..50]);
+        assert_eq!(&image[3810 + 16..3810 + 16 + 46], &EMPTY_FORK_TAG[..46]);
         assert!(AppleDouble::parse(&image).unwrap().is_empty());
+
+        // Attributes past the first area push the fork down by whole areas.
+        let big = AppleDouble {
+            attrs: vec![Attr {
+                name: b"big".to_vec(),
+                value: vec![1u8; 5000],
+            }],
+            ..AppleDouble::default()
+        };
+        let image = big.to_bytes();
+        assert_eq!(&image[42..46], &(3810u32 + 4096).to_be_bytes());
+        assert_eq!(image.len(), 3810 + 4096 + 286);
+        assert_eq!(AppleDouble::parse(&image).unwrap(), big);
 
         // What the Mac wrote survives a round trip through our layout.
         let reparsed =

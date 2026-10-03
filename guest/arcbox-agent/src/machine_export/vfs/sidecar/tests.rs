@@ -132,12 +132,12 @@ async fn what_the_mac_writes_lands_as_the_targets_attributes() {
     assert_eq!(xattr::get(&f, "user.user.note").unwrap().unwrap(), b"hi");
     assert!(!dir.path().join("._f").exists());
 
-    // The image the Mac created was merged and dropped: it reads back in
-    // our layout, with the same content and no slack.
+    // The image the Mac created was merged and dropped: it reads back as
+    // XNU would have laid it out, with the same content.
     assert_eq!(fs.lookup(&root, &name("._f")).await.unwrap(), sc);
     let (bytes, eof) = fs.read(&sc, 0, 8192).await.unwrap();
     assert!(eof);
-    assert!(bytes.len() < 4096, "no slack in our layout");
+    assert_eq!(bytes.len(), 4096, "a fresh sidecar's size");
     assert_eq!(sorted(&bytes), sorted(ATTRS_ONLY));
     assert_eq!(fs.getattr(&sc).await.unwrap().size, bytes.len() as u64);
     assert_eq!(fs.readlink(&sc).await, Err(nfsstat3::NFS3ERR_INVAL));
