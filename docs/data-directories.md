@@ -54,7 +54,7 @@ Defined in `app/arcbox-core/src/config.rs`.
 |------|---------|---------|
 | `data/images/` | Image storage | daemon |
 | `data/containers/` | Container metadata | daemon |
-| `data/machines/` | Virtual machine data | daemon |
+| `data/machines/` | Linux machines: `<name>/config.toml` and `<name>/data.img` (the btrfs data disk; a clone's is a copy-on-write clone of its source's). `.export-*` / `.import-*` are staging directories of an export or import in progress, swept at daemon start | daemon |
 | `data/volumes/` | Named volumes | daemon |
 | `data/docker.img` | Docker persistent disk image (Btrfs) | daemon |
 | `data/docker-meta.img` | Docker metadata disk image (ext4, fsync-hot boltdb state); paired with `docker.img` — back up or move the two together | daemon |
