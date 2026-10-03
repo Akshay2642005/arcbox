@@ -289,6 +289,56 @@ fn mount_tag(index: usize) -> String {
     format!("m{index}")
 }
 
+/// The VirtioFS shares every machine gets, plus one per user mount.
+///
+/// The `arcbox` tag shares the data directory (boot assets, logs, runtime);
+/// `users` shares `/Users` so macOS paths work transparently in the guest
+/// (`docker run -v /Users/foo/project:/app` just works), and `private`
+/// shares `/private` for the symlink targets under it. User mounts follow
+/// as `m0`, `m1`, …, the tags the cmdline mount table names.
+fn vm_shared_dirs(data_dir: &std::path::Path, mounts: &[MachineMount]) -> Vec<SharedDirConfig> {
+    let mut shared_dirs = vec![SharedDirConfig::new(
+        data_dir.to_string_lossy().to_string(),
+        TAG_ARCBOX,
+    )];
+    if std::path::Path::new(MOUNT_USERS).is_dir() {
+        shared_dirs.push(SharedDirConfig::new(MOUNT_USERS, TAG_USERS));
+    }
+    if std::path::Path::new(MOUNT_PRIVATE).is_dir() {
+        shared_dirs.push(SharedDirConfig::new(MOUNT_PRIVATE, TAG_PRIVATE));
+    }
+    for (i, mount) in mounts.iter().enumerate() {
+        let mut share = SharedDirConfig::new(mount.host_path.clone(), mount_tag(i));
+        share.read_only = mount.read_only;
+        shared_dirs.push(share);
+    }
+    shared_dirs
+}
+
+/// Checks that `name` is free to register and returns the hostname it would
+/// get.
+///
+/// The hostname is a key too: `my_box` and `my-box` would answer to one
+/// `my-box.arcbox.local`, and the DNS table keeps whichever started last,
+/// so a user's `ssh` lands on the wrong machine with nothing to say why.
+/// The second name is refused instead.
+fn reserve_hostname(machines: &HashMap<String, MachineInfo>, name: &str) -> Result<String> {
+    let hostname = machine_hostname(name)?;
+    if machines.contains_key(name) {
+        return Err(EngineError::already_exists(name.to_owned()));
+    }
+    if let Some(other) = machines
+        .keys()
+        .find(|existing| machine_hostname(existing).ok().as_deref() == Some(hostname.as_str()))
+    {
+        return Err(EngineError::already_exists(format!(
+            "machine name '{name}' would take hostname '{hostname}', which machine '{other}' \
+             already has"
+        )));
+    }
+    Ok(hostname)
+}
+
 /// The hostname a machine named `name` gets, which is also the label of
 /// its `<hostname>.arcbox.local` record and what the shim is handed on the
 /// kernel command line.
@@ -381,21 +431,6 @@ impl MachineManager {
         let machines_dir = data_dir.join("machines");
         let persistence = MachinePersistence::new(&machines_dir);
 
-        // Create the default shared directory config for VirtioFS.
-        // "arcbox" shares the data_dir; "users" shares /Users for transparent paths.
-        let mut shared_dirs = vec![SharedDirConfig::new(
-            data_dir.to_string_lossy().to_string(),
-            TAG_ARCBOX,
-        )];
-        let users_dir = std::path::Path::new(MOUNT_USERS);
-        if users_dir.is_dir() {
-            shared_dirs.push(SharedDirConfig::new(MOUNT_USERS, TAG_USERS));
-        }
-        let private_dir = std::path::Path::new(MOUNT_PRIVATE);
-        if private_dir.is_dir() {
-            shared_dirs.push(SharedDirConfig::new(MOUNT_PRIVATE, TAG_PRIVATE));
-        }
-
         // Load persisted machines
         let mut machines = HashMap::new();
         for persisted in persistence.load_all() {
@@ -410,18 +445,12 @@ impl MachineManager {
             // Reconstruct VmConfig from persisted data, including the
             // machine's own VirtioFS shares (tags must match what the
             // persisted cmdline mount table references).
-            let mut vm_shared_dirs = shared_dirs.clone();
-            for (i, mount) in persisted.mounts.iter().enumerate() {
-                let mut share = SharedDirConfig::new(mount.host_path.clone(), mount_tag(i));
-                share.read_only = mount.read_only;
-                vm_shared_dirs.push(share);
-            }
             let vm_config = VmConfig {
                 cpus: persisted.cpus,
                 memory_mb: persisted.memory_mb,
                 kernel: persisted.kernel.clone(),
                 cmdline: persisted.cmdline.clone(),
-                shared_dirs: vm_shared_dirs,
+                shared_dirs: vm_shared_dirs(&data_dir, &persisted.mounts),
                 block_devices: persisted.block_devices.clone(),
                 backend: persisted.backend,
                 nested_virt: persisted.nested_virt,
@@ -511,49 +540,14 @@ impl MachineManager {
         // and user-driven, so the alternative (insert a `Creating` sentinel,
         // drop the lock for I/O, then finalize/rollback) is not worth its
         // orphan-state failure mode.
-        let hostname = machine_hostname(&config.name)?;
         let mut machines = self
             .machines
             .write()
             .map_err(|_| EngineError::LockPoisoned)?;
-
-        if machines.contains_key(&config.name) {
-            return Err(EngineError::already_exists(config.name));
-        }
-        // The hostname is a key too: `my_box` and `my-box` would answer to
-        // one `my-box.arcbox.local`, and the DNS table keeps whichever
-        // started last, so a user's `ssh` lands on the wrong machine with
-        // nothing to say why. Refuse the second name instead.
-        if let Some(other) = machines
-            .keys()
-            .find(|existing| machine_hostname(existing).ok().as_deref() == Some(hostname.as_str()))
-        {
-            return Err(EngineError::already_exists(format!(
-                "machine name '{}' would take hostname '{hostname}', which machine '{other}' \
-                 already has",
-                config.name
-            )));
-        }
+        let hostname = reserve_hostname(&machines, &config.name)?;
 
         let machine_dir = self.machines_dir.join(&config.name);
         std::fs::create_dir_all(&machine_dir)?;
-
-        // Set up shared directories for VirtioFS.
-        // "arcbox" tag provides internal data (boot assets, logs, runtime).
-        // "users" tag shares /Users so macOS paths work transparently in guest
-        // (e.g. `docker run -v /Users/foo/project:/app` just works).
-        let mut shared_dirs = vec![SharedDirConfig::new(
-            self.data_dir.to_string_lossy().to_string(),
-            TAG_ARCBOX,
-        )];
-        let users_dir = std::path::Path::new(MOUNT_USERS);
-        if users_dir.is_dir() {
-            shared_dirs.push(SharedDirConfig::new(MOUNT_USERS, TAG_USERS));
-        }
-        let private_dir = std::path::Path::new(MOUNT_PRIVATE);
-        if private_dir.is_dir() {
-            shared_dirs.push(SharedDirConfig::new(MOUNT_PRIVATE, TAG_PRIVATE));
-        }
 
         // User mounts become per-machine VirtioFS shares (tags m0, m1, …);
         // the shim replays the cmdline mount table into the new root. Only
@@ -565,13 +559,11 @@ impl MachineManager {
                     "mounts require a shim-booted distro machine",
                 ));
             }
-            for (i, mount) in config.mounts.iter().enumerate() {
+            for mount in &config.mounts {
                 validate_mount(mount)?;
-                let mut share = SharedDirConfig::new(mount.host_path.clone(), mount_tag(i));
-                share.read_only = mount.read_only;
-                shared_dirs.push(share);
             }
         }
+        let shared_dirs = vm_shared_dirs(&self.data_dir, &config.mounts);
 
         // Distro machines boot the pulled rootfs image (behind the boot shim
         // when configured) with a sparse per-machine data disk; plain VMs
@@ -671,19 +663,26 @@ impl MachineManager {
             started_at: None,
             mounts: config.mounts,
         };
+        self.register(&mut machines, info)
+    }
 
-        // Persist the machine config
+    /// Records a newly built machine: persists it, adds it to the registry
+    /// and publishes `MachineCreated`. The caller holds the registry's write
+    /// lock from its name check through this call, so no other create can
+    /// take the name in between.
+    fn register(
+        &self,
+        machines: &mut HashMap<String, MachineInfo>,
+        info: MachineInfo,
+    ) -> Result<String> {
+        let name = info.name.clone();
         self.persistence.save(&info)?;
-
-        machines.insert(config.name.clone(), info);
-
+        machines.insert(name.clone(), info);
         self.publish_event(
-            &config.name,
-            crate::event::Event::MachineCreated {
-                name: config.name.clone(),
-            },
+            &name,
+            crate::event::Event::MachineCreated { name: name.clone() },
         );
-        Ok(config.name)
+        Ok(name)
     }
 
     /// Starts a machine.
