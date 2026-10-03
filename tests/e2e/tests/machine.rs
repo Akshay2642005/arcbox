@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use arcbox_e2e::boot_assets::{resolve_boot_version, stage_dev_boot_assets};
-use arcbox_e2e::daemon::{DaemonConfig, DaemonHandle, connect_unix};
+use arcbox_e2e::daemon::{DaemonConfig, DaemonHandle, connect_unix, host_mounts};
 use arcbox_e2e::metrics::RunMetrics;
 use arcbox_grpc::v1::machine_service_client::MachineServiceClient;
 use arcbox_grpc::v1::stats_service_client::StatsServiceClient;
@@ -248,8 +248,8 @@ fn scenario(daemon: &mut DaemonHandle, data_dir: &Path, metrics: &mut RunMetrics
     })
 }
 
-/// The machine's root is mounted on the host under the harness's machine
-/// mount root (`ARCBOX_MACHINE_MOUNT_DIR`, pointed into the data dir by
+/// The machine's root is mounted on the host under the harness's host mount
+/// root (`ARCBOX_HOST_MOUNT_DIR`, pointed into the data dir by
 /// `DaemonHandle::spawn`): `/etc/os-release` reads through it, a file the
 /// host writes is what the machine reads, and a file the machine writes is
 /// what the host reads. Returns the mount point so the stop path can check
@@ -258,7 +258,7 @@ async fn machine_root_mounted_on_the_host(
     data_dir: &Path,
     machines: &mut MachineServiceClient<Channel>,
 ) -> Result<PathBuf> {
-    let mount = data_dir.join("ArcBoxMachines").join(MACHINE);
+    let mount = host_mounts(data_dir).machine(MACHINE);
     let os_release = mount.join("etc/os-release");
     let deadline = Instant::now() + MOUNT_BUDGET;
     let release = loop {

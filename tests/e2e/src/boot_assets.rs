@@ -12,7 +12,7 @@ use tempfile::TempDir;
 use toml_edit::DocumentMut;
 use tracing::{info, warn};
 
-use crate::daemon::{DaemonConfig, DaemonHandle};
+use crate::daemon::{DaemonConfig, DaemonHandle, host_mounts};
 use crate::metrics::RunMetrics;
 use crate::{env_flag, repo_root};
 
@@ -235,11 +235,11 @@ fn run_scenario(ctx: &mut TestContext, metrics: &mut RunMetrics) -> Result<()> {
 
 /// Verifies the guest-data NFS export end to end by reading the guest's docker
 /// data root through the host mount the daemon established (isolated at
-/// `<data_dir>/ArcBox` via `ARCBOX_HOST_MOUNT_DIR`). Registry-independent — it
+/// `<data_dir>/ArcBox/docker` via `ARCBOX_HOST_MOUNT_DIR`). Registry-independent — it
 /// reads data dockerd creates on startup, so it does not need a pulled image.
 fn verify_nfs_export(ctx: &TestContext) -> Result<()> {
-    info!("[test] nfs export: read guest docker data through the host ~/ArcBox mount");
-    let mount_dir = ctx.test_dir.join("ArcBox");
+    info!("[test] nfs export: read guest docker data through the host ~/ArcBox/docker mount");
+    let mount_dir = host_mounts(&ctx.test_dir).docker();
     wait_for_nfs_mount(&mount_dir)?;
 
     // Strongest signal: read a real guest file's contents through NFS. dockerd
@@ -251,7 +251,7 @@ fn verify_nfs_export(ctx: &TestContext) -> Result<()> {
     let engine_id = mount_dir.join("engine-id");
     if let Ok(content) = read_file_with_retry(&engine_id, Duration::from_secs(20)) {
         if content.trim().is_empty() {
-            bail!("engine-id read through ~/ArcBox was empty");
+            bail!("engine-id read through ~/ArcBox/docker was empty");
         }
         info!(path = %engine_id.display(), "nfs export file read-through OK");
         return Ok(());
@@ -261,7 +261,9 @@ fn verify_nfs_export(ctx: &TestContext) -> Result<()> {
         .with_context(|| format!("reading {} via NFS", mount_dir.display()))?
         .count();
     if entries < 2 {
-        bail!("~/ArcBox export listed only {entries} entries; expected the docker data root");
+        bail!(
+            "~/ArcBox/docker export listed only {entries} entries; expected the docker data root"
+        );
     }
     info!(entries, "nfs export directory read-through OK");
     Ok(())

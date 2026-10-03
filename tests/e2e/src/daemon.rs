@@ -19,7 +19,7 @@ use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use arcbox_constants::paths::ArcboxProfile;
+use arcbox_constants::paths::{ArcboxProfile, HostMountLayout};
 use arcbox_grpc::v1::system_service_client::SystemServiceClient;
 use arcbox_protocol::v1::{Empty, setup_status};
 use hyper_util::rt::TokioIo;
@@ -34,6 +34,14 @@ use crate::signing::ensure_signed;
 const POLL_TICK: Duration = Duration::from_millis(200);
 /// Grace period for SIGTERM before falling back to SIGKILL.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(15);
+
+/// The host mount root [`DaemonHandle::spawn`] points a daemon at:
+/// `<data_dir>/ArcBox`, with the guest-data export at its `docker()` and
+/// machine roots at its `machine(name)`.
+#[must_use]
+pub fn host_mounts(data_dir: &Path) -> HostMountLayout {
+    HostMountLayout::new(data_dir.join("ArcBox"))
+}
 
 /// Launch parameters for a daemon under test.
 pub struct DaemonConfig {
@@ -138,13 +146,12 @@ impl DaemonHandle {
             .arg("0")
             .arg("--ssh-port")
             .arg("0")
-            // Keep the guest-data NFS mount off the shared ~/ArcBox, and the
-            // machine root mounts off ~/ArcBoxMachines, by pointing both inside
+            // Keep the daemon's host mounts — the guest-data export and the
+            // machine roots — off the shared ~/ArcBox by rooting them inside
             // the isolated data dir. A caller can override via env.
-            .env("ARCBOX_HOST_MOUNT_DIR", config.data_dir.join("ArcBox"))
             .env(
-                "ARCBOX_MACHINE_MOUNT_DIR",
-                config.data_dir.join("ArcBoxMachines"),
+                arcbox_constants::env::HOST_MOUNT_DIR,
+                host_mounts(&config.data_dir).root(),
             )
             .args(&config.args)
             .stdout(Stdio::from(log))

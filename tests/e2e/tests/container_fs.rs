@@ -2,7 +2,7 @@
 //! and the containerd child NFS export: boots the System VM through a real
 //! daemon, runs a container that writes a marker into its rootfs, resolves
 //! the container's snapshot layer directories over gRPC, reads the marker
-//! back through the host NFS mount (`<data_dir>/ArcBox/containerd/...`),
+//! back through the host NFS mount (`<data_dir>/ArcBox/docker/containerd/...`),
 //! then resolves the image's layers by top chain ID and checks they are
 //! visible through the same mount.
 
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use arcbox_e2e::boot_assets::{resolve_boot_version, stage_dev_boot_assets};
-use arcbox_e2e::daemon::{DaemonConfig, DaemonHandle, connect_unix};
+use arcbox_e2e::daemon::{DaemonConfig, DaemonHandle, connect_unix, host_mounts};
 use arcbox_e2e::docker::docker_output;
 use arcbox_grpc::SystemServiceClient;
 use arcbox_protocol::v1::{ResolveContainerFsRequest, ResolveImageFsRequest};
@@ -236,13 +236,16 @@ fn resolve_container_fs(
 }
 
 /// Rewrites a guest `/var/lib/containerd/...` path onto the host NFS mount
-/// (`<data_dir>/ArcBox/containerd/...`, per the harness
+/// (`<data_dir>/ArcBox/docker/containerd/...`, per the harness
 /// `ARCBOX_HOST_MOUNT_DIR`).
 fn host_path(data_dir: &Path, guest_path: &str) -> Result<PathBuf> {
     let relative = guest_path
         .strip_prefix(CONTAINERD_PREFIX)
         .with_context(|| format!("guest path {guest_path} not under {CONTAINERD_PREFIX}"))?;
-    Ok(data_dir.join("ArcBox/containerd").join(relative))
+    Ok(host_mounts(data_dir)
+        .docker()
+        .join("containerd")
+        .join(relative))
 }
 
 fn read_when_visible(path: &Path, timeout: Duration) -> Result<String> {

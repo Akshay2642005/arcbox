@@ -21,7 +21,7 @@ use anyhow::{Context, Result, bail};
 use tracing_subscriber::EnvFilter;
 
 use arcbox_e2e::boot_assets::{resolve_boot_version, stage_dev_boot_assets};
-use arcbox_e2e::daemon::{DaemonConfig, DaemonHandle};
+use arcbox_e2e::daemon::{DaemonConfig, DaemonHandle, host_mounts};
 use arcbox_e2e::docker::docker_output;
 use arcbox_e2e::repo_root;
 
@@ -160,11 +160,11 @@ echo "SANITY_OVERLAY=$($B grep -c 'overlay' /proc/mounts 2>/dev/null || echo 0)"
 
     // Host side: DaemonHandle::spawn points ARCBOX_HOST_MOUNT_DIR at
     // <data_dir>/ArcBox, so a daemon that ignored --no-mount-nfs would populate
-    // this isolated dir (never the developer's real ~/ArcBox). It must stay empty.
-    let arcbox = test_dir.join("ArcBox");
+    // its docker/ (never the developer's real ~/ArcBox). It must stay empty.
+    let arcbox = host_mounts(&test_dir).docker();
     let populated = arcbox.join("volumes").is_dir() || arcbox.join("overlay2").is_dir();
     if populated {
-        bail!("host ~/ArcBox unexpectedly populated under --no-mount-nfs");
+        bail!("host ~/ArcBox/docker unexpectedly populated under --no-mount-nfs");
     }
     println!("OK: host {} is not a populated NFS mount", arcbox.display());
 
