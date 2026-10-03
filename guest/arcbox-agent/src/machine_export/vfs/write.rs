@@ -29,6 +29,9 @@ const DEFAULT_DIR_MODE: u32 = 0o755;
 impl NfsFileSystem for MachineRoot {
     async fn setattr(&self, id: &Self::Handle, setattr: sattr3) -> Result<fattr3, nfsstat3> {
         let id = id.as_u64();
+        if let Some(attr) = self.setattr_sidecar(id, &setattr) {
+            return Ok(attr);
+        }
         let path = self.path_of(id)?;
         let map = self.map;
         let meta = blocking(move || {
@@ -47,6 +50,9 @@ impl NfsFileSystem for MachineRoot {
         stable: stable_how,
     ) -> Result<(fattr3, stable_how), nfsstat3> {
         let id = id.as_u64();
+        if let Some(attr) = self.write_sidecar(id, offset, data) {
+            return Ok((attr, stable_how::FILE_SYNC));
+        }
         let path = self.path_of(id)?;
         let map = self.map;
         let data = data.to_vec();
@@ -73,6 +79,9 @@ impl NfsFileSystem for MachineRoot {
         let dirid = dirid.as_u64();
         let name = component(filename)?;
         let path = self.child_path(dirid, &name)?;
+        if self.shadows(&name, &path).await? {
+            return self.create_sidecar(dirid, &name, &attr, false);
+        }
         let map = self.map;
         let created = path.clone();
         blocking(move || {
@@ -105,6 +114,11 @@ impl NfsFileSystem for MachineRoot {
         let dirid = dirid.as_u64();
         let name = component(filename)?;
         let path = self.child_path(dirid, &name)?;
+        if self.shadows(&name, &path).await? {
+            return self
+                .create_sidecar(dirid, &name, &sattr3::default(), true)
+                .map(|(handle, _)| handle);
+        }
         let (uid, gid) = self.map.guest_owner();
         blocking(move || {
             OpenOptions::new()
@@ -142,6 +156,9 @@ impl NfsFileSystem for MachineRoot {
         let dirid = dirid.as_u64();
         let name = component(filename)?;
         let path = self.child_path(dirid, &name)?;
+        if self.remove_sidecar(dirid, &name) {
+            return Ok(());
+        }
         blocking(move || {
             if std::fs::symlink_metadata(&path)?.is_dir() {
                 std::fs::remove_dir(&path)
@@ -150,6 +167,7 @@ impl NfsFileSystem for MachineRoot {
             }
         })
         .await?;
+        self.drop_sidecars_in(dirid, &name);
         self.ids().forget(dirid, &name);
         Ok(())
     }
@@ -166,7 +184,12 @@ impl NfsFileSystem for MachineRoot {
         let to_name = component(to_filename)?;
         let from = self.child_path(from_dirid, &from_name)?;
         let to = self.child_path(to_dirid, &to_name)?;
+        if let Some(moved) = self.rename_sidecar(from_dirid, &from_name, to_dirid, &to_name) {
+            return moved;
+        }
         blocking(move || std::fs::rename(&from, &to)).await?;
+        // A sidecar the rename wrote over.
+        self.remove_sidecar(to_dirid, &to_name);
         self.ids()
             .rename(from_dirid, &from_name, to_dirid, &to_name);
         Ok(())
@@ -194,7 +217,11 @@ impl NfsFileSystem for MachineRoot {
     }
 
     async fn commit(&self, id: &Self::Handle, _offset: u64, _count: u32) -> Result<(), nfsstat3> {
-        let path = self.path_of(id.as_u64())?;
+        let id = id.as_u64();
+        if self.is_sidecar(id) {
+            return Ok(());
+        }
+        let path = self.path_of(id)?;
         blocking(move || std::fs::File::open(&path)?.sync_data()).await
     }
 }

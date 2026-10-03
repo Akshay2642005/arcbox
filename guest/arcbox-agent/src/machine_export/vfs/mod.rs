@@ -10,7 +10,8 @@
 //! The one thing the export hides is `/arcbox`, ArcBox's own VirtioFS
 //! share of the host's data directory: exporting it would hand the host
 //! its own disk images back through two filesystems, and Finder or `du`
-//! would happily read them.
+//! would happily read them. The one thing it keeps out is the Mac's
+//! AppleDouble `._` files; see `sidecar`.
 
 mod sidecar;
 mod write;
@@ -27,6 +28,7 @@ use nfs3_server::vfs::{
     DirEntryPlus, FileHandleU64, NextResult, NfsReadFileSystem, ReadDirPlusIterator,
 };
 
+use self::sidecar::{Sidecars, is_sidecar_name};
 use super::attr::{IdMap, fattr3_from_metadata, nfs_error};
 use super::ids::{IdTable, ROOT};
 
@@ -37,6 +39,7 @@ const HIDDEN_ROOT_ENTRIES: &[&str] = &["arcbox"];
 pub struct MachineRoot {
     root: PathBuf,
     ids: Mutex<IdTable>,
+    sidecars: Mutex<Sidecars>,
     map: IdMap,
 }
 
@@ -45,6 +48,7 @@ impl MachineRoot {
         Self {
             root,
             ids: Mutex::new(IdTable::new()),
+            sidecars: Mutex::new(Sidecars::default()),
             map,
         }
     }
@@ -113,6 +117,15 @@ fn component(name: &filename3<'_>) -> Result<OsString, nfsstat3> {
     Ok(OsStr::from_bytes(bytes).to_owned())
 }
 
+/// Whether anything is at `path`, a symlink included.
+async fn on_disk(path: PathBuf) -> Result<bool, nfsstat3> {
+    match blocking(move || std::fs::symlink_metadata(&path)).await {
+        Ok(_) => Ok(true),
+        Err(nfsstat3::NFS3ERR_NOENT) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// Runs a filesystem operation on the blocking pool.
 async fn blocking<T, F>(op: F) -> Result<T, nfsstat3>
 where
@@ -166,12 +179,18 @@ impl NfsReadFileSystem for MachineRoot {
         }
         let name = component(filename)?;
         let path = self.child_path(dirid, &name)?;
+        if is_sidecar_name(&name) {
+            return self.lookup_sidecar(dirid, &name, &path).await;
+        }
         blocking(move || std::fs::symlink_metadata(&path)).await?;
         Ok(self.handle_for(dirid, &name))
     }
 
     async fn getattr(&self, id: &Self::Handle) -> Result<fattr3, nfsstat3> {
         let id = id.as_u64();
+        if let Some(attr) = self.sidecar_attr(id) {
+            return Ok(attr);
+        }
         let path = self.path_of(id)?;
         let map = self.map;
         let meta = blocking(move || std::fs::symlink_metadata(&path)).await?;
@@ -184,7 +203,11 @@ impl NfsReadFileSystem for MachineRoot {
         offset: u64,
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
-        let path = self.path_of(id.as_u64())?;
+        let id = id.as_u64();
+        if let Some(read) = self.read_sidecar(id, offset, count) {
+            return Ok(read);
+        }
+        let path = self.path_of(id)?;
         blocking(move || {
             let file = std::fs::File::open(&path)?;
             let len = file.metadata()?.len();
@@ -252,7 +275,11 @@ impl NfsReadFileSystem for MachineRoot {
     }
 
     async fn readlink(&self, id: &Self::Handle) -> Result<nfspath3<'_>, nfsstat3> {
-        let path = self.path_of(id.as_u64())?;
+        let id = id.as_u64();
+        if self.is_sidecar(id) {
+            return Err(nfsstat3::NFS3ERR_INVAL);
+        }
+        let path = self.path_of(id)?;
         let target = blocking(move || std::fs::read_link(&path)).await?;
         Ok(nfspath3::from(target.into_os_string().into_vec()))
     }

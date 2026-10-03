@@ -23,14 +23,18 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt as _;
+use std::path::Path;
+use std::sync::{MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nfs3_server::nfs3_types::nfs3::{
-    fattr3, ftype3, nfstime3, sattr3, set_mode3, set_size3, specdata3,
+    fattr3, ftype3, nfsstat3, nfstime3, sattr3, set_mode3, set_size3, specdata3,
 };
+use nfs3_server::vfs::FileHandleU64;
 
 use super::super::attr::IdMap;
 use super::write::DEFAULT_FILE_MODE;
+use super::{MachineRoot, on_disk};
 
 /// Sidecars kept at most; past it the oldest goes. Each is a few KiB, so
 /// the table stays near 16 MiB however much the Mac writes.
@@ -206,8 +210,129 @@ impl Sidecars {
     }
 }
 
+/// The sidecar hooks of the filesystem operations; each returns `None` or
+/// `false` for an object that is not a sidecar, and the operation goes on
+/// to disk.
+impl MachineRoot {
+    fn sidecars(&self) -> MutexGuard<'_, Sidecars> {
+        self.sidecars.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Resolves a `._` name: the file on disk if there is one — a sidecar
+    /// the Mac wrote under that name gives way to it — else the one in
+    /// memory.
+    pub(super) async fn lookup_sidecar(
+        &self,
+        dirid: u64,
+        name: &OsStr,
+        path: &Path,
+    ) -> Result<FileHandleU64, nfsstat3> {
+        if on_disk(path.to_path_buf()).await? {
+            self.sidecars().remove_named(dirid, name);
+            return Ok(self.handle_for(dirid, name));
+        }
+        self.sidecars()
+            .lookup(dirid, name)
+            .map(FileHandleU64::new)
+            .ok_or(nfsstat3::NFS3ERR_NOENT)
+    }
+
+    pub(super) fn is_sidecar(&self, id: u64) -> bool {
+        self.sidecars().contains(id)
+    }
+
+    pub(super) fn sidecar_attr(&self, id: u64) -> Option<fattr3> {
+        self.sidecars().attr(id, self.map)
+    }
+
+    pub(super) fn read_sidecar(&self, id: u64, offset: u64, count: u32) -> Option<(Vec<u8>, bool)> {
+        self.sidecars().read(id, offset, count)
+    }
+
+    pub(super) fn write_sidecar(&self, id: u64, offset: u64, data: &[u8]) -> Option<fattr3> {
+        self.sidecars().write(id, offset, data, self.map)
+    }
+
+    pub(super) fn setattr_sidecar(&self, id: u64, attr: &sattr3) -> Option<fattr3> {
+        self.sidecars().setattr(id, attr, self.map)
+    }
+
+    /// Whether creating `name` at `path` makes a sidecar: a `._` name with
+    /// nothing on disk under it.
+    pub(super) async fn shadows(&self, name: &OsStr, path: &Path) -> Result<bool, nfsstat3> {
+        Ok(is_sidecar_name(name) && !on_disk(path.to_path_buf()).await?)
+    }
+
+    /// Creates sidecar `name` in `dirid` — unless the Mac already has, which
+    /// `exclusive` refuses — and applies `attr` to it.
+    pub(super) fn create_sidecar(
+        &self,
+        dirid: u64,
+        name: &OsStr,
+        attr: &sattr3,
+        exclusive: bool,
+    ) -> Result<(FileHandleU64, fattr3), nfsstat3> {
+        let id = self.ids().child(dirid, name);
+        let mut sidecars = self.sidecars();
+        if sidecars.contains(id) {
+            if exclusive {
+                return Err(nfsstat3::NFS3ERR_EXIST);
+            }
+        } else {
+            sidecars.insert(id, dirid, name);
+        }
+        let attr = sidecars
+            .setattr(id, attr, self.map)
+            .ok_or(nfsstat3::NFS3ERR_SERVERFAULT)?;
+        Ok((FileHandleU64::new(id), attr))
+    }
+
+    /// Drops sidecar `name` from memory, telling whether there was one.
+    pub(super) fn remove_sidecar(&self, dirid: u64, name: &OsStr) -> bool {
+        if !self.sidecars().remove_named(dirid, name) {
+            return false;
+        }
+        self.ids().forget(dirid, name);
+        true
+    }
+
+    /// Moves a sidecar, if `from` is one: to another `._` name, in memory;
+    /// to any other name, `NFS3ERR_XDEV`, so `mv` and Finder copy it out
+    /// and the file lands on disk as the Mac asked.
+    pub(super) fn rename_sidecar(
+        &self,
+        from_dirid: u64,
+        from_name: &OsStr,
+        to_dirid: u64,
+        to_name: &OsStr,
+    ) -> Option<Result<(), nfsstat3>> {
+        let id = self.sidecars().lookup(from_dirid, from_name)?;
+        if !is_sidecar_name(to_name) {
+            return Some(Err(nfsstat3::NFS3ERR_XDEV));
+        }
+        self.remove_sidecar(to_dirid, to_name);
+        self.sidecars().rename(id, to_dirid, to_name);
+        self.ids().rename(from_dirid, from_name, to_dirid, to_name);
+        Some(Ok(()))
+    }
+
+    /// Drops the sidecars under directory `name` of `dirid`, which the Mac
+    /// has removed.
+    pub(super) fn drop_sidecars_in(&self, dirid: u64, name: &OsStr) {
+        let dir = self.ids().lookup(dirid, name);
+        if let Some(dir) = dir {
+            self.sidecars().remove_in_dir(dir);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::MetadataExt as _;
+
+    use nfs3_server::nfs3_types::nfs3::{filename3, stable_how};
+    use nfs3_server::vfs::{NextResult, NfsFileSystem, NfsReadFileSystem, ReadDirPlusIterator};
+
     use super::*;
 
     #[test]
@@ -228,5 +353,132 @@ mod tests {
         assert!(!sidecars.contains(10), "the first one inserted was evicted");
         assert_eq!(sidecars.lookup(1, OsStr::new("._0")), None);
         assert!(sidecars.contains(10 + CAPACITY as u64));
+    }
+
+    fn name(s: &str) -> filename3<'_> {
+        filename3::from(s.as_bytes())
+    }
+
+    #[tokio::test]
+    async fn the_macs_sidecars_stay_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f"), b"file").unwrap();
+        std::fs::write(dir.path().join("._real"), b"machine").unwrap();
+        // The guest owner is this user: `mkdir` below chowns to it.
+        let me = std::fs::metadata(dir.path()).unwrap();
+        let map = IdMap::new(501, 20, me.uid(), me.gid());
+        let fs = MachineRoot::new(dir.path().to_path_buf(), map);
+        let root = fs.root_dir();
+
+        // Written from the Mac: in memory, served back, never on disk.
+        let (sc, attr) = fs
+            .create(&root, &name("._f"), sattr3::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            (attr.size, attr.uid, attr.mode),
+            (0, 501, DEFAULT_FILE_MODE)
+        );
+        assert_eq!(
+            fs.create_exclusive(&root, &name("._f"), Default::default())
+                .await,
+            Err(nfsstat3::NFS3ERR_EXIST)
+        );
+        let (attr, stable) = fs
+            .write(&sc, 0, b"AppleDouble", stable_how::UNSTABLE)
+            .await
+            .unwrap();
+        assert_eq!((attr.size, stable), (11, stable_how::FILE_SYNC));
+        fs.commit(&sc, 0, 0).await.unwrap();
+        assert_eq!(
+            fs.read(&sc, 5, 100).await.unwrap(),
+            (b"Double".to_vec(), true)
+        );
+        assert_eq!(fs.lookup(&root, &name("._f")).await.unwrap(), sc);
+        assert_eq!(fs.getattr(&sc).await.unwrap().size, 11);
+        assert_eq!(fs.readlink(&sc).await, Err(nfsstat3::NFS3ERR_INVAL));
+        assert!(!dir.path().join("._f").exists());
+
+        // Not listed; the machine's own `._real` is a file like any other.
+        let mut listing = fs.readdirplus(&root, 0).await.unwrap();
+        let mut names = Vec::new();
+        while let NextResult::Ok(entry) = listing.next().await {
+            names.push(String::from_utf8(entry.name.as_ref().to_vec()).unwrap());
+        }
+        names.sort();
+        assert_eq!(names, ["._real", "f"]);
+
+        // One the machine made is a plain file, and create keeps it.
+        let real = fs.lookup(&root, &name("._real")).await.unwrap();
+        assert_eq!(fs.read(&real, 0, 100).await.unwrap().0, b"machine");
+        fs.create(&root, &name("._real"), sattr3::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("._real")).unwrap(),
+            b"machine"
+        );
+
+        // A move to a plain name is cross-device; to a sidecar name, in memory.
+        assert_eq!(
+            fs.rename(&root, &name("._f"), &root, &name("g")).await,
+            Err(nfsstat3::NFS3ERR_XDEV)
+        );
+        fs.rename(&root, &name("._f"), &root, &name("._g"))
+            .await
+            .unwrap();
+        assert_eq!(
+            fs.lookup(&root, &name("._f")).await,
+            Err(nfsstat3::NFS3ERR_NOENT)
+        );
+        assert_eq!(fs.lookup(&root, &name("._g")).await.unwrap(), sc);
+        let attr = sattr3 {
+            size: set_size3::Some(5),
+            mode: set_mode3::Some(0o600),
+            ..sattr3::default()
+        };
+        let attr = fs.setattr(&sc, attr).await.unwrap();
+        assert_eq!((attr.size, attr.mode), (5, 0o600));
+        assert_eq!(fs.read(&sc, 0, 100).await.unwrap().0, b"Apple");
+
+        // A file the machine makes under the name takes the sidecar's place.
+        std::fs::write(dir.path().join("._g"), b"disk").unwrap();
+        let g = fs.lookup(&root, &name("._g")).await.unwrap();
+        assert_eq!(fs.read(&g, 0, 100).await.unwrap().0, b"disk");
+        std::fs::remove_file(dir.path().join("._g")).unwrap();
+        assert_eq!(
+            fs.lookup(&root, &name("._g")).await,
+            Err(nfsstat3::NFS3ERR_NOENT)
+        );
+
+        // Removed from the Mac, a sidecar is gone and its handle stale.
+        let (sc, _) = fs
+            .create(&root, &name("._h"), sattr3::default())
+            .await
+            .unwrap();
+        fs.remove(&root, &name("._h")).await.unwrap();
+        assert!(matches!(
+            fs.getattr(&sc).await,
+            Err(nfsstat3::NFS3ERR_STALE)
+        ));
+        assert_eq!(
+            fs.remove(&root, &name("._h")).await,
+            Err(nfsstat3::NFS3ERR_NOENT)
+        );
+
+        // So are the sidecars in a directory the Mac removes.
+        let (d, _) = fs.mkdir(&root, &name("d")).await.unwrap();
+        let (q, _) = fs
+            .create(&d, &name("._q"), sattr3::default())
+            .await
+            .unwrap();
+        fs.remove(&root, &name("d")).await.unwrap();
+        assert!(matches!(fs.getattr(&q).await, Err(nfsstat3::NFS3ERR_STALE)));
+        let mut on_disk: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        on_disk.sort();
+        assert_eq!(on_disk, ["._real", "f"]);
     }
 }
