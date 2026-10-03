@@ -12,9 +12,9 @@
 //! The loop follows the runtime's event bus the way `machine_dns` does and
 //! re-derives what should be mounted from each machine's record, so a
 //! lagged receiver is repaired by one pass. [`mount_machine`] and
-//! [`unmount_machine`] are the two operations; a lifecycle operation that
-//! needs the mount gone before it acts on the machine's disks (export,
-//! clone) calls [`unmount_machine`] itself.
+//! [`unmount_machine`] are the two operations. Clone and export never meet
+//! a mount: both refuse a running machine, and a clone or an imported
+//! machine is mounted like any other once it starts.
 //!
 //! Why not `~/ArcBox/machines/<name>`: `~/ArcBox` is itself the read-only
 //! NFS mount of the System VM's docker data, so nothing can be created
