@@ -794,3 +794,138 @@ fn clone_file_keeps_the_image_sparse() {
     }
     assert!(clone_file(&src, &dst).is_err(), "the destination exists");
 }
+
+fn test_image_manifest() -> arcbox_image::machine_image::MachineImageManifest {
+    serde_json::from_value(serde_json::json!({
+        "schema_version": 1,
+        "name": "alpine-3.24-arm64",
+        "version": "20260716_1300",
+        "distro": "alpine",
+        "release": "3.24",
+        "release_title": "3.24",
+        "arch": "arm64",
+        "variant": "default",
+        "upstream": {
+            "server": "https://images.linuxcontainers.org",
+            "product": "alpine:3.24:arm64:default",
+            "version": "20260716_13:00"
+        },
+        "rootfs": { "path": "rootfs.squashfs", "format": "squashfs", "size": 6, "sha256": "ab" }
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn export_then_import_restores_the_machine_and_its_data() {
+    let temp_dir = tempdir().unwrap();
+    let manager = test_machine_manager(temp_dir.path());
+    let source = create_shimmed(&manager, temp_dir.path(), "dev").await;
+    let source_disk = std::fs::read(source.disk_path.as_ref().unwrap()).unwrap();
+    let archive_path = temp_dir.path().join("dev.tar.zst");
+
+    let size = manager
+        .export("dev", &archive_path, test_image_manifest())
+        .unwrap();
+    assert_eq!(size, archive_path.metadata().unwrap().len());
+    // The snapshot the archive was written from is gone with the export.
+    assert!(
+        std::fs::read_dir(temp_dir.path().join("machines"))
+            .unwrap()
+            .all(|e| !e.unwrap().file_name().to_string_lossy().starts_with('.'))
+    );
+
+    let manifest = archive::read_manifest(&archive_path).unwrap();
+    assert_eq!(manifest.machine.name, "dev");
+    assert_eq!(
+        (manifest.machine.cpus, manifest.machine.memory_mb),
+        (2, 1536)
+    );
+    assert_eq!(manifest.machine.distro, "alpine");
+    assert_eq!(manifest.image.version, "20260716_1300");
+
+    manager.remove("dev", false).unwrap();
+    assert!(manager.get("dev").is_none());
+
+    // Import under another name: the caller turns the manifest into a config
+    // the way `create` is called, with the rootfs resolved locally.
+    let rootfs_img = temp_dir.path().join("rootfs.squashfs");
+    let config = MachineConfig {
+        name: "dev2".to_string(),
+        cpus: manifest.machine.cpus,
+        memory_mb: manifest.machine.memory_mb,
+        disk_gb: manifest.machine.disk_gb,
+        distro: Some(manifest.machine.distro.clone()),
+        distro_version: manifest.machine.distro_version.clone(),
+        rootfs: Some(MachineRootfs {
+            path: rootfs_img,
+            format: "squashfs".to_string(),
+            shim: Some(BootShim {
+                kernel: temp_dir.path().join("kernel"),
+                rootfs: temp_dir.path().join("shim.erofs"),
+            }),
+        }),
+        mounts: manifest.machine.mounts,
+        ..Default::default()
+    };
+    assert_eq!(
+        manager.import(config.clone(), &archive_path).unwrap(),
+        "dev2"
+    );
+
+    let imported = manager.get("dev2").unwrap();
+    assert_eq!(imported.state, MachineState::Created);
+    assert_eq!(
+        (imported.cpus, imported.memory_mb, imported.disk_gb),
+        (2, 1536, 1)
+    );
+    let disk = imported.disk_path.clone().unwrap();
+    assert_eq!(disk, temp_dir.path().join("machines/dev2/data.img"));
+    assert_eq!(std::fs::read(&disk).unwrap(), source_disk);
+    let cmdline = imported.cmdline.as_deref().unwrap();
+    let name_token = format!("{}dev2", arcbox_constants::cmdline::MACHINE_NAME_KEY);
+    assert!(
+        cmdline.split_whitespace().any(|t| t == name_token),
+        "{cmdline}"
+    );
+
+    // A taken name is refused before anything is extracted.
+    let taken = manager.import(config, &archive_path).unwrap_err();
+    assert!(matches!(taken, EngineError::Common(ref c) if c.is_already_exists()));
+    assert!(
+        std::fs::read_dir(temp_dir.path().join("machines"))
+            .unwrap()
+            .all(|e| !e.unwrap().file_name().to_string_lossy().starts_with('.'))
+    );
+}
+
+#[tokio::test]
+async fn export_refuses_a_running_machine_and_stale_staging_is_swept() {
+    let temp_dir = tempdir().unwrap();
+    let manager = test_machine_manager(temp_dir.path());
+    create_shimmed(&manager, temp_dir.path(), "dev").await;
+    manager
+        .machines
+        .write()
+        .unwrap()
+        .get_mut("dev")
+        .unwrap()
+        .state = MachineState::Running;
+    let err = manager
+        .export(
+            "dev",
+            &temp_dir.path().join("dev.tar.zst"),
+            test_image_manifest(),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("stop it first"), "{err}");
+    assert!(!temp_dir.path().join("dev.tar.zst").exists());
+
+    // What a crashed daemon could leave behind goes on the next start.
+    let stale = temp_dir.path().join("machines/.import-leftover");
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(stale.join("data.img"), b"partial").unwrap();
+    drop(manager);
+    let manager = test_machine_manager(temp_dir.path());
+    assert!(!stale.exists());
+    assert!(manager.get("dev").is_some());
+}

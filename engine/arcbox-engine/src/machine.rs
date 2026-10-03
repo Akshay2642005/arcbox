@@ -45,8 +45,10 @@ mod clone;
 mod serial;
 #[cfg(test)]
 mod tests;
+mod transfer;
 
 pub use clone::clone_file;
+use transfer::DataDisk;
 
 /// Machine information.
 #[derive(Debug, Clone)]
@@ -434,6 +436,7 @@ impl MachineManager {
     ) -> Self {
         let machines_dir = data_dir.join("machines");
         let persistence = MachinePersistence::new(&machines_dir);
+        Self::sweep_staging(&machines_dir);
 
         // Load persisted machines
         let mut machines = HashMap::new();
@@ -538,6 +541,13 @@ impl MachineManager {
     ///
     /// Returns an error if the machine cannot be created.
     pub async fn create(&self, config: MachineConfig) -> Result<String> {
+        self.create_machine(config, DataDisk::Sparse)
+    }
+
+    /// Registers a machine from `config`, provisioning its data disk as
+    /// `data_disk` says: fresh and sparse for `create`, moved in from a
+    /// staging directory for `import`.
+    fn create_machine(&self, config: MachineConfig, data_disk: DataDisk) -> Result<String> {
         // Hold the write lock for the entire create operation to prevent TOCTOU
         // races: without this, two concurrent creates with the same name could
         // both pass the existence check before either inserts. `create` is rare
@@ -585,11 +595,17 @@ impl MachineManager {
                          kernel (pass --kernel)",
                     ));
                 }
-                let data_disk = machine_dir.join("data.img");
+                let data_disk_path = machine_dir.join(clone::DATA_DISK);
+                if let DataDisk::Staged(staged) = &data_disk {
+                    std::fs::rename(staged, &data_disk_path)?;
+                }
+                // Never shrinks an existing image, so a restored disk keeps
+                // its size and only a larger `disk_gb` grows it.
                 crate::vm::ensure_sparse_block_image(
-                    &data_disk,
+                    &data_disk_path,
                     config.disk_gb.saturating_mul(1024 * 1024 * 1024),
                 )?;
+                let data_disk = data_disk_path;
                 let mut devices = Vec::new();
                 if let Some(shim) = &rootfs.shim {
                     devices.push(crate::vm::BlockDeviceConfig {
@@ -621,12 +637,19 @@ impl MachineManager {
                 });
                 (kernel, devices, cmdline, Some(data_disk))
             }
-            None => (
-                config.kernel.clone(),
-                config.block_devices.clone(),
-                config.cmdline.clone(),
-                None,
-            ),
+            None => {
+                if matches!(data_disk, DataDisk::Staged(_)) {
+                    return Err(EngineError::config(
+                        "a restored data disk needs a distro rootfs to boot under",
+                    ));
+                }
+                (
+                    config.kernel.clone(),
+                    config.block_devices.clone(),
+                    config.cmdline.clone(),
+                    None,
+                )
+            }
         };
 
         // Create underlying VM
