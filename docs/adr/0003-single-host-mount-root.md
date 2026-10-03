@@ -48,12 +48,14 @@ the cleanup of what the previous layout left.
    mount table `/sbin/mount` reports, never by touching a mount point; a
    mount of another shape or a directory with the user's files stays, and
    so does everything above it.
-5. A force stop of a machine (`machine stop --force`, `machine remove
-   --force`) publishes `MachineStopping` and then waits, at most 10 s, for
-   the host to release what it holds of the machine before it kills the
-   VM (`MachineManager::host_hold`). The mount loop holds while a root is
-   mounted and lets go on its first release attempt. A graceful stop does
-   not wait: the guest's own shutdown outlasts the release.
+5. Every stop of a machine — graceful, `machine stop --force`, `machine
+   remove --force` — publishes `MachineStopping` and then waits, at most
+   10 s, for the host to release what it holds of the machine before it
+   touches the VM (`MachineManager::host_hold`). The mount loop holds while
+   a root is mounted and lets go on its first release attempt. The force
+   paths killed the VM in the same breath as the event; the graceful path
+   sends a shutdown RPC whose guest-side sequence killed the export within
+   moments on alpine, before the unmount it raced had finished.
 6. The desktop app maps `/var/lib/docker/<rest>` onto
    `~/ArcBox/docker/<rest>` and `/var/lib/containerd/<rest>` onto
    `~/ArcBox/docker/containerd/<rest>`.

@@ -6,9 +6,10 @@
 //! answer, and only a forced unmount, after its timeout, gets rid of them —
 //! a `remove --force` took ~15 s that way. A holder therefore registers a
 //! [`HostHold`] while it depends on the machine and drops it once the
-//! `MachineStopping` event has made it let go; a force stop waits, bounded,
-//! for the holds to clear before it kills the VM. A graceful stop needs no
-//! wait: the guest's own shutdown outlasts the release.
+//! `MachineStopping` event has made it let go; every stop waits, bounded,
+//! for the holds to clear before it touches the VM. The graceful stop
+//! waits too: its shutdown RPC kills the machine's export within moments
+//! on alpine, before an unmount started at the event has finished.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};

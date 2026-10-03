@@ -52,10 +52,10 @@ pub use clone::clone_file;
 pub use host_hold::HostHold;
 use transfer::DataDisk;
 
-/// How long a force stop waits for the host to release what it holds of
-/// the machine before killing the VM. The release takes well under a
-/// second while the machine still answers; the bound covers a holder that
-/// is busy with another machine.
+/// How long a stop waits for the host to release what it holds of the
+/// machine before touching the VM. The release takes well under a second
+/// while the machine still answers; the bound covers a holder that is
+/// busy with another machine.
 const HOST_RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Machine information.
@@ -439,8 +439,8 @@ pub struct MachineManager {
     /// so watchers (`MachineService.Events`) see them; the default System VM's
     /// events are published by its own lifecycle actor instead.
     event_bus: crate::event::EventBus,
-    /// What the host holds of each running machine; a force stop waits for
-    /// these to clear before it kills the VM (see [`HostHold`]).
+    /// What the host holds of each running machine; every stop waits for
+    /// these to clear before it touches the VM (see [`HostHold`]).
     host_holds: host_hold::HostHolds,
     /// The serial drain of every running machine, by name (see [`serial`]).
     /// Dropping an entry stops its drain.
@@ -545,7 +545,7 @@ impl MachineManager {
     }
 
     /// Registers a host-side dependency on machine `name` — a mount served
-    /// by the machine, say — that a force stop waits for before it kills
+    /// by the machine, say — that every stop waits for before it touches
     /// the VM. Release it, by dropping the hold, on `MachineStopping`.
     #[must_use]
     pub fn host_hold(&self, name: &str) -> HostHold {
@@ -1632,6 +1632,10 @@ impl MachineManager {
                 name: name.to_string(),
             },
         );
+        // The guest's shutdown kills the machine's export within moments
+        // of the RPC below — before the unmount it races has finished
+        // (alpine, 2026-10-04) — so the host's release goes first here too.
+        self.await_host_release(name);
 
         match self.vm_manager.graceful_stop(&vm_id, timeout) {
             Ok(true) => {
