@@ -336,18 +336,19 @@ mod tests {
         );
         images.insert(2, Image::fresh(start), start);
         let second = Duration::from_secs(1);
-        assert!(images.due(start, second).is_empty());
+        assert_eq!(images.due(start, second), Vec::<u64>::new());
         assert_eq!(images.due(start + second, second), [2]);
         images.get_mut(2, start).unwrap().tried = Some(0);
-        assert!(
-            images.due(start + second, second).is_empty(),
+        assert_eq!(
+            images.due(start + second, second),
+            Vec::<u64>::new(),
             "tried at this generation"
         );
         images.write(2, 0, b"x", start).unwrap();
         assert_eq!(images.due(start + second, second), [2]);
         assert!(
             images
-                .retire(start + (CLEAN_TTL - Duration::from_millis(1)))
+                .retire(start + CLEAN_TTL.checked_sub(Duration::from_millis(1)).unwrap())
                 .is_empty()
         );
         let retired = images.retire(start + CLEAN_TTL);
