@@ -1,5 +1,6 @@
 //! Machine management commands.
 
+mod lifecycle;
 mod target;
 
 use anyhow::{Context, Result, bail};
@@ -89,6 +90,16 @@ pub enum MachineCommands {
     Ssh(SshArgs),
     /// Execute a command in a machine
     Exec(ExecArgs),
+    /// Clone a stopped machine (copy-on-write, instant)
+    Clone(lifecycle::CloneArgs),
+    /// Write a stopped machine to a self-contained archive
+    Export(lifecycle::ExportArgs),
+    /// Create a machine from an archive
+    Import(lifecycle::ImportArgs),
+    /// Change a machine's CPU and memory limits (applied at its next start)
+    Resize(lifecycle::ResizeArgs),
+    /// Show or set the machine `exec` and `ssh` use when given no name
+    Default(lifecycle::DefaultArgs),
 }
 
 #[derive(Args)]
@@ -217,6 +228,11 @@ pub async fn execute(cmd: MachineCommands) -> Result<()> {
         MachineCommands::Info(args) => execute_info(args).await,
         MachineCommands::Ssh(args) => execute_ssh(args).await,
         MachineCommands::Exec(args) => execute_exec(args).await,
+        MachineCommands::Clone(args) => lifecycle::execute_clone(args).await,
+        MachineCommands::Export(args) => lifecycle::execute_export(args).await,
+        MachineCommands::Import(args) => lifecycle::execute_import(args).await,
+        MachineCommands::Resize(args) => lifecycle::execute_resize(args).await,
+        MachineCommands::Default(args) => lifecycle::execute_default(args).await,
     }
 }
 
