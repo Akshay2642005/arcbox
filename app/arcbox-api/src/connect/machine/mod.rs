@@ -1,9 +1,10 @@
 //! Machine service gRPC implementation.
 
+mod rootfs;
+
 use arcbox_connect::v1 as pb;
 use arcbox_connect::v1::machine_exec_input;
 use arcbox_core::ExecSessionInput;
-use arcbox_core::machine_image;
 use connectrpc::{
     ConnectError, InboundStream, RequestContext, Response, ServiceRequest, ServiceResult,
     ServiceStream,
@@ -66,55 +67,10 @@ impl pb::MachineService for MachineServiceImpl {
         let rootfs = if req.distro.is_empty() {
             None
         } else {
-            let arch = if req.arch.is_empty() {
-                machine_image::host_image_arch().to_string()
-            } else {
-                machine_image::image_arch(&req.arch).to_string()
-            };
-            let selector = machine_image::ImageSelector::Distro {
-                distro: req.distro.clone(),
-                release: (!req.version.is_empty()).then(|| req.version.clone()),
-                arch,
-            };
-            let image = runtime
-                .machine_image_manager()
-                .pull(&selector, |done, total| {
-                    tracing::debug!(machine = %req.name, done, total, "machine image pull");
-                })
-                .await
-                .map_err(|e| match &e {
-                    arcbox_image::ImageError::Common(c) if c.is_not_found() => {
-                        ConnectError::not_found(e.to_string())
-                    }
-                    _ => ConnectError::internal(e.to_string()),
-                })?;
-            tracing::info!(
-                machine = %req.name,
-                image = %format!("{}@{}", image.manifest.name, image.manifest.version),
-                "machine image ready"
-            );
-
-            // Resolve the boot shim (kernel + EROFS with
-            // /sbin/arcbox-machine-init) from the same boot-assets cache the
-            // daemon populates for the System VM; a warm cache is a no-op.
-            let shim = async {
-                let provider = arcbox_core::boot_assets::BootAssetProvider::new(
-                    runtime.config().data_dir.join("boot"),
-                )?;
-                let assets = provider.get_assets().await?;
-                Ok::<_, arcbox_core::error::CoreError>(arcbox_core::machine::BootShim {
-                    kernel: assets.kernel,
-                    rootfs: assets.rootfs_image,
-                })
-            }
-            .await
-            .map_err(|e| ConnectError::internal(format!("resolve boot shim: {e}")))?;
-
-            Some(arcbox_core::machine::MachineRootfs {
-                path: image.rootfs_path(),
-                format: image.manifest.rootfs.format,
-                shim: Some(shim),
-            })
+            let image =
+                rootfs::pull_image(runtime, &req.name, &req.distro, &req.version, &req.arch)
+                    .await?;
+            Some(rootfs::rootfs_for(runtime, &image).await?)
         };
 
         let config = arcbox_core::machine::MachineConfig {
