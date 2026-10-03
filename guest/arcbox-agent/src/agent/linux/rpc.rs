@@ -342,10 +342,11 @@ fn handle_shutdown(req: arcbox_connect::v1::ShutdownRequest) -> RpcResponse {
         Duration::from_secs(u64::from(req.timeout_seconds))
     };
     tracing::info!(grace_secs = grace.as_secs(), "Shutdown requested by host");
+    let guest = crate::agent::Guest::detect();
     std::thread::spawn(move || {
         // Brief delay so the response frame flushes over vsock.
         std::thread::sleep(Duration::from_millis(100));
-        crate::shutdown::poweroff(grace);
+        crate::shutdown::poweroff(grace, guest);
     });
     RpcResponse::Shutdown(arcbox_connect::v1::ShutdownResponse {
         accepted: true,
