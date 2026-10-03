@@ -20,12 +20,18 @@
 
 mod attr;
 mod ids;
+// The listeners have one caller, the Linux RPC handler; the filesystem
+// below them is unit-tested on a host build.
+#[cfg(target_os = "linux")]
+mod server;
 mod vfs;
 
 use std::net::IpAddr;
 
 use arcbox_connect::v1::EnsureMachineExportRequest;
 pub use attr::IdMap;
+#[cfg(target_os = "linux")]
+pub use server::Endpoint;
 
 /// What the host asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +62,25 @@ impl ExportConfig {
             client_addresses,
         })
     }
+}
+
+/// Serves `root` on `bridge` for the peers in `config`, once: a later call
+/// returns the endpoint the first one started, whatever it asked for.
+#[cfg(target_os = "linux")]
+pub async fn ensure(
+    root: std::path::PathBuf,
+    bridge: std::net::Ipv4Addr,
+    config: ExportConfig,
+) -> Result<Endpoint, String> {
+    static ENDPOINT: tokio::sync::OnceCell<Endpoint> = tokio::sync::OnceCell::const_new();
+    ENDPOINT
+        .get_or_try_init(|| async move {
+            server::serve(root, bridge, config)
+                .await
+                .map_err(|e| format!("start the machine export on {bridge}: {e}"))
+        })
+        .await
+        .copied()
 }
 
 #[cfg(test)]
