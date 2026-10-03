@@ -97,6 +97,25 @@ alpine/ubuntu/fedora machines on VZ, M-series host:
    git on the Mac never meets a `._pack-*.idx`. A `._` file made inside
    the machine is a plain file and takes precedence.
 
+   *Revised 2026-10-04 (the `feat/machine-export-xattrs` series).* The
+   in-memory table is gone, and with it its 4 096-entry cap and the loss
+   of every attribute at machine stop. The agent now parses what the Mac
+   writes into `._<name>` and stores it on `<name>` itself as `user.*`
+   extended attributes — the Mac's name under Linux's user namespace
+   (`user.com.apple.provenance`, `user.com.apple.FinderInfo`,
+   `user.com.apple.ResourceFork`) — and answers a read of `._<name>` with
+   an AppleDouble image built from those attributes. A value btrfs will
+   not hold in one leaf item (name and value over 16 228 bytes; a resource
+   fork, in practice) goes to a hidden `.arcbox-xattrs/<name>` beside the
+   file, tagged with the inode it belongs to; the export hides that
+   directory from the Mac and moves or removes the entry with the file.
+   The attributes follow the file through renames on either side and
+   survive stop and start; a sidecar the Mac writes before its file (a
+   copy from a volume with real `._` files) waits in memory, bounded and
+   expiring, until the file appears. The rest of the point stands: `._`
+   names are never listed, and a `._` file on disk is a plain file. The
+   measurements are the 2026-10-04 addendum of the experiment entry.
+
 ## Consequences
 
 - `/arcbox` — ArcBox's VirtioFS share of the host's own data directory —
@@ -113,6 +132,11 @@ alpine/ubuntu/fedora machines on VZ, M-series host:
   entry, drops them, and the Mac sees "no attribute" and writes them again
   on the next `setxattr`. Finder's `.DS_Store` files are ordinary files
   and do land in the machine, as on any network mount.
+  *Revised 2026-10-04:* the attributes are the file's own now and last as
+  long as it does; what remains is the Mac's attribute cache, which can
+  show an attribute set inside the machine up to 60 s late, and the
+  hidden `.arcbox-xattrs/` directory wherever a value needed the side
+  store, visible from inside the machine (`ls -a`, `git status`).
 - Changing the mount root, the port strategy, or the admission rule is a
   new ADR; so is moving the docker export under `~/ArcBox/docker`.
 - The relay costs one loopback hop per RPC inside the machine. Removing it
