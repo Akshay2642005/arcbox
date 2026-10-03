@@ -108,8 +108,18 @@ pub async fn mount_nfs(opts: &str, source: &str, mount_path: &Path) -> Result<()
 
 /// Unmounts `path`, waiting at most [`UNMOUNT_TIMEOUT`].
 pub async fn unmount(path: &Path) -> Result<()> {
+    run_umount(path, &[]).await
+}
+
+/// Forcibly unmounts `path` (`umount -f`): the NFS client abandons its
+/// outstanding requests instead of waiting for a server that is gone.
+pub async fn unmount_force(path: &Path) -> Result<()> {
+    run_umount(path, &["-f"]).await
+}
+
+async fn run_umount(path: &Path, flags: &[&str]) -> Result<()> {
     let mut command = tokio::process::Command::new("/sbin/umount");
-    command.arg(path).kill_on_drop(true);
+    command.args(flags).arg(path).kill_on_drop(true);
     let output = tokio::time::timeout(UNMOUNT_TIMEOUT, command.output())
         .await
         .context("umount timed out")??;

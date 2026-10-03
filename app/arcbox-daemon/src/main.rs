@@ -8,6 +8,7 @@ mod host_mount;
 mod kubernetes_lb;
 mod kubernetes_proxy;
 mod machine_dns;
+mod machine_mount;
 mod nfs_mount;
 mod power;
 mod recovery;
