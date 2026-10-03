@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use arcbox_constants::paths::{
-    ArcboxProfile, DOCKER_CLI_TOOLS, HostLayout, guest, is_arcbox_owned, labels, privileged,
-    privileged_log,
+    ArcboxProfile, DOCKER_CLI_TOOLS, HostLayout, HostMountLayout, guest, is_arcbox_owned, labels,
+    privileged, privileged_log,
 };
 use arcbox_helper::validate::SocketTarget;
 
@@ -79,14 +79,11 @@ impl Roots {
         self.system_path("/etc/hosts")
     }
 
-    /// The host-side mount of the guest's Docker data.
-    pub(super) fn data_export_mount(&self) -> PathBuf {
-        self.home.join("ArcBox")
-    }
-
-    /// The directory the daemon mounts each running machine's root under.
-    pub(super) fn machine_mount_root(&self) -> PathBuf {
-        self.home.join("ArcBoxMachines")
+    /// The host mount root (`~/ArcBox`): the daemon's docker export and
+    /// machine root mounts live under it, and a daemon from before the
+    /// single root mounted machines under its `legacy_machines_root`.
+    pub(super) fn host_mounts(&self) -> HostMountLayout {
+        HostMountLayout::under_home(&self.home)
     }
 
     pub(super) fn login_keychain(&self) -> PathBuf {

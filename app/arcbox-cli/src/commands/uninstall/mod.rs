@@ -11,12 +11,14 @@
 
 mod host;
 mod inventory;
+mod mounts;
 mod steps;
 
 use std::io::Write as _;
 
 use anyhow::{Context, Result, bail};
 use arcbox_constants::paths::{ArcboxProfile, HostLayout, labels};
+use arcbox_core::host_mount::MountInfo;
 use arcbox_docker::DockerContextManager;
 use clap::Args;
 
@@ -183,16 +185,20 @@ async fn run(
             steps::bootout_helper(host),
         );
     }
-    step(
-        format!("Unmounting {}", roots.data_export_mount().display()),
-        steps::remove_data_export(host, &roots.data_export_mount()),
-    );
+    let host_mounts = roots.host_mounts();
     step(
         format!(
-            "Unmounting machines under {}",
-            roots.machine_mount_root().display()
+            "Unmounting what the daemon left under {}",
+            host_mounts.root().display()
         ),
-        steps::remove_machine_exports(host, &roots.machine_mount_root()),
+        mounts::remove_host_mounts(host, host_mounts.root(), |mount| {
+            mount.is_docker_export() || mount.is_machine_export()
+        }),
+    );
+    let legacy_machines = host_mounts.legacy_machines_root();
+    step(
+        format!("Unmounting machines under {}", legacy_machines.display()),
+        mounts::remove_host_mounts(host, &legacy_machines, MountInfo::is_machine_export),
     );
     step(
         "Removing the Docker context".into(),

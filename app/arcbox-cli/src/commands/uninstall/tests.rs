@@ -14,7 +14,7 @@ use std::process::{ExitStatus, Output};
 use std::sync::Mutex;
 
 use anyhow::Result;
-use arcbox_constants::paths::{ArcboxProfile, DOCKER_CLI_TOOLS, privileged};
+use arcbox_constants::paths::{ArcboxProfile, DOCKER_CLI_TOOLS, HostMountLayout, privileged};
 use arcbox_docker::DockerContextManager;
 
 use super::host::Host;
@@ -256,8 +256,13 @@ async fn everything_arcbox_wrote_is_removed_and_nothing_else_is_touched() {
     );
     write(&bin.join("docker-credential-pass"), "real binary");
     write(&roots.home.join("ArcBox/README"), "the user's own folder");
-    // A mount point the daemon left behind under the machine mount root.
-    fs::create_dir_all(roots.machine_mount_root().join("ubuntu")).unwrap();
+    // The mount points a daemon left behind: the docker export's and a
+    // machine's under the host mount root, and a machine's under the root
+    // a daemon from before the single root used.
+    let host_mounts = roots.host_mounts();
+    fs::create_dir_all(host_mounts.docker()).unwrap();
+    fs::create_dir_all(host_mounts.machine("ubuntu")).unwrap();
+    fs::create_dir_all(host_mounts.legacy_machines_root().join("ubuntu")).unwrap();
     let shell_profile = install.write_shell_profile().await;
 
     let host = Recorder::new();
@@ -291,7 +296,9 @@ async fn everything_arcbox_wrote_is_removed_and_nothing_else_is_touched() {
         roots.preferences(),
         roots.data_dir.clone(),
         roots.app_bundle(),
-        roots.machine_mount_root(),
+        host_mounts.docker(),
+        host_mounts.machines(),
+        host_mounts.legacy_machines_root(),
     ] {
         assert!(
             absent.symlink_metadata().is_err(),
@@ -346,14 +353,16 @@ async fn everything_arcbox_wrote_is_removed_and_nothing_else_is_touched() {
     );
 }
 
-/// A directory under the machine mount root that holds the user's own files
-/// is not a mount point the daemon left: it and the root stay.
+/// A directory under the pre-single-root machine mount root that holds the
+/// user's own files is not a mount point the daemon left: it and the root
+/// stay.
 #[tokio::test]
 async fn a_machine_mount_root_with_the_users_files_is_left_alone() {
     let install = Install::new();
     let roots = install.roots();
+    let legacy = roots.host_mounts().legacy_machines_root();
     write(
-        &roots.machine_mount_root().join("ubuntu/notes.txt"),
+        &legacy.join("ubuntu/notes.txt"),
         "kept after the mount went away",
     );
 
@@ -367,7 +376,80 @@ async fn a_machine_mount_root_with_the_users_files_is_left_alone() {
         matches!(&step.outcome, Ok(Outcome::Skipped(reason)) if reason.contains("left alone")),
         "{step}"
     );
-    assert!(roots.machine_mount_root().join("ubuntu/notes.txt").exists());
+    assert!(legacy.join("ubuntu/notes.txt").exists());
+}
+
+/// The mounts a dead daemon left are released from the mount table the
+/// host reports, forced, child before parent; a mount of another shape
+/// under the root is left alone, and the root with it.
+#[tokio::test]
+async fn the_daemons_mounts_are_released_deepest_first_and_foreign_ones_kept() {
+    let install = Install::new();
+    let roots = install.roots();
+    let host_mounts = roots.host_mounts();
+    for dir in [
+        host_mounts.docker().join("containerd"),
+        host_mounts.machine("ubuntu"),
+        host_mounts.machine("nas"),
+    ] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    // The table names mount points by their resolved paths.
+    let canonical = HostMountLayout::new(fs::canonicalize(host_mounts.root()).unwrap());
+    let table = format!(
+        "/dev/disk3s1 on / (apfs, local, journaled)\n\
+         ArcBox:/ on {docker} (nfs, nodev, read-only)\n\
+         ArcBox:/containerd on {containerd} (nfs, nodev, automounted)\n\
+         192.168.64.7:/ on {ubuntu} (nfs, nodev)\n\
+         //nas/share on {nas} (smbfs, nodev)\n",
+        docker = canonical.docker().display(),
+        containerd = canonical.docker().join("containerd").display(),
+        ubuntu = canonical.machine("ubuntu").display(),
+        nas = canonical.machine("nas").display(),
+    );
+    let host = Recorder::answering(move |program, _| {
+        (program == "/sbin/mount").then(|| output(0, &table, ""))
+    });
+
+    let steps = uninstall(&install, &host, false).await;
+    assert_eq!(failures(&steps), Vec::<String>::new());
+    let step = steps
+        .iter()
+        .find(|step| step.label.starts_with("Unmounting what the daemon left"))
+        .expect("the host mounts step ran");
+    assert!(
+        matches!(&step.outcome, Ok(Outcome::Skipped(reason)) if reason.contains("//nas/share (smbfs)")),
+        "{step}"
+    );
+
+    let umounts: Vec<&String> = host
+        .calls()
+        .iter()
+        .filter(|call| call.starts_with("/sbin/umount"))
+        .cloned()
+        .collect::<Vec<_>>()
+        .leak()
+        .iter()
+        .collect();
+    let umount = |path: PathBuf| format!("/sbin/umount -f {}", path.display());
+    let position = |call: String| {
+        umounts
+            .iter()
+            .position(|made| **made == call)
+            .unwrap_or_else(|| panic!("{call} was not run: {umounts:?}"))
+    };
+    assert!(
+        position(umount(canonical.docker().join("containerd")))
+            < position(umount(canonical.docker()))
+    );
+    position(umount(canonical.machine("ubuntu")));
+    assert_eq!(umounts.len(), 3, "the smb mount is not ours: {umounts:?}");
+
+    // Our mount points went; the foreign one, and the root above it, stay.
+    assert!(!host_mounts.docker().exists());
+    assert!(!host_mounts.machine("ubuntu").exists());
+    assert!(host_mounts.machine("nas").exists());
+    assert!(host_mounts.root().exists());
 }
 
 #[tokio::test]
