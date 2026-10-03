@@ -1,8 +1,8 @@
 //! A distro machine's root filesystem, served to the host over NFSv3.
 //!
-//! The host mounts it under its machine mount root (`~/ArcBoxMachines/<name>`
-//! by default) so the machine's files appear on the Mac read-write, the way
-//! OrbStack shows a machine under `~/OrbStack/<machine>`. The export rides
+//! The host mounts it at `~/ArcBox/machines/<name>` (ADR 0003) so the
+//! machine's files appear on the Mac read-write, the way OrbStack shows a
+//! machine under `~/OrbStack/<machine>`. The export rides
 //! the bridge NIC the Mac reaches directly, not a vsock relay, so the host's
 //! NFS client talks TCP straight to the machine.
 //!

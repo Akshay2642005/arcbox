@@ -249,9 +249,10 @@ Covers `arcbox-daemon` (startup/shutdown), `arcbox-core` (`vm_lifecycle`),
   seen 2026-10-04); the entry then stays in the registry and a background
   task retries past the mount's `deadtimeout` (60 s). Entries carry a
   generation so a retry never unmounts a newer incarnation of the name.
-- The export hides `/arcbox` (ArcBox's own VirtioFS shares) and keeps the
-  Mac's AppleDouble `._` sidecars out of the machine
-  (`guest/arcbox-agent/src/machine_export/vfs/sidecar.rs`): macOS cannot
+- The export hides `/arcbox` (ArcBox's own VirtioFS shares) and never puts
+  the Mac's AppleDouble `._` sidecars on disk: it translates them into
+  `user.*` extended attributes on the target file
+  (`guest/arcbox-agent/src/machine_export/vfs/sidecar/`). macOS cannot
   store an xattr on NFSv3 and stamps `com.apple.provenance` on every file a
   downloaded app writes, so without that every host write littered the
   machine with `._*` files and git took a `._pack-*.idx` for a pack index.

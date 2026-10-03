@@ -585,7 +585,7 @@ message EnsureNfsExportResponse {
 
 // Ask a distro machine's agent to serve the machine's root filesystem to the
 // host, read-write, over NFSv3 on the machine's bridge NIC. The host mounts
-// it under its machine mount root (`~/ArcBoxMachines/<name>` by default). The
+// it at `~/ArcBox/machines/<name>`, under its host mount root (ADR 0003). The
 // System VM answers with an error: its data lives behind `EnsureNfsExportRequest`.
 // Idempotent: a second request returns the endpoint the first one started.
 message EnsureMachineExportRequest {
