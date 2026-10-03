@@ -99,18 +99,19 @@ pub mod image {
 pub mod agent {
     pub use super::v1::{
         AgentPingRequest, AgentPingResponse, ContainerFsPathsRequest, ContainerFsPathsResponse,
-        ContainerStats, DiskTrimRequest, DiskTrimResponse, EnsureNfsExportRequest,
-        EnsureNfsExportResponse, ImageFsPathsRequest, ImageFsPathsResponse,
-        KubernetesDeleteRequest, KubernetesDeleteResponse, KubernetesHostPort,
-        KubernetesKubeconfigRequest, KubernetesKubeconfigResponse, KubernetesLoadBalancer,
-        KubernetesLoadBalancersRequest, KubernetesLoadBalancersResponse, KubernetesServicePort,
-        KubernetesStartRequest, KubernetesStartResponse, KubernetesStatusRequest,
-        KubernetesStatusResponse, KubernetesStopRequest, KubernetesStopResponse, MachineStats,
-        MemoryPressureEvent, MmapReadFileRequest, MmapReadFileResponse, PortBindingsChanged,
-        PortBindingsRemoved, ReadinessEvent, RuntimeEnsureRequest, RuntimeEnsureResponse,
-        RuntimeStatusRequest, RuntimeStatusResponse, ServiceStatus, ShutdownRequest,
-        ShutdownResponse, SystemInfo, WatchMemoryPressureRequest, WatchReadinessRequest,
-        WatchStatsRequest, kubernetes_host_port, memory_pressure_event, readiness_event,
+        ContainerStats, DiskTrimRequest, DiskTrimResponse, EnsureMachineExportRequest,
+        EnsureMachineExportResponse, EnsureNfsExportRequest, EnsureNfsExportResponse,
+        ImageFsPathsRequest, ImageFsPathsResponse, KubernetesDeleteRequest,
+        KubernetesDeleteResponse, KubernetesHostPort, KubernetesKubeconfigRequest,
+        KubernetesKubeconfigResponse, KubernetesLoadBalancer, KubernetesLoadBalancersRequest,
+        KubernetesLoadBalancersResponse, KubernetesServicePort, KubernetesStartRequest,
+        KubernetesStartResponse, KubernetesStatusRequest, KubernetesStatusResponse,
+        KubernetesStopRequest, KubernetesStopResponse, MachineStats, MemoryPressureEvent,
+        MmapReadFileRequest, MmapReadFileResponse, PortBindingsChanged, PortBindingsRemoved,
+        ReadinessEvent, RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest,
+        RuntimeStatusResponse, ServiceStatus, ShutdownRequest, ShutdownResponse, SystemInfo,
+        WatchMemoryPressureRequest, WatchReadinessRequest, WatchStatsRequest, kubernetes_host_port,
+        memory_pressure_event, readiness_event,
     };
 
     // Backward compatibility type aliases (short names without Agent prefix).

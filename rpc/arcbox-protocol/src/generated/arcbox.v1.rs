@@ -3723,6 +3723,44 @@ pub struct EnsureNfsExportResponse {
     #[prost(string, repeated, tag = "1")]
     pub notes: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
+/// Ask a distro machine's agent to serve the machine's root filesystem to the
+/// host, read-write, over NFSv3 on the machine's bridge NIC. The host mounts
+/// it under its machine mount root (`~/ArcBoxMachines/<name>` by default). The
+/// System VM answers with an error: its data lives behind `EnsureNfsExportRequest`.
+/// Idempotent: a second request returns the endpoint the first one started.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EnsureMachineExportRequest {
+    /// Addresses the export accepts connections from — the host's own
+    /// addresses on the bridge network. Every other peer is refused, because
+    /// every VM and container on that network can otherwise reach the port
+    /// and the export performs no authentication of its own.
+    #[prost(string, repeated, tag = "1")]
+    pub client_addresses: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The uid and gid the host mounts as. Files the guest owns as
+    /// `guest_uid`/`guest_gid` are shown with these ids, and files created
+    /// or chowned to these ids from the host land as `guest_uid`/`guest_gid`;
+    /// every other id passes through unchanged.
+    #[prost(uint32, tag = "2")]
+    pub host_uid: u32,
+    #[prost(uint32, tag = "3")]
+    pub host_gid: u32,
+    /// The guest account the host user stands in for: root unless the
+    /// machine has a default user.
+    #[prost(uint32, tag = "4")]
+    pub guest_uid: u32,
+    #[prost(uint32, tag = "5")]
+    pub guest_gid: u32,
+}
+/// Response to `EnsureMachineExportRequest`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EnsureMachineExportResponse {
+    /// IPv4 address of the bridge NIC the export listens on.
+    #[prost(string, tag = "1")]
+    pub address: ::prost::alloc::string::String,
+    /// TCP port serving both the MOUNT and the NFS protocol.
+    #[prost(uint32, tag = "2")]
+    pub port: u32,
+}
 /// Ask the guest agent to DNAT a reserved guest port to a sandbox port.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SandboxPortForwardRequest {
