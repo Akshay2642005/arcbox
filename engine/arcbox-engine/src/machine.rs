@@ -39,6 +39,7 @@ pub enum MachineState {
     Stopped,
 }
 
+pub mod archive;
 mod clone;
 #[cfg(target_os = "macos")]
 mod serial;

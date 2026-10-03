@@ -743,7 +743,9 @@ dependencies = [
  "chrono",
  "libc",
  "serde",
+ "serde_json",
  "statig",
+ "tar",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -752,6 +754,7 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "uuid",
+ "zstd",
 ]
 
 [[package]]
